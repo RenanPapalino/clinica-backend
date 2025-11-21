@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+.env.backup
+node_modules
+vendor
+storage/logs/*.log
+*.sql
+*.zip
+*.backup
+README.md
