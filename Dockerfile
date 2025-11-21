@@ -42,21 +42,27 @@ RUN composer install --no-interaction --no-scripts --no-autoloader
 # 10. Copiar arquivos do projeto
 COPY . .
 
-# --- CORREÇÃO ESSENCIAL AQUI ---
-# Remove especificamente os caches que registram o Pail (pacote de dev) e causam erro
+# --- LIMPEZA DE CACHE ANTIGO ---
 RUN rm -f bootstrap/cache/packages.php bootstrap/cache/services.php
 
 # 11. Autoloader otimizado
-# Mantemos o --no-scripts para segurança
 RUN composer dump-autoload --optimize --no-dev --no-scripts
 
 # 12. Permissões
 RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache
 
-# 13. Configurar Apache
+# 13. Configurar Apache (CORREÇÃO AQUI)
 ENV APACHE_DOCUMENT_ROOT="/var/www/html/public"
 RUN sed -ri -e 's!/var/www/html!${APACHE_DOCUMENT_ROOT}!g' /etc/apache2/sites-available/*.conf
 RUN sed -ri -e 's!/var/www/!${APACHE_DOCUMENT_ROOT}!g' /etc/apache2/apache2.conf
+
+# Forçar AllowOverride All para o .htaccess funcionar
+RUN echo "<Directory /var/www/html/public>\n\
+    Options Indexes FollowSymLinks\n\
+    AllowOverride All\n\
+    Require all granted\n\
+</Directory>" > /etc/apache2/conf-available/laravel.conf \
+    && a2enconf laravel
 
 # 14. Expor porta 80
 EXPOSE 80
