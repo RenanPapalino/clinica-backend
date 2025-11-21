@@ -137,4 +137,63 @@ class ClienteController extends Controller
             ], 404);
         }
     }
+
+/**
+     * Importar clientes em lote (para Agent/N8N)
+     * 
+     * Espera JSON no formato:
+     * {
+     *   "clientes": [
+     *     { "cnpj": "11.222.333/0001-44", "razao_social": "...", "email": "...", ... },
+     *     ...
+     *   ]
+     * }
+     */
+    public function importarLote(Request $request)
+    {
+        $data = $request->validate([
+            'clientes' => 'required|array|min:1',
+            'clientes.*.cnpj' => 'required|string',
+            'clientes.*.razao_social' => 'required|string|max:200',
+            'clientes.*.nome_fantasia' => 'nullable|string|max:200',
+            'clientes.*.email' => 'nullable|email|max:100',
+            'clientes.*.telefone' => 'nullable|string|max:20',
+            'clientes.*.celular' => 'nullable|string|max:20',
+            'clientes.*.cidade' => 'nullable|string|max:100',
+            'clientes.*.uf' => 'nullable|string|max:2',
+            'clientes.*.status' => 'nullable|in:ativo,inativo',
+        ]);
+
+        $importados = [];
+        $atualizados = [];
+
+        foreach ($data['clientes'] as $c) {
+            // Normaliza CNPJ (só números)
+            $cnpj = preg_replace('/\D/', '', $c['cnpj']);
+
+            // Status padrão
+            if (!isset($c['status'])) {
+                $c['status'] = 'ativo';
+            }
+
+            $cliente = Cliente::where('cnpj', $cnpj)->first();
+
+            if ($cliente) {
+                $cliente->update(array_merge($c, ['cnpj' => $cnpj]));
+                $atualizados[] = $cliente->id;
+            } else {
+                $novo = Cliente::create(array_merge($c, ['cnpj' => $cnpj]));
+                $importados[] = $novo->id;
+            }
+        }
+
+        return response()->json([
+            'success'    => true,
+            'message'    => 'Importação de clientes concluída',
+            'importados' => $importados,
+            'atualizados'=> $atualizados,
+            'total'      => count($importados) + count($atualizados),
+        ]);
+    }
+
 }

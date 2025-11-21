@@ -2,6 +2,7 @@
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\ClienteController;
 use App\Http\Controllers\Api\ServicoController;
 use App\Http\Controllers\Api\FaturaController;
@@ -9,7 +10,7 @@ use App\Http\Controllers\Api\NfseController;
 use App\Http\Controllers\Api\TituloController;
 use App\Http\Controllers\Api\RelatorioController;
 use App\Http\Controllers\Api\N8nController;
-
+use App\Models\User;
 // ============================================
 // HEALTH CHECK
 // ============================================
@@ -20,6 +21,16 @@ Route::get('/health', function () {
         'service' => 'Clinica Financeiro API',
         'version' => '1.0.0',
     ]);
+});
+
+// ============================================
+// AUTENTICAÇÃO
+// ============================================
+Route::prefix('auth')->group(function () {
+    Route::post('/login', [AuthController::class, 'login']);
+    Route::post('/register', [AuthController::class, 'register']);
+    Route::post('/logout', [AuthController::class, 'logout']);
+    Route::get('/me', [AuthController::class, 'me']);
 });
 
 // DB Test
@@ -38,6 +49,9 @@ Route::get('/db-test', function () {
 Route::prefix('cadastros')->group(function () {
     // Clientes
     Route::apiResource('clientes', ClienteController::class);
+
+    // Importação em lote de clientes (para Agent/N8N)
+    Route::post('clientes/importar', [ClienteController::class, 'importarLote']);
     
     // Serviços
     Route::apiResource('servicos', ServicoController::class);
