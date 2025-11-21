@@ -42,8 +42,13 @@ RUN composer install --no-interaction --no-scripts --no-autoloader
 # 10. Copiar arquivos do projeto
 COPY . .
 
-# 11. Autoloader otimizado (A CORREÇÃO ESTÁ AQUI)
-# Adicionei --no-scripts para evitar que ele tente carregar o Laravel Pail durante o build
+# --- CORREÇÃO ESSENCIAL AQUI ---
+# Remove caches antigos que podem referenciar pacotes de dev (como o Pail)
+# Isso evita o erro "Class Laravel\Pail\PailServiceProvider not found"
+RUN rm -rf bootstrap/cache/*.php
+
+# 11. Autoloader otimizado
+# Mantemos o --no-scripts para segurança
 RUN composer dump-autoload --optimize --no-dev --no-scripts
 
 # 12. Permissões
