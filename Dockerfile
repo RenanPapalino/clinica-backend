@@ -43,9 +43,8 @@ RUN composer install --no-interaction --no-scripts --no-autoloader
 COPY . .
 
 # --- CORREÇÃO ESSENCIAL AQUI ---
-# Remove caches antigos que podem referenciar pacotes de dev (como o Pail)
-# Isso evita o erro "Class Laravel\Pail\PailServiceProvider not found"
-RUN rm -rf bootstrap/cache/*.php
+# Remove especificamente os caches que registram o Pail (pacote de dev) e causam erro
+RUN rm -f bootstrap/cache/packages.php bootstrap/cache/services.php
 
 # 11. Autoloader otimizado
 # Mantemos o --no-scripts para segurança
