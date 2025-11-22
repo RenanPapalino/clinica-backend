@@ -9,6 +9,7 @@ use App\Models\FaturaItem;
 use App\Models\Titulo;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\DB; // <--- Importar DB
 
 class N8nController extends Controller
 {
@@ -23,9 +24,7 @@ class N8nController extends Controller
             return response()->json(['success' => false, 'message' => 'CNPJ não informado'], 400);
         }
         
-        // Limpar CNPJ (remover pontos, traços, etc)
         $cnpj = preg_replace('/[^0-9]/', '', $cnpj);
-        
         $cliente = Cliente::where('cnpj', 'like', "%{$cnpj}%")->first();
         
         if (!$cliente) {
@@ -56,7 +55,7 @@ class N8nController extends Controller
     }
     
     /**
-     * Processar planilha SOC e criar fatura
+     * Processar planilha SOC e criar fatura (COM TRANSAÇÃO)
      */
     public function processarPlanilhaSoc(Request $request)
     {
@@ -71,28 +70,28 @@ class N8nController extends Controller
         
         if ($validator->fails()) {
             return response()->json([
-                'success' => false,
-                'message' => 'Dados inválidos',
+                'success' => false, 
+                'message' => 'Dados inválidos', 
                 'errors' => $validator->errors()
             ], 422);
         }
         
+        // Início da Transação
+        DB::beginTransaction();
+
         try {
-            // Buscar cliente
             $cnpj = preg_replace('/[^0-9]/', '', $request->cliente_cnpj);
             $cliente = Cliente::where('cnpj', 'like', "%{$cnpj}%")->first();
             
             if (!$cliente) {
-                return response()->json(['success' => false, 'message' => 'Cliente não encontrado'], 404);
+                throw new \Exception('Cliente não encontrado para o CNPJ: ' . $cnpj);
             }
             
-            // Calcular totais
             $valorTotal = 0;
             foreach ($request->itens as $item) {
                 $valorTotal += $item['quantidade'] * $item['valor_unitario'];
             }
             
-            // Criar fatura
             $fatura = Fatura::create([
                 'cliente_id' => $cliente->id,
                 'numero_fatura' => $this->gerarNumeroFatura(),
@@ -104,7 +103,6 @@ class N8nController extends Controller
                 'status' => 'emitida',
             ]);
             
-            // Criar itens
             foreach ($request->itens as $index => $item) {
                 FaturaItem::create([
                     'fatura_id' => $fatura->id,
@@ -117,6 +115,9 @@ class N8nController extends Controller
                     'matricula' => $item['matricula'] ?? null,
                 ]);
             }
+
+            // Commit: Salva tudo no banco se chegou até aqui
+            DB::commit();
             
             return response()->json([
                 'success' => true,
@@ -125,53 +126,36 @@ class N8nController extends Controller
             ], 201);
             
         } catch (\Exception $e) {
+            // Rollback: Desfaz tudo se deu erro
+            DB::rollBack();
+
             return response()->json([
                 'success' => false,
-                'message' => 'Erro ao processar planilha',
-                'error' => $e->getMessage()
+                'message' => 'Erro ao processar planilha: ' . $e->getMessage()
             ], 500);
         }
     }
     
-    /**
-     * Consultar títulos a vencer
-     */
+    // ... (Métodos titulosAVencer e titulosVencidos mantêm iguais) ...
     public function titulosAVencer(Request $request)
     {
         $dias = $request->input('dias', 7);
-        
         $titulos = Titulo::with('cliente')
             ->where('status', 'aberto')
             ->whereBetween('data_vencimento', [now(), now()->addDays($dias)])
-            ->orderBy('data_vencimento', 'asc')
-            ->get();
-        
-        return response()->json([
-            'success' => true,
-            'data' => $titulos,
-            'total' => $titulos->count()
-        ]);
+            ->orderBy('data_vencimento', 'asc')->get();
+        return response()->json(['success' => true, 'data' => $titulos, 'total' => $titulos->count()]);
     }
-    
-    /**
-     * Consultar títulos vencidos
-     */
+
     public function titulosVencidos()
     {
         $titulos = Titulo::with('cliente')
             ->where('status', 'aberto')
             ->where('data_vencimento', '<', now())
-            ->orderBy('data_vencimento', 'asc')
-            ->get();
-        
-        return response()->json([
-            'success' => true,
-            'data' => $titulos,
-            'total' => $titulos->count(),
-            'valor_total' => $titulos->sum('valor_saldo')
-        ]);
+            ->orderBy('data_vencimento', 'asc')->get();
+        return response()->json(['success' => true, 'data' => $titulos, 'total' => $titulos->count(), 'valor_total' => $titulos->sum('valor_saldo')]);
     }
-    
+
     private function gerarNumeroFatura()
     {
         $ultimo = Fatura::max('id') ?? 0;

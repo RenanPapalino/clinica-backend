@@ -8,12 +8,110 @@ use App\Models\FaturaItem;
 use App\Models\Titulo;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Maatwebsite\Excel\Facades\Excel; // Importar facade
 
 class FaturaController extends Controller
 {
     /**
      * LISTAR FATURAS
      */
+   
+   protected $socImportService;
+
+
+public function analisarArquivo(Request $request)
+    {
+        $request->validate([
+            'file' => 'required|file|mimes:csv,xlsx,xls'
+        ]);
+
+        try {
+            // Lê o arquivo para array (usando Maatwebsite ou nativo)
+            $dados = Excel::toArray([], $request->file('file'))[0];
+            
+            // Chama o serviço de inteligência
+            $analise = $this->socImportService->analisarArquivo($dados);
+
+            return response()->json([
+                'success' => true,
+                'analise' => $analise
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'message' => 'Erro ao ler arquivo: ' . $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Passo 2: Recebe os dados APROVADOS pelo usuário e cria as faturas
+     */
+    public function processarLoteConfirmado(Request $request)
+    {
+        // Espera receber um array de faturas validadas pelo front
+        $faturasAprovadas = $request->input('faturas'); 
+        
+        $geradas = 0;
+        
+        DB::beginTransaction();
+        try {
+            foreach ($faturasAprovadas as $faturaData) {
+                // Lógica de criação (reutilizando o que fizemos antes, mas agora com dados limpos)
+                // ... criar Fatura, Itens e Titulo ...
+                // Use o ID do cliente que o usuário confirmou no front
+                $this->criarFaturaDoLote($faturaData);
+                $geradas++;
+            }
+            DB::commit();
+            return response()->json(['success' => true, 'geradas' => $geradas]);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    private function criarFaturaDoLote($dados) {
+        // ... (Código de criação igual ao SocImportService anterior) ...
+        // Aqui cria Fatura::create usando $dados['cliente_id'] e $dados['valor_total']
+    }
+}
+
+    // Injeção de Dependência do Service
+    public function __construct(SocImportService $socImportService)
+    {
+        $this->socImportService = $socImportService;
+    }
+
+    /**
+     * Endpoint chamado pelo n8n para criar faturas em lote
+     * Recebe um JSON com os dados da planilha já processados pela IA
+     */
+    public function importarLote(Request $request)
+    {
+        // Validação simples da estrutura
+        $request->validate([
+            'periodo' => 'required|string', // ex: 2025-10
+            'itens' => 'required|array'     // Array flat de todos os itens da planilha
+        ]);
+
+        try {
+            $resultado = $this->socImportService->processarLote(
+                $request->input('itens'),
+                $request->input('periodo')
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => "Processamento concluído. {$resultado['faturas_geradas']} faturas geradas.",
+                'erros' => $resultado['erros']
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erro crítico na importação: ' . $e->getMessage()
+            ], 500);
+        }
+    }
     public function index(Request $request)
     {
         try {

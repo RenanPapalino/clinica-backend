@@ -213,4 +213,47 @@ class Titulo extends Model
             $this->save();
         }
     }
+
+    // Relacionamento com Rateios
+    public function rateios()
+    {
+        return $this->hasMany(TituloRateio::class);
+    }
+
+    // Relacionamento com Fornecedor (Novo)
+    public function fornecedor()
+    {
+        return $this->belongsTo(Fornecedor::class);
+    }
+
+    // Método auxiliar para verificar se o total rateado bate com o valor do título
+    public function validarRateio(): bool
+    {
+        $totalRateado = $this->rateios()->sum('valor');
+        // Aceita diferença de 1 centavo
+        return abs($totalRateado - $this->valor_original) <= 0.01;
+    }
+    // Relacionamento com Fornecedor
+    public function fornecedor()
+    {
+        return $this->belongsTo(Fornecedor::class);
+    }
+
+    // Relacionamento com Rateios (Um título tem vários rateios)
+    public function rateios()
+    {
+        return $this->hasMany(TituloRateio::class);
+    }
+
+    // Relacionamento com Plano de Contas Principal (Cabeçalho)
+    public function planoConta()
+    {
+        return $this->belongsTo(PlanoConta::class);
+    }
+
+    // Relacionamento com Centro de Custo Principal (Cabeçalho)
+    public function centroCusto()
+    {
+        return $this->belongsTo(CentroCusto::class);
+    }
 }

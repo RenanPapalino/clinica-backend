@@ -8,27 +8,21 @@ use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Str;
 
 class AuthController extends Controller
 {
     use ApiResponseTrait;
 
-    /**
-     * Login do usuário
-     */
     public function login(Request $request)
     {
         $validator = Validator::make($request->all(), [
             'email' => 'required|email',
-            'password' => 'required|string|min:6',
+            'password' => 'required|string',
         ]);
 
         if ($validator->fails()) {
-            return $this->errorResponse(
-                'Dados inválidos', 
-                422, 
-                $validator->errors()
-            );
+            return $this->errorResponse('Dados inválidos', 422, $validator->errors());
         }
 
         $user = User::where('email', $request->email)->first();
@@ -37,8 +31,10 @@ class AuthController extends Controller
             return $this->errorResponse('Credenciais inválidas', 401);
         }
 
-        // Criar token simples (sem JWT por enquanto)
-        $token = base64_encode($user->id . '|' . now()->timestamp);
+        // CORREÇÃO: Gerar token real do Sanctum
+        // Remove tokens antigos para manter apenas um ativo (opcional)
+        $user->tokens()->delete(); 
+        $token = $user->createToken('auth_token')->plainTextToken;
 
         return $this->successResponse([
             'user' => [
@@ -50,84 +46,55 @@ class AuthController extends Controller
         ], 'Login realizado com sucesso');
     }
 
-    /**
-     * Logout do usuário
-     */
     public function logout(Request $request)
     {
-        // Por enquanto apenas retorna sucesso
-        // JWT invalidará o token aqui
+        // Revoga o token atual
+        $request->user()->currentAccessToken()->delete();
         return $this->successResponse(null, 'Logout realizado com sucesso');
     }
 
-    /**
-     * Obter usuário autenticado
-     */
     public function me(Request $request)
     {
-        // Simular usuário por enquanto
-        // Com JWT, será: $user = $request->user();
-        
-        $token = $request->bearerToken();
-        
-        if (!$token) {
-            return $this->errorResponse('Token não fornecido', 401);
-        }
-
-        try {
-            $decoded = base64_decode($token);
-            list($userId, $timestamp) = explode('|', $decoded);
-            
-            $user = User::find($userId);
-            
-            if (!$user) {
-                return $this->errorResponse('Usuário não encontrado', 404);
-            }
-
-            return $this->successResponse([
-                'id' => $user->id,
-                'name' => $user->name,
-                'email' => $user->email,
-            ]);
-        } catch (\Exception $e) {
-            return $this->errorResponse('Token inválido', 401);
-        }
+        return $this->successResponse($request->user());
     }
 
-    /**
-     * Registrar novo usuário
-     */
-    public function register(Request $request)
+    // NOVA FUNÇÃO: Recuperar Senha
+    public function forgotPassword(Request $request)
     {
         $validator = Validator::make($request->all(), [
-            'name' => 'required|string|max:255',
-            'email' => 'required|string|email|max:255|unique:users',
-            'password' => 'required|string|min:6|confirmed',
+            'email' => 'required|email',
+            'channel' => 'in:email,whatsapp' // Opção de envio
         ]);
 
         if ($validator->fails()) {
-            return $this->errorResponse(
-                'Dados inválidos', 
-                422, 
-                $validator->errors()
-            );
+            return $this->errorResponse('Email inválido', 422);
         }
 
-        $user = User::create([
-            'name' => $request->name,
-            'email' => $request->email,
-            'password' => Hash::make($request->password),
-        ]);
+        $user = User::where('email', $request->email)->first();
 
-        $token = base64_encode($user->id . '|' . now()->timestamp);
+        if (!$user) {
+            // Retornamos sucesso mesmo se não existir para segurança (evitar enumeration)
+            return $this->successResponse(null, 'Se o email existir, enviaremos as instruções.');
+        }
 
+        // Gera uma nova senha temporária (ou link de reset)
+        $tempPassword = Str::random(8);
+        $user->password = Hash::make($tempPassword);
+        $user->save();
+
+        // AQUI: Integração para enviar a senha
+        // Em produção, dispare um Job ou chame o n8n para enviar
+        $mensagem = "Olá {$user->name}, sua nova senha temporária no MDGestão é: {$tempPassword}";
+
+        if ($request->channel === 'whatsapp' && $user->telefone) {
+             // Exemplo: Http::post('n8n-webhook-whatsapp', ['phone' => $user->telefone, 'msg' => $mensagem]);
+        } else {
+             // Mail::to($user)->send(...);
+        }
+
+        // Para teste local, retornamos a senha (REMOVER EM PRODUÇÃO)
         return $this->successResponse([
-            'user' => [
-                'id' => $user->id,
-                'name' => $user->name,
-                'email' => $user->email,
-            ],
-            'token' => $token,
-        ], 'Usuário criado com sucesso', 201);
+            'debug_temp_password' => $tempPassword 
+        ], 'Instruções enviadas (Verifique a resposta JSON para a senha temporária em ambiente dev).');
     }
 }

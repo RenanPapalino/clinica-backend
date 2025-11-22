@@ -14,6 +14,53 @@ use App\Http\Controllers\Api\RelatorioController;
 use App\Http\Controllers\Api\N8nController;
 use App\Http\Controllers\Api\DashboardController;
 
+
+Route::get('/debug-auth', function () {
+    echo "<h1>Diagnóstico de Autenticação</h1>";
+    
+    // 1. Teste de Conexão com Banco
+    try {
+        DB::connection()->getPdo();
+        echo "<p style='color:green'>✅ 1. Banco de Dados Conectado.</p>";
+    } catch (\Exception $e) {
+        echo "<p style='color:red'>❌ 1. Erro de Conexão: " . $e->getMessage() . "</p>";
+        die();
+    }
+
+    // 2. Teste de Usuário
+    try {
+        $user = User::first();
+        if (!$user) {
+            echo "<p style='color:orange'>⚠️ 2. Tabela 'users' acessível, mas vazia. Rode as seeds.</p>";
+        } else {
+            echo "<p style='color:green'>✅ 2. Usuário encontrado: " . $user->email . "</p>";
+        }
+    } catch (\Exception $e) {
+        echo "<p style='color:red'>❌ 2. Erro ao acessar Model User (Tabela existe?): " . $e->getMessage() . "</p>";
+        die();
+    }
+
+    // 3. Teste do Sanctum (O Ponto Crítico)
+    if ($user) {
+        if (!method_exists($user, 'createToken')) {
+            echo "<p style='color:red'>❌ 3. Método 'createToken' NÃO existe no User.</p>";
+            echo "<pre>Verifique se 'use HasApiTokens' está dentro da classe em app/Models/User.php</pre>";
+        } else {
+            echo "<p style='color:green'>✅ 3. Método 'createToken' detectado.</p>";
+            
+            // 4. Tentar Criar o Token (Teste Real)
+            try {
+                $token = $user->createToken('TesteDebug')->plainTextToken;
+                echo "<p style='color:green'>✅ 4. Token gerado com sucesso: " . substr($token, 0, 10) . "...</p>";
+                echo "<p><b>Se você vê isso, o login deveria estar funcionando. Limpe o cache!</b></p>";
+            } catch (\Exception $e) {
+                echo "<p style='color:red'>❌ 4. Erro FATAL ao criar token: " . $e->getMessage() . "</p>";
+                echo "<p>Provavelmente falta a tabela <b>personal_access_tokens</b>.</p>";
+            }
+        }
+    }
+});
+
 // ============================================
 // HEALTH CHECK
 // ============================================
@@ -119,10 +166,23 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/top-clientes', [RelatorioController::class, 'topClientes']);
     });
 
+// Chat / IA
+Route::prefix('chat')->group(function () {
+    Route::post('/mensagem', [ChatController::class, 'enviarMensagem']);
+    Route::get('/historico', [ChatController::class, 'historico']);
+});
+
+
+Route::prefix('auth')->group(function () {
+    // ... login, register
+    Route::post('/forgot-password', [AuthController::class, 'forgotPassword']);
+});
+
     // ============================================
     // N8N - INTEGRAÇÕES
     // ============================================
     Route::prefix('n8n')->group(function () {
+        Route::post('/webhook', [N8nController::class, 'webhook']);
         Route::get('/buscar-cliente', [N8nController::class, 'buscarClientePorCnpj']);
         Route::get('/buscar-servico', [N8nController::class, 'buscarServicoPorCodigo']);
         Route::post('/processar-planilha-soc', [N8nController::class, 'processarPlanilhaSoc']);
@@ -130,5 +190,23 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/titulos-vencidos', [N8nController::class, 'titulosVencidos']);
     });
 
+    Route::prefix('faturamento')->group(function () {
+    // ...
+    Route::post('importar-lote', [FaturaController::class, 'importarLote']);
+});
+
+
+    // Financeiro Avançado
+Route::apiResource('fornecedores', FornecedorController::class);
+Route::apiResource('titulos', TituloController::class); // Substitui o antigo se houver
+Route::get('planos-contas', [PlanoContaController::class, 'index']);
+Route::get('centros-custo', [CentroCustoController::class, 'index']);
+
 }); // fim das rotas com auth
 
+Route::post('faturamento/analisar', [FaturaController::class, 'analisarArquivo']);
+Route::post('faturamento/processar-confirmados', [FaturaController::class, 'processarLoteConfirmado']);
+Route::post('cadastros/clientes/sincronizar-soc', [ClienteController::class, 'sincronizarSoc']);
+
+Route::apiResource('lancamentos-contabeis', LancamentoContabilController::class)->only(['index', 'store', 'show']);
+Route::post('contabilidade/processar-titulo/{id}', [LancamentoContabilController::class, 'processarTitulo']);
