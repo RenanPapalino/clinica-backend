@@ -168,3 +168,27 @@ Route::middleware('auth:sanctum')->group(function () {
     });
 
 }); // Fim do middleware auth:sanctum
+
+Route::get('/debug-senha', function () {
+    $email = 'papalino@papalino.com.br';
+    $senha = 'papalino';
+    
+    // 1. Busca o usuário
+    $user = \App\Models\User::where('email', $email)->first();
+    
+    if (!$user) {
+        return response()->json(['erro' => 'Usuário não encontrado no banco com este e-mail exato.']);
+    }
+
+    // 2. Testa a senha
+    $check = \Illuminate\Support\Facades\Hash::check($senha, $user->password);
+    
+    return response()->json([
+        'status' => 'Diagnóstico',
+        'email_banco' => $user->email,
+        'senha_testada' => $senha,
+        'hash_no_banco' => $user->password,
+        'resultado_check' => $check ? '✅ SENHA CORRETA (O problema é o Front-end)' : '❌ SENHA INCORRETA (O problema é o Hash no Banco)',
+        'algoritmo' => \Illuminate\Support\Facades\Hash::info($user->password)
+    ]);
+});
