@@ -1,55 +1,56 @@
 <?php
+
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Fatura;
 use App\Models\FaturaItem;
-use App\Models\Cliente;
+use App\Models\Titulo;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
 class FaturaController extends Controller
 {
     /**
-     * Listar faturas
+     * LISTAR FATURAS
      */
     public function index(Request $request)
     {
         try {
-            $query = Fatura::with(['cliente', 'itens']);
+            $query = Fatura::with(['cliente', 'itens', 'titulos']);
 
             // Filtros
-            if ($request->has('cliente_id')) {
+            if ($request->filled('cliente_id')) {
                 $query->where('cliente_id', $request->cliente_id);
             }
 
-            if ($request->has('periodo')) {
-                $query->where('periodo_referencia', $request->periodo);
-            }
-
-            if ($request->has('status')) {
+            if ($request->filled('status')) {
                 $query->where('status', $request->status);
             }
 
-            if ($request->has('data_inicio')) {
-                $query->where('data_emissao', '>=', $request->data_inicio);
+            if ($request->filled('periodo_referencia')) {
+                $query->where('periodo_referencia', $request->periodo_referencia);
             }
 
-            if ($request->has('data_fim')) {
-                $query->where('data_emissao', '<=', $request->data_fim);
+            if ($request->filled('data_inicio')) {
+                $query->whereDate('data_emissao', '>=', $request->data_inicio);
             }
 
-            // Paginação ou listagem completa
-            if ($request->has('per_page')) {
-                $faturas = $query->orderBy('data_emissao', 'desc')->paginate($request->per_page);
-            } else {
-                $faturas = $query->orderBy('data_emissao', 'desc')->get();
+            if ($request->filled('data_fim')) {
+                $query->whereDate('data_emissao', '<=', $request->data_fim);
             }
+
+            $query->orderBy('data_emissao', 'desc');
+
+            $faturas = $request->filled('per_page')
+                ? $query->paginate($request->per_page)
+                : $query->get();
 
             return response()->json([
                 'success' => true,
                 'data' => $faturas
             ]);
+
         } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
@@ -60,31 +61,28 @@ class FaturaController extends Controller
     }
 
     /**
-     * Criar nova fatura
+     * CRIAR FATURA
      */
     public function store(Request $request)
     {
-        try {
-            $validated = $request->validate([
-                'cliente_id' => 'required|exists:clientes,id',
-                'data_emissao' => 'required|date',
-                'data_vencimento' => 'required|date',
-                'periodo_referencia' => 'required|string',
-                'itens' => 'required|array|min:1',
-                'itens.*.descricao' => 'required|string',
-                'itens.*.quantidade' => 'required|integer|min:1',
-                'itens.*.valor_unitario' => 'required|numeric|min:0',
-            ]);
+        $validated = $request->validate([
+            'cliente_id' => 'required|exists:clientes,id',
+            'data_emissao' => 'required|date',
+            'data_vencimento' => 'required|date',
+            'periodo_referencia' => 'required|string',
+            'itens' => 'required|array|min:1',
+            'itens.*.descricao' => 'required|string',
+            'itens.*.quantidade' => 'required|integer|min:1',
+            'itens.*.valor_unitario' => 'required|numeric|min:0',
+        ]);
 
+        try {
             DB::beginTransaction();
 
-            // Calcular totais
-            $valorServicos = 0;
-            foreach ($validated['itens'] as $item) {
-                $valorServicos += $item['quantidade'] * $item['valor_unitario'];
-            }
+            $valorServicos = collect($validated['itens'])->sum(function ($i) {
+                return $i['quantidade'] * $i['valor_unitario'];
+            });
 
-            // Criar fatura
             $fatura = Fatura::create([
                 'cliente_id' => $validated['cliente_id'],
                 'numero_fatura' => $this->gerarNumeroFatura(),
@@ -93,22 +91,18 @@ class FaturaController extends Controller
                 'periodo_referencia' => $validated['periodo_referencia'],
                 'valor_servicos' => $valorServicos,
                 'valor_total' => $valorServicos,
-                'status' => 'emitida',
+                'status' => 'aberta', // agora correto
             ]);
 
-            // Criar itens
             foreach ($validated['itens'] as $index => $item) {
                 FaturaItem::create([
                     'fatura_id' => $fatura->id,
-                    'servico_id' => $item['servico_id'] ?? null,
                     'item_numero' => $index + 1,
+                    'servico_id' => $item['servico_id'] ?? null,
                     'descricao' => $item['descricao'],
                     'quantidade' => $item['quantidade'],
                     'valor_unitario' => $item['valor_unitario'],
                     'valor_total' => $item['quantidade'] * $item['valor_unitario'],
-                    'funcionario' => $item['funcionario'] ?? null,
-                    'matricula' => $item['matricula'] ?? null,
-                    'data_realizacao' => $item['data_realizacao'] ?? null,
                 ]);
             }
 
@@ -120,15 +114,9 @@ class FaturaController extends Controller
                 'data' => $fatura->load(['itens', 'cliente'])
             ], 201);
 
-        } catch (\Illuminate\Validation\ValidationException $e) {
-            DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Erro de validação',
-                'errors' => $e->errors()
-            ], 422);
         } catch (\Exception $e) {
             DB::rollBack();
+
             return response()->json([
                 'success' => false,
                 'message' => 'Erro ao criar fatura',
@@ -138,18 +126,20 @@ class FaturaController extends Controller
     }
 
     /**
-     * Ver fatura específica
+     * MOSTRAR FATURA
      */
     public function show($id)
     {
         try {
-            $fatura = Fatura::with(['cliente', 'itens', 'nfse'])->findOrFail($id);
+            $fatura = Fatura::with(['cliente', 'itens.servico', 'titulos'])->findOrFail($id);
 
             return response()->json([
                 'success' => true,
                 'data' => $fatura
             ]);
+
         } catch (\Exception $e) {
+
             return response()->json([
                 'success' => false,
                 'message' => 'Fatura não encontrada'
@@ -158,14 +148,13 @@ class FaturaController extends Controller
     }
 
     /**
-     * Atualizar fatura
+     * ATUALIZAR FATURA
      */
     public function update(Request $request, $id)
     {
         try {
             $fatura = Fatura::findOrFail($id);
 
-            // Não permitir editar fatura já com NFSe
             if ($fatura->nfse_emitida) {
                 return response()->json([
                     'success' => false,
@@ -175,19 +164,35 @@ class FaturaController extends Controller
 
             $validated = $request->validate([
                 'data_vencimento' => 'sometimes|date',
-                'status' => 'sometimes|in:rascunho,emitida,cancelada',
+                'status' => 'sometimes|string',
+                'valor_descontos' => 'nullable|numeric',
+                'valor_acrescimos' => 'nullable|numeric',
+                'valor_iss' => 'nullable|numeric',
                 'observacoes' => 'nullable|string',
             ]);
 
+            $statusAnterior = $fatura->status;
+
             $fatura->update($validated);
+
+            $this->recalcularTotais($fatura->id);
+
+            // SE STATUS MUDOU PARA EMITIDA → GERAR TÍTULO
+            if (
+                isset($validated['status']) &&
+                $statusAnterior !== $validated['status'] &&
+                in_array($validated['status'], ['emitida', 'fechada'])
+            ) {
+                $fatura->gerarTituloPadrao();
+            }
 
             return response()->json([
                 'success' => true,
-                'message' => 'Fatura atualizada com sucesso',
-                'data' => $fatura->load(['itens', 'cliente'])
+                'data' => $fatura->fresh(['itens', 'titulos', 'cliente'])
             ]);
 
         } catch (\Exception $e) {
+
             return response()->json([
                 'success' => false,
                 'message' => 'Erro ao atualizar fatura',
@@ -197,14 +202,13 @@ class FaturaController extends Controller
     }
 
     /**
-     * Deletar fatura
+     * DELETAR FATURA
      */
     public function destroy($id)
     {
         try {
             $fatura = Fatura::findOrFail($id);
 
-            // Não permitir deletar fatura já com NFSe
             if ($fatura->nfse_emitida) {
                 return response()->json([
                     'success' => false,
@@ -220,16 +224,16 @@ class FaturaController extends Controller
             ]);
 
         } catch (\Exception $e) {
+
             return response()->json([
                 'success' => false,
-                'message' => 'Erro ao excluir fatura',
-                'error' => $e->getMessage()
+                'message' => 'Erro ao excluir fatura'
             ], 500);
         }
     }
 
     /**
-     * Adicionar item à fatura
+     * ADICIONAR ITEM
      */
     public function adicionarItem(Request $request, $id)
     {
@@ -249,31 +253,27 @@ class FaturaController extends Controller
                 'valor_unitario' => 'required|numeric|min:0',
             ]);
 
-            $ultimoItem = FaturaItem::where('fatura_id', $fatura->id)->max('item_numero') ?? 0;
+            $ultimo = FaturaItem::where('fatura_id', $id)->max('item_numero') ?? 0;
 
-            $item = FaturaItem::create([
-                'fatura_id' => $fatura->id,
-                'item_numero' => $ultimoItem + 1,
+            FaturaItem::create([
+                'fatura_id' => $id,
+                'item_numero' => $ultimo + 1,
                 'descricao' => $validated['descricao'],
                 'quantidade' => $validated['quantidade'],
                 'valor_unitario' => $validated['valor_unitario'],
                 'valor_total' => $validated['quantidade'] * $validated['valor_unitario'],
             ]);
 
-            // Recalcular totais da fatura
-            $valorTotal = FaturaItem::where('fatura_id', $fatura->id)->sum('valor_total');
-            $fatura->update([
-                'valor_servicos' => $valorTotal,
-                'valor_total' => $valorTotal,
-            ]);
+            $this->recalcularTotais($id);
 
             return response()->json([
                 'success' => true,
                 'message' => 'Item adicionado com sucesso',
-                'data' => $item
-            ], 201);
+                'data' => Fatura::with(['itens', 'cliente'])->find($id)
+            ]);
 
         } catch (\Exception $e) {
+
             return response()->json([
                 'success' => false,
                 'message' => 'Erro ao adicionar item',
@@ -283,44 +283,27 @@ class FaturaController extends Controller
     }
 
     /**
-     * Estatísticas de faturamento
+     * RECALCULAR TOTAIS
      */
-    public function estatisticas(Request $request)
+    private function recalcularTotais($id)
     {
-        try {
-            $periodo = $request->input('periodo', date('Y-m'));
+        $fatura = Fatura::with('itens')->findOrFail($id);
 
-            $stats = [
-                'total_faturas' => Fatura::where('periodo_referencia', $periodo)->count(),
-                'valor_total' => Fatura::where('periodo_referencia', $periodo)->sum('valor_total'),
-                'faturas_emitidas' => Fatura::where('periodo_referencia', $periodo)
-                    ->where('status', 'emitida')->count(),
-                'nfse_emitidas' => Fatura::where('periodo_referencia', $periodo)
-                    ->where('nfse_emitida', true)->count(),
-                'top_clientes' => Fatura::select('cliente_id', DB::raw('SUM(valor_total) as total'))
-                    ->with('cliente:id,razao_social')
-                    ->where('periodo_referencia', $periodo)
-                    ->groupBy('cliente_id')
-                    ->orderBy('total', 'desc')
-                    ->limit(5)
-                    ->get(),
-            ];
+        $valorServicos = $fatura->itens->sum('valor_total');
 
-            return response()->json([
-                'success' => true,
-                'data' => $stats
-            ]);
+        $fatura->valor_servicos = $valorServicos;
 
-        } catch (\Exception $e) {
-            return response()->json([
-                'success' => false,
-                'error' => $e->getMessage()
-            ], 500);
-        }
+        $fatura->valor_total =
+            $valorServicos
+            - ($fatura->valor_descontos ?? 0)
+            + ($fatura->valor_acrescimos ?? 0)
+            + ($fatura->valor_iss ?? 0);
+
+        $fatura->save();
     }
 
     /**
-     * Gerar número de fatura
+     * GERAR NÚMERO DE FATURA
      */
     private function gerarNumeroFatura()
     {

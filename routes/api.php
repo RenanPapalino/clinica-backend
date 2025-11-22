@@ -2,6 +2,8 @@
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
+
+// Controllers
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\ClienteController;
 use App\Http\Controllers\Api\ServicoController;
@@ -10,7 +12,8 @@ use App\Http\Controllers\Api\NfseController;
 use App\Http\Controllers\Api\TituloController;
 use App\Http\Controllers\Api\RelatorioController;
 use App\Http\Controllers\Api\N8nController;
-use App\Models\User;
+use App\Http\Controllers\Api\DashboardController;
+
 // ============================================
 // HEALTH CHECK
 // ============================================
@@ -24,6 +27,21 @@ Route::get('/health', function () {
 });
 
 // ============================================
+// DB TEST
+// ============================================
+Route::get('/db-test', function () {
+    try {
+        \DB::connection()->getPdo();
+        return response()->json(['database' => 'connected']);
+    } catch (\Exception $e) {
+        return response()->json([
+            'database' => 'error',
+            'message' => $e->getMessage()
+        ], 500);
+    }
+});
+
+// ============================================
 // AUTENTICAÇÃO
 // ============================================
 Route::prefix('auth')->group(function () {
@@ -33,77 +51,84 @@ Route::prefix('auth')->group(function () {
     Route::get('/me', [AuthController::class, 'me']);
 });
 
-// DB Test
-Route::get('/db-test', function () {
-    try {
-        \DB::connection()->getPdo();
-        return response()->json(['database' => 'connected']);
-    } catch (\Exception $e) {
-        return response()->json(['database' => 'error', 'message' => $e->getMessage()], 500);
-    }
-});
+// ============================================
+// ROTAS PROTEGIDAS
+// ============================================
+Route::middleware('auth:sanctum')->group(function () {
 
-// ============================================
-// CADASTROS
-// ============================================
-Route::prefix('cadastros')->group(function () {
-    // Clientes
-    Route::apiResource('clientes', ClienteController::class);
+    // ============================================
+    // DASHBOARD (NOVO)
+    // ============================================
+    Route::prefix('dashboard')->group(function () {
+        Route::get('/titulos-vencendo', [DashboardController::class, 'titulosVencendo']);
+        Route::get('/acoes-pendentes', [DashboardController::class, 'acoesPendentes']);
+    });
 
-    // Importação em lote de clientes (para Agent/N8N)
-    Route::post('clientes/importar', [ClienteController::class, 'importarLote']);
-    
-    // Serviços
-    Route::apiResource('servicos', ServicoController::class);
-});
+    // ============================================
+    // CADASTROS
+    // ============================================
+    Route::prefix('cadastros')->group(function () {
+        // Clientes
+        Route::apiResource('clientes', ClienteController::class);
 
-// ============================================
-// FATURAMENTO
-// ============================================
-Route::prefix('faturamento')->group(function () {
-    Route::get('faturas', [FaturaController::class, 'index']);
-    Route::post('faturas', [FaturaController::class, 'store']);
-    Route::get('faturas/{id}', [FaturaController::class, 'show']);
-    Route::put('faturas/{id}', [FaturaController::class, 'update']);
-    Route::delete('faturas/{id}', [FaturaController::class, 'destroy']);
-    Route::post('faturas/{id}/itens', [FaturaController::class, 'adicionarItem']);
-    Route::get('estatisticas', [FaturaController::class, 'estatisticas']);
-});
+        // Importação em lote
+        Route::post('clientes/importar', [ClienteController::class, 'importarLote']);
 
-// ============================================
-// NFSE
-// ============================================
-Route::prefix('nfse')->group(function () {
-    Route::get('/', [NfseController::class, 'index']);
-    Route::post('/emitir-lote', [NfseController::class, 'emitirLote']);
-    Route::get('/consultar-protocolo', [NfseController::class, 'consultarProtocolo']);
-});
+        // Serviços
+        Route::apiResource('servicos', ServicoController::class);
+    });
 
-// ============================================
-// CONTAS A RECEBER
-// ============================================
-Route::prefix('contas-receber')->group(function () {
-    Route::apiResource('titulos', TituloController::class);
-    Route::post('titulos/{id}/baixar', [TituloController::class, 'baixar']);
-    Route::get('aging', [TituloController::class, 'relatorioAging']);
-});
+    // ============================================
+    // FATURAMENTO
+    // ============================================
+    Route::prefix('faturamento')->group(function () {
+        Route::get('faturas', [FaturaController::class, 'index']);
+        Route::post('faturas', [FaturaController::class, 'store']);
+        Route::get('faturas/{id}', [FaturaController::class, 'show']);
+        Route::put('faturas/{id}', [FaturaController::class, 'update']);
+        Route::delete('faturas/{id}', [FaturaController::class, 'destroy']);
+        Route::post('faturas/{id}/itens', [FaturaController::class, 'adicionarItem']);
 
-// ============================================
-// RELATÓRIOS
-// ============================================
-Route::prefix('relatorios')->group(function () {
-    Route::get('/dashboard', [RelatorioController::class, 'dashboard']);
-    Route::get('/faturamento-periodo', [RelatorioController::class, 'faturamentoPorPeriodo']);
-    Route::get('/top-clientes', [RelatorioController::class, 'topClientes']);
-});
+        Route::get('estatisticas', [FaturaController::class, 'estatisticas']);
+    });
 
-// ============================================
-// N8N - WEBHOOKS E INTEGRAÇÕES
-// ============================================
-Route::prefix('n8n')->group(function () {
-    Route::get('/buscar-cliente', [N8nController::class, 'buscarClientePorCnpj']);
-    Route::get('/buscar-servico', [N8nController::class, 'buscarServicoPorCodigo']);
-    Route::post('/processar-planilha-soc', [N8nController::class, 'processarPlanilhaSoc']);
-    Route::get('/titulos-a-vencer', [N8nController::class, 'titulosAVencer']);
-    Route::get('/titulos-vencidos', [N8nController::class, 'titulosVencidos']);
-});
+    // ============================================
+    // NFSE
+    // ============================================
+    Route::prefix('nfse')->group(function () {
+        Route::get('/', [NfseController::class, 'index']);
+        Route::post('/emitir-lote', [NfseController::class, 'emitirLote']);
+        Route::get('/consultar-protocolo', [NfseController::class, 'consultarProtocolo']);
+    });
+
+    // ============================================
+    // CONTAS A RECEBER
+    // ============================================
+    Route::prefix('contas-receber')->group(function () {
+        Route::apiResource('titulos', TituloController::class);
+        Route::post('titulos/{id}/baixar', [TituloController::class, 'baixar']);
+        Route::get('aging', [TituloController::class, 'relatorioAging']);
+    });
+
+    // ============================================
+    // RELATÓRIOS
+    // ============================================
+    Route::prefix('relatorios')->group(function () {
+        Route::get('/dashboard', [RelatorioController::class, 'dashboard']);
+        Route::get('/faturamento-periodo', [RelatorioController::class, 'faturamentoPorPeriodo']);
+        Route::get('/top-clientes', [RelatorioController::class, 'topClientes']);
+    });
+
+    // ============================================
+    // N8N - INTEGRAÇÕES
+    // ============================================
+    Route::prefix('n8n')->group(function () {
+        Route::get('/buscar-cliente', [N8nController::class, 'buscarClientePorCnpj']);
+        Route::get('/buscar-servico', [N8nController::class, 'buscarServicoPorCodigo']);
+        Route::post('/processar-planilha-soc', [N8nController::class, 'processarPlanilhaSoc']);
+        Route::get('/titulos-a-vencer', [N8nController::class, 'titulosAVencer']);
+        Route::get('/titulos-vencidos', [N8nController::class, 'titulosVencidos']);
+    });
+
+}); // fim das rotas com auth
+

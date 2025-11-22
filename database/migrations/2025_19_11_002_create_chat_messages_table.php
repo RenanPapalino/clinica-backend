@@ -6,30 +6,24 @@ use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
 {
-    /**
-     * Run the migrations.
-     */
     public function up(): void
     {
-        Schema::create('chat_messages', function (Blueprint $table) {
+        Schema::create('chat_mensagens', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('user_id')->nullable()->constrained('users')->onDelete('cascade');
-            $table->enum('role', ['user', 'assistant'])->default('user');
-            $table->text('content');
-            $table->string('session_id')->default('default');
+            $table->unsignedBigInteger('cliente_id')->nullable();
+            $table->string('canal', 30)->default('web'); // web, whatsapp, n8n
+            $table->string('origem', 30)->default('usuario'); // usuario, sistema, bot
+            $table->string('identificador_externo')->nullable(); // ex: número whatsapp
+            $table->text('mensagem');
+            $table->json('metadata')->nullable();
             $table->timestamps();
 
-            $table->index('user_id');
-            $table->index('session_id');
-            $table->index('created_at');
+            $table->index(['cliente_id', 'canal']);
         });
     }
 
-    /**
-     * Reverse the migrations.
-     */
     public function down(): void
     {
-        Schema::dropIfExists('chat_messages');
+        Schema::dropIfExists('chat_mensagens');
     }
 };

@@ -1,83 +1,149 @@
 <?php
+
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Nfse;
 use App\Models\Fatura;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 
 class NfseController extends Controller
 {
+    /**
+     * Lista NFSe (com filtros)
+     * GET /nfse
+     */
     public function index(Request $request)
     {
-        try {
-            $query = Nfse::with(['fatura', 'cliente']);
+        $query = Nfse::with(['fatura', 'cliente'])
+            ->orderByDesc('data_emissao')
+            ->orderByDesc('id');
 
-            if ($request->has('status')) {
-                $query->where('status', $request->status);
-            }
-
-            if ($request->has('cliente_id')) {
-                $query->where('cliente_id', $request->cliente_id);
-            }
-
-            $nfses = $query->orderBy('created_at', 'desc')->get();
-
-            return response()->json(['success' => true, 'data' => $nfses]);
-        } catch (\Exception $e) {
-            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        if ($request->filled('cliente_id')) {
+            $query->where('cliente_id', $request->cliente_id);
         }
+
+        if ($request->filled('fatura_id')) {
+            $query->where('fatura_id', $request->fatura_id);
+        }
+
+        if ($request->filled('status')) {
+            $query->where('status', $request->status);
+        }
+
+        $perPage = (int) $request->get('per_page', 20);
+
+        $nfse = $query->paginate($perPage);
+
+        return response()->json([
+            'success' => true,
+            'data' => $nfse,
+        ]);
     }
 
+    /**
+     * Emite NFSe em lote a partir de faturas
+     * POST /nfse/emitir-lote
+     */
     public function emitirLote(Request $request)
     {
-        try {
-            $validated = $request->validate([
-                'fatura_ids' => 'required|array',
-                'fatura_ids.*' => 'exists:faturas,id',
-            ]);
+        $data = $request->validate([
+            'faturas' => ['required', 'array', 'min:1'],
+            'faturas.*' => ['integer', 'exists:faturas,id'],
+        ]);
 
-            $nfses = [];
-            
-            foreach ($validated['fatura_ids'] as $faturaId) {
-                $fatura = Fatura::find($faturaId);
-                
-                if (!$fatura->nfse_emitida) {
-                    $nfse = Nfse::create([
-                        'fatura_id' => $fatura->id,
-                        'cliente_id' => $fatura->cliente_id,
-                        'valor_servicos' => $fatura->valor_servicos,
-                        'valor_iss' => $fatura->valor_servicos * 0.05,
-                        'status' => 'pendente',
-                    ]);
-                    
-                    $nfses[] = $nfse;
+        $protocolo = 'PROTO-' . now()->format('YmdHis') . '-' . Str::random(6);
+
+        $criadas = [];
+
+        try {
+            DB::beginTransaction();
+
+            foreach ($data['faturas'] as $faturaId) {
+                $fatura = Fatura::with('cliente')->findOrFail($faturaId);
+
+                // Se já existe nfse associada, pula ou atualiza
+                if ($fatura->nfse_emitida) {
+                    continue;
                 }
+
+                $nfse = Nfse::create([
+                    'fatura_id'        => $fatura->id,
+                    'cliente_id'       => $fatura->cliente_id,
+                    'lote_id'          => null,
+                    'numero_nfse'      => null, // preencher depois do retorno da prefeitura
+                    'codigo_verificacao' => null,
+                    'protocolo'        => $protocolo,
+                    'data_envio'       => now(),
+                    'data_emissao'     => null,
+                    'data_autorizacao' => null,
+                    'valor_servicos'   => $fatura->valor_servicos,
+                    'valor_deducoes'   => 0,
+                    'valor_iss'        => $fatura->valor_iss,
+                    'aliquota_iss'     => null,
+                    'valor_liquido'    => $fatura->valor_total,
+                    'status'           => 'pendente',
+                    'codigo_servico'   => null,
+                    'discriminacao'    => null,
+                    'xml_nfse'         => null,
+                    'pdf_url'          => null,
+                    'mensagem_erro'    => null,
+                    'detalhes_erro'    => null,
+                ]);
+
+                $fatura->nfse_emitida = false; // ainda pendente
+                $fatura->save();
+
+                $criadas[] = $nfse;
             }
+
+            DB::commit();
 
             return response()->json([
                 'success' => true,
-                'message' => count($nfses) . ' NFSe(s) criada(s)',
-                'data' => $nfses
+                'protocolo' => $protocolo,
+                'mensagem' => 'Lote de NFSe enviado/registrado com sucesso (pendente de autorização).',
+                'data' => $criadas,
             ], 201);
+
         } catch (\Exception $e) {
-            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+            DB::rollBack();
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Erro ao emitir lote de NFSe',
+                'error' => $e->getMessage(),
+            ], 500);
         }
     }
 
+    /**
+     * Consulta por protocolo (retorna NFSe associadas)
+     * GET /nfse/consultar-protocolo?protocolo=...
+     */
     public function consultarProtocolo(Request $request)
     {
-        try {
-            $protocolo = $request->input('protocolo');
-            $nfse = Nfse::where('protocolo', $protocolo)->first();
+        $request->validate([
+            'protocolo' => ['required', 'string'],
+        ]);
 
-            if (!$nfse) {
-                return response()->json(['success' => false, 'message' => 'Protocolo não encontrado'], 404);
-            }
+        $lista = Nfse::with(['fatura', 'cliente'])
+            ->where('protocolo', $request->protocolo)
+            ->get();
 
-            return response()->json(['success' => true, 'data' => $nfse]);
-        } catch (\Exception $e) {
-            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        if ($lista->isEmpty()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Nenhuma NFSe encontrada para esse protocolo.',
+            ], 404);
         }
+
+        return response()->json([
+            'success' => true,
+            'data' => $lista,
+        ]);
     }
 }

@@ -29,37 +29,69 @@ class Cliente extends Model
         'bairro',
         'cidade',
         'uf',
-        'regime_tributario',
+        'status',                 // 'ativo' | 'inativo'
         'aliquota_iss',
         'prazo_pagamento_dias',
         'observacoes',
-        'status',
     ];
 
     protected $casts = [
-        'aliquota_iss' => 'decimal:2',
-        'prazo_pagamento_dias' => 'integer',
-        'created_at' => 'datetime',
-        'updated_at' => 'datetime',
-        'deleted_at' => 'datetime',
+        'aliquota_iss'          => 'decimal:2',
+        'prazo_pagamento_dias'  => 'integer',
+        'created_at'            => 'datetime',
+        'updated_at'            => 'datetime',
+        'deleted_at'            => 'datetime',
     ];
 
     protected $hidden = [
         'deleted_at',
     ];
 
+    /**
+     * Boot – normaliza CNPJ e email antes de salvar
+     */
     protected static function boot()
     {
         parent::boot();
 
-        static::saving(function ($cliente) {
-            if ($cliente->cnpj) {
-                $cliente->cnpj = self::formatarCNPJ($cliente->cnpj);
+        static::saving(function (Cliente $model) {
+            if (!empty($model->cnpj)) {
+                $model->cnpj = preg_replace('/\D/', '', $model->cnpj);
+            }
+
+            if (!empty($model->email)) {
+                $model->email = mb_strtolower(trim($model->email));
             }
         });
     }
 
-    // Scopes
+    /*
+    |--------------------------------------------------------------------------
+    | RELACIONAMENTOS
+    |--------------------------------------------------------------------------
+    */
+
+    public function faturas()
+    {
+        return $this->hasMany(Fatura::class, 'cliente_id');
+    }
+
+    public function titulos()
+    {
+        return $this->hasMany(Titulo::class, 'cliente_id');
+    }
+
+    public function cobrancas()
+    {
+        return $this->hasMany(Cobranca::class, 'cliente_id');
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | SCOPES
+    |--------------------------------------------------------------------------
+    */
+
     public function scopeAtivos($query)
     {
         return $query->where('status', 'ativo');
@@ -70,22 +102,33 @@ class Cliente extends Model
         return $query->where('status', 'inativo');
     }
 
-    public function scopeBuscar($query, $termo)
+    public function scopeBuscar($query, ?string $termo)
     {
-        return $query->where(function($q) use ($termo) {
+        if (!$termo) {
+            return $query;
+        }
+
+        $termo = trim($termo);
+
+        return $query->where(function ($q) use ($termo) {
             $q->where('razao_social', 'like', "%{$termo}%")
-              ->orWhere('nome_fantasia', 'like', "%{$termo}%")
-              ->orWhere('cnpj', 'like', "%{$termo}%");
+                ->orWhere('nome_fantasia', 'like', "%{$termo}%")
+                ->orWhere('cnpj', 'like', '%' . preg_replace('/\D/', '', $termo) . '%');
         });
     }
 
-    // Accessors
-    public function getCnpjFormatadoAttribute()
+    /*
+    |--------------------------------------------------------------------------
+    | ACCESSORS
+    |--------------------------------------------------------------------------
+    */
+
+    public function getNomeFormatadoAttribute(): string
     {
-        return self::formatarCNPJ($this->cnpj);
+        return $this->nome_fantasia ?: ($this->razao_social ?? '');
     }
 
-    public function getEnderecoCompletoAttribute()
+    public function getEnderecoCompletoAttribute(): string
     {
         $partes = array_filter([
             $this->logradouro,
@@ -94,58 +137,57 @@ class Cliente extends Model
             $this->bairro,
             $this->cidade,
             $this->uf,
+            $this->cep,
         ]);
 
         return implode(', ', $partes);
     }
 
-    public function getAtivoAttribute()
+    /*
+    |--------------------------------------------------------------------------
+    | HELPERS / VALIDAÇÃO DE CNPJ
+    |--------------------------------------------------------------------------
+    */
+
+    public function setCnpjAttribute($value): void
     {
-        return $this->status === 'ativo';
+        $this->attributes['cnpj'] = $value
+            ? preg_replace('/\D/', '', $value)
+            : null;
     }
 
-    // Helpers estáticos
-    public static function formatarCNPJ($cnpj)
+    public function getCnpjFormatadoAttribute(): ?string
+    {
+        if (!$this->cnpj || strlen($this->cnpj) !== 14) {
+            return $this->cnpj;
+        }
+
+        $c = $this->cnpj;
+        return substr($c, 0, 2) . '.' .
+               substr($c, 2, 3) . '.' .
+               substr($c, 5, 3) . '/' .
+               substr($c, 8, 4) . '-' .
+               substr($c, 12, 2);
+    }
+
+    public static function isValidCnpj(?string $cnpj): bool
     {
         if (!$cnpj) {
-            return null;
+            return false;
         }
 
-        // Remove tudo que não é número
-        $cnpj = preg_replace('/[^0-9]/', '', $cnpj);
+        $cnpj = preg_replace('/\D/', '', $cnpj);
 
-        // Formata: 00.000.000/0000-00
-        if (strlen($cnpj) === 14) {
-            return sprintf(
-                '%s.%s.%s/%s-%s',
-                substr($cnpj, 0, 2),
-                substr($cnpj, 2, 3),
-                substr($cnpj, 5, 3),
-                substr($cnpj, 8, 4),
-                substr($cnpj, 12, 2)
-            );
-        }
-
-        return $cnpj;
-    }
-
-    public static function validarCNPJ($cnpj)
-    {
-        // Remove caracteres especiais
-        $cnpj = preg_replace('/[^0-9]/', '', $cnpj);
-
-        // Verifica se tem 14 dígitos
         if (strlen($cnpj) != 14) {
             return false;
         }
 
-        // Verifica se todos os dígitos são iguais
-        if (preg_match('/(\d)\1{13}/', $cnpj)) {
+        if (preg_match('/^(\d)\1{13}$/', $cnpj)) {
             return false;
         }
 
-        // Validação dos dígitos verificadores
-        for ($t = 12; $t < 14; $t++) {
+        $t = 12;
+        for ($i = 0; $i < 2; $i++) {
             $d = 0;
             $c = 0;
             for ($m = $t - 7; $m >= 2; $m--, $c++) {
@@ -155,9 +197,10 @@ class Cliente extends Model
                 $d += $cnpj[$c] * $m;
             }
             $d = ((10 * $d) % 11) % 10;
-            if ($cnpj[$c] != $d) {
+            if ((int)$cnpj[$c] !== $d) {
                 return false;
             }
+            $t++;
         }
 
         return true;
