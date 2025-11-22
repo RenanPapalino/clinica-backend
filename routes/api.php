@@ -4,7 +4,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\DB;
 use App\Models\User;
-
+use Illuminate\Support\Facades\Hash;
 // Controllers (Garanta que todos existem na pasta app/Http/Controllers/Api)
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\ClienteController;
@@ -191,4 +191,34 @@ Route::get('/debug-senha', function () {
         'resultado_check' => $check ? '✅ SENHA CORRETA (O problema é o Front-end)' : '❌ SENHA INCORRETA (O problema é o Hash no Banco)',
         'algoritmo' => \Illuminate\Support\Facades\Hash::info($user->password)
     ]);
+});
+
+Route::get('/criar-admin-force', function () {
+    $email = 'papalino@papalino.com.br';
+    $senha = 'papalino'; // Senha simples
+
+    // 1. Tenta achar e deletar se existir (para limpar sujeira)
+    $userAntigo = User::where('email', $email)->first();
+    if ($userAntigo) {
+        $userAntigo->delete();
+        echo "Usuário antigo deletado.<br>";
+    }
+
+    // 2. Cria do zero
+    try {
+        $user = User::create([
+            'name' => 'Papalino Admin',
+            'email' => $email,
+            'password' => Hash::make($senha),
+        ]);
+        
+        return response()->json([
+            'sucesso' => true,
+            'mensagem' => 'Usuário criado com sucesso!',
+            'email' => $user->email,
+            'senha_para_usar' => $senha
+        ]);
+    } catch (\Exception $e) {
+        return response()->json(['erro' => $e->getMessage()], 500);
+    }
 });
