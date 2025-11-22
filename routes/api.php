@@ -5,28 +5,25 @@ use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\DB;
 use App\Models\User;
 use Illuminate\Support\Facades\Hash;
-// Controllers (Garanta que todos existem na pasta app/Http/Controllers/Api)
+
+// Controllers
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\ClienteController;
-use App\Http\Controllers\Api\FornecedorController; // Novo
+use App\Http\Controllers\Api\FornecedorController;
 use App\Http\Controllers\Api\ServicoController;
-use App\Http\Controllers\Api\PlanoContaController; // Novo
-use App\Http\Controllers\Api\CentroCustoController; // Novo
+use App\Http\Controllers\Api\PlanoContaController;
+use App\Http\Controllers\Api\CentroCustoController;
 use App\Http\Controllers\Api\FaturaController;
 use App\Http\Controllers\Api\NfseController;
 use App\Http\Controllers\Api\TituloController;
-use App\Http\Controllers\Api\CobrancaController; // Faltava no seu use
+use App\Http\Controllers\Api\CobrancaController;
 use App\Http\Controllers\Api\RelatorioController;
-use App\Http\Controllers\Api\LancamentoContabilController; // Novo
-use App\Http\Controllers\Api\ChatController; // Novo
+use App\Http\Controllers\Api\LancamentoContabilController;
+use App\Http\Controllers\Api\ChatController;
 use App\Http\Controllers\Api\N8nController;
 use App\Http\Controllers\Api\DashboardController;
-
-/*
-|--------------------------------------------------------------------------
-| API Routes - MedIntelligence
-|--------------------------------------------------------------------------
-*/
+use App\Http\Controllers\Api\DespesaController;
+use App\Http\Controllers\Api\ConfiguracaoController;
 
 // ============================================
 // ROTAS PÚBLICAS (Health & Debug)
@@ -36,8 +33,8 @@ Route::get('/health', function () {
     return response()->json([
         'status' => 'ok',
         'timestamp' => now()->toISOString(),
-        'service' => 'Clinica Financeiro API',
-        'version' => '1.0.0',
+        'service' => 'MedIntelligence API',
+        'version' => '2.0.0',
     ]);
 });
 
@@ -48,12 +45,6 @@ Route::get('/db-test', function () {
     } catch (\Exception $e) {
         return response()->json(['database' => 'error', 'message' => $e->getMessage()], 500);
     }
-});
-
-// Rota de Debug de Login (Pode remover em produção)
-Route::get('/debug-login', function () {
-    // ... (código de debug que passamos antes)
-    return response()->json(['status' => 'debug_route_active']);
 });
 
 // ============================================
@@ -76,17 +67,24 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/me', [AuthController::class, 'me']);
     });
 
-    // Dashboard
+    // ========== DASHBOARD COMPLETO ==========
     Route::prefix('dashboard')->group(function () {
+        Route::get('/kpis-completos', [DashboardController::class, 'kpisCompletos']);
         Route::get('/titulos-vencendo', [DashboardController::class, 'titulosVencendo']);
         Route::get('/acoes-pendentes', [DashboardController::class, 'acoesPendentes']);
+        Route::get('/ultimas-faturas', [DashboardController::class, 'ultimasFaturas']);
+        Route::get('/fluxo-caixa', [DashboardController::class, 'fluxoCaixa']);
+        Route::get('/graficos', [DashboardController::class, 'graficos']); // Consolidado
+        Route::get('/top-clientes', [DashboardController::class, 'topClientes']);
+        Route::get('/receita-por-servico', [DashboardController::class, 'receitaPorServico']);
+        Route::get('/taxa-inadimplencia', [DashboardController::class, 'taxaInadimplencia']);
     });
 
     // Cadastros Gerais (Hub)
     Route::prefix('cadastros')->group(function () {
         Route::apiResource('clientes', ClienteController::class);
         Route::post('clientes/importar', [ClienteController::class, 'importarLote']);
-        Route::post('clientes/sincronizar-soc', [ClienteController::class, 'sincronizarSoc']); // Movido para cá (Seguro)
+        Route::post('clientes/sincronizar-soc', [ClienteController::class, 'sincronizarSoc']);
         
         Route::apiResource('servicos', ServicoController::class);
     });
@@ -108,8 +106,8 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('estatisticas', [FaturaController::class, 'estatisticas']);
         
         // Novas rotas inteligentes
-        Route::post('analisar', [FaturaController::class, 'analisarArquivo']); // Movido para cá
-        Route::post('processar-confirmados', [FaturaController::class, 'processarLoteConfirmado']); // Movido para cá
+        Route::post('analisar', [FaturaController::class, 'analisarArquivo']);
+        Route::post('processar-confirmados', [FaturaController::class, 'processarLoteConfirmado']);
         Route::post('importar-lote', [FaturaController::class, 'importarLote']);
     });
 
@@ -118,37 +116,78 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/', [NfseController::class, 'index']);
         Route::post('/emitir-lote', [NfseController::class, 'emitirLote']);
         Route::get('/consultar-protocolo', [NfseController::class, 'consultarProtocolo']);
+        
+        // Novos endpoints
+        Route::get('/{id}/xml', [NfseController::class, 'downloadXml']);
+        Route::get('/{id}/pdf', [NfseController::class, 'downloadPdf']);
+        Route::post('/{id}/cancelar', [NfseController::class, 'cancelar']);
     });
 
     // Contas a Receber & Pagar (Títulos Unificados)
-    Route::apiResource('titulos', TituloController::class); // CRUD Completo
+    Route::apiResource('titulos', TituloController::class);
     
     Route::prefix('contas-receber')->group(function () {
-        // Atalhos para front-end legado
         Route::get('titulos', [TituloController::class, 'index']); 
         Route::post('titulos/{id}/baixar', [TituloController::class, 'baixar']);
         Route::get('aging', [TituloController::class, 'relatorioAging']);
     });
 
-    // Cobrança
+    // Contas a Pagar (Despesas)
+    Route::prefix('contas-pagar')->group(function () {
+        Route::get('despesas', [DespesaController::class, 'index']);
+        Route::post('despesas', [DespesaController::class, 'store']);
+        Route::post('despesas/analisar-documento', [DespesaController::class, 'analisarDocumento']);
+        Route::post('despesas/{id}/pagar', [DespesaController::class, 'pagar']);
+    });
+
+    // ========== COBRANÇAS (NOVO MÓDULO COMPLETO) ==========
     Route::prefix('cobrancas')->group(function () {
-         // Se tiver métodos específicos além do CRUD de títulos
-         Route::post('enviar/{faturaId}', [CobrancaController::class, 'enviarCobranca']); 
-         Route::post('gerar-remessa', [CobrancaController::class, 'gerarRemessa']);
+        Route::get('inadimplentes', [CobrancaController::class, 'inadimplentes']);
+        Route::post('enviar-whatsapp/{clienteId}', [CobrancaController::class, 'enviarWhatsApp']);
+        Route::post('enviar-email/{clienteId}', [CobrancaController::class, 'enviarEmail']);
+        Route::post('enviar-lote', [CobrancaController::class, 'enviarLote']);
+        Route::post('gerar-remessa', [CobrancaController::class, 'gerarRemessa']);
+        Route::post('processar-retorno', [CobrancaController::class, 'processarRetorno']);
     });
     
-    // Contabilidade Inteligente (Movido para área segura)
+    // Contabilidade Inteligente
     Route::apiResource('lancamentos-contabeis', LancamentoContabilController::class)->only(['index', 'store', 'show']);
     Route::post('contabilidade/processar-titulo/{id}', [LancamentoContabilController::class, 'processarTitulo']);
+    Route::get('contabilidade/balancete', [LancamentoContabilController::class, 'balancete']);
+    Route::get('contabilidade/dre-real', [LancamentoContabilController::class, 'dreReal']);
 
     // Relatórios
     Route::prefix('relatorios')->group(function () {
         Route::get('/dashboard', [RelatorioController::class, 'dashboard']);
         Route::get('/faturamento-periodo', [RelatorioController::class, 'faturamentoPorPeriodo']);
         Route::get('/top-clientes', [RelatorioController::class, 'topClientes']);
-        // Endpoints para o Dashboard CFO
-        Route::get('/fluxo-caixa', [RelatorioController::class, 'getFluxoCaixa']); // Assumindo que criou
-        Route::get('/dre', [RelatorioController::class, 'getDRE']); // Assumindo que criou
+        
+        // Novos endpoints para dados reais
+        Route::get('/fluxo-caixa-real', [RelatorioController::class, 'getFluxoCaixaReal']);
+        Route::get('/dre-real', [RelatorioController::class, 'getDREReal']);
+        Route::post('/exportar-pdf', [RelatorioController::class, 'exportarPDF']);
+    });
+
+    // ========== CONFIGURAÇÕES (NOVO MÓDULO COMPLETO) ==========
+    Route::prefix('configuracoes')->group(function () {
+        // Empresa
+        Route::get('/empresa', [ConfiguracaoController::class, 'getEmpresa']);
+        Route::put('/empresa', [ConfiguracaoController::class, 'updateEmpresa']);
+        Route::post('/upload-logo', [ConfiguracaoController::class, 'uploadLogo']);
+        
+        // Usuários
+        Route::get('/usuarios', [ConfiguracaoController::class, 'getUsuarios']);
+        Route::post('/usuarios', [ConfiguracaoController::class, 'storeUsuario']);
+        Route::put('/usuarios/{id}', [ConfiguracaoController::class, 'updateUsuario']);
+        Route::delete('/usuarios/{id}', [ConfiguracaoController::class, 'destroyUsuario']);
+        
+        // Integrações
+        Route::get('/integracoes', [ConfiguracaoController::class, 'getIntegracoes']);
+        Route::put('/integracoes', [ConfiguracaoController::class, 'updateIntegracoes']);
+        
+        // Fiscal
+        Route::get('/fiscal', [ConfiguracaoController::class, 'getFiscal']);
+        Route::put('/fiscal', [ConfiguracaoController::class, 'updateFiscal']);
     });
 
     // Chat IA
@@ -169,18 +208,20 @@ Route::middleware('auth:sanctum')->group(function () {
 
 }); // Fim do middleware auth:sanctum
 
+// ============================================
+// ROTAS DE DEBUG (REMOVER EM PRODUÇÃO)
+// ============================================
+
 Route::get('/debug-senha', function () {
     $email = 'papalino@papalino.com.br';
     $senha = 'papalino';
     
-    // 1. Busca o usuário
     $user = \App\Models\User::where('email', $email)->first();
     
     if (!$user) {
-        return response()->json(['erro' => 'Usuário não encontrado no banco com este e-mail exato.']);
+        return response()->json(['erro' => 'Usuário não encontrado']);
     }
 
-    // 2. Testa a senha
     $check = \Illuminate\Support\Facades\Hash::check($senha, $user->password);
     
     return response()->json([
@@ -188,28 +229,27 @@ Route::get('/debug-senha', function () {
         'email_banco' => $user->email,
         'senha_testada' => $senha,
         'hash_no_banco' => $user->password,
-        'resultado_check' => $check ? '✅ SENHA CORRETA (O problema é o Front-end)' : '❌ SENHA INCORRETA (O problema é o Hash no Banco)',
+        'resultado_check' => $check ? '✅ SENHA CORRETA' : '❌ SENHA INCORRETA',
         'algoritmo' => \Illuminate\Support\Facades\Hash::info($user->password)
     ]);
 });
 
 Route::get('/criar-admin-force', function () {
     $email = 'papalino@papalino.com.br';
-    $senha = 'papalino'; // Senha simples
+    $senha = 'papalino';
 
-    // 1. Tenta achar e deletar se existir (para limpar sujeira)
     $userAntigo = User::where('email', $email)->first();
     if ($userAntigo) {
         $userAntigo->delete();
-        echo "Usuário antigo deletado.<br>";
     }
 
-    // 2. Cria do zero
     try {
         $user = User::create([
             'name' => 'Papalino Admin',
             'email' => $email,
             'password' => Hash::make($senha),
+            'role' => 'admin',
+            'ativo' => true
         ]);
         
         return response()->json([
