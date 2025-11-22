@@ -3,15 +3,13 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Traits\ApiResponseTrait;
 use App\Models\ChatMessage;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
 class ChatController extends Controller
 {
-    use ApiResponseTrait;
-
     public function enviarMensagem(Request $request)
     {
         $request->validate([
@@ -20,10 +18,10 @@ class ChatController extends Controller
         ]);
 
         $mensagemUsuario = $request->input('mensagem');
-        $user = $request->user(); // Usuário autenticado
+        $user = $request->user();
         $sessionId = $request->input('session_id', 'session_' . $user->id);
 
-        // 1. Salvar mensagem do usuário no banco
+        // 1. Salvar mensagem do usuário
         ChatMessage::create([
             'user_id' => $user->id,
             'role' => 'user',
@@ -31,31 +29,35 @@ class ChatController extends Controller
             'session_id' => $sessionId,
         ]);
 
-        // 2. Enviar para o Agente Orquestrador no n8n
-        // URL do seu webhook do n8n (ajuste conforme seu setup)
-        $n8nWebhookUrl = env('N8N_CHAT_WEBHOOK_URL', 'http://localhost:5678/webhook/chat-agent');
+        // 2. Enviar para IA (n8n)
+        $n8nWebhookUrl = env('N8N_CHAT_WEBHOOK_URL');
+        $respostaIa = "Desculpe, o assistente está indisponível no momento.";
 
-        try {
-            // Enviamos contexto do usuário para o n8n
-            $response = Http::timeout(30)->post($n8nWebhookUrl, [
-                'message' => $mensagemUsuario,
-                'user_id' => $user->id,
-                'user_name' => $user->name,
-                'session_id' => $sessionId,
-                'context' => 'financeiro' 
-            ]);
+        if ($n8nWebhookUrl) {
+            try {
+                $response = Http::timeout(30)->post($n8nWebhookUrl, [
+                    'message' => $mensagemUsuario,
+                    'user_id' => $user->id,
+                    'user_name' => $user->name,
+                    'session_id' => $sessionId,
+                    'context' => 'financeiro' 
+                ]);
 
-            if ($response->successful()) {
-                $data = $response->json();
-                // Espera que o n8n retorne: { "output": "Texto da resposta" }
-                $respostaIa = $data['output'] ?? 'Desculpe, não consegui processar sua solicitação no momento.';
-            } else {
-                $respostaIa = 'Erro de comunicação com o assistente inteligente.';
+                if ($response->successful()) {
+                    $data = $response->json();
+                    // Aceita 'output', 'text' ou 'message' como resposta do n8n
+                    $respostaIa = $data['output'] ?? $data['text'] ?? $data['message'] ?? 'Recebi, mas não entendi a resposta da IA.';
+                } else {
+                    Log::error("Erro n8n: Status " . $response->status());
+                    $respostaIa = "Erro de comunicação com a IA (Código: " . $response->status() . ")";
+                }
+            } catch (\Exception $e) {
+                Log::error("Erro n8n Exception: " . $e->getMessage());
+                $respostaIa = "O assistente está demorando muito para responder.";
             }
-
-        } catch (\Exception $e) {
-            $respostaIa = 'O assistente está indisponível temporariamente.';
-             \Log::error("Erro n8n: " . $e->getMessage());
+        } else {
+            // Modo Simulação (se não tiver n8n configurado no .env)
+            $respostaIa = "Modo Demo: Recebi sua mensagem '{$mensagemUsuario}'. Configure o N8N_CHAT_WEBHOOK_URL no .env para ativar a IA real.";
         }
 
         // 3. Salvar resposta da IA
@@ -63,25 +65,27 @@ class ChatController extends Controller
             'user_id' => $user->id,
             'role' => 'assistant',
             'content' => $respostaIa,
-            'session_id' => $sessionId,
+            'session_id' => 'session_' . $user->id, // Corrigido para salvar na mesma sessão
         ]);
 
-        return $this->successResponse([
-            'id' => (string) $chatMessage->id,
-            'role' => 'assistant',
-            'content' => $respostaIa,
-            'timestamp' => $chatMessage->created_at->toISOString(),
+        return response()->json([
+            'success' => true,
+            'data' => $chatMessage // Retorna o objeto completo para o front
         ]);
     }
 
     public function historico(Request $request)
     {
         $user = $request->user();
+        // Ordena por created_at ASC para o chat exibir na ordem correta (antigas em cima)
         $messages = ChatMessage::where('user_id', $user->id)
-            ->orderBy('created_at', 'asc')
+            ->orderBy('created_at', 'asc') 
             ->take(50)
             ->get();
 
-        return $this->successResponse($messages);
+        return response()->json([
+            'success' => true,
+            'data' => $messages
+        ]);
     }
 }
