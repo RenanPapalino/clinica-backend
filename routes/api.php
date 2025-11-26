@@ -27,7 +27,7 @@ use App\Http\Controllers\Api\DashboardController;
 use App\Http\Controllers\Api\DespesaController;
 use App\Http\Controllers\Api\ConfiguracaoController;
 use App\Http\Controllers\Api\OrdemServicoController;
-use App\Http\Controllers\FaturamentoController;
+use App\Http\Controllers\Api\FaturamentoController;
 
 
 // ============================================
