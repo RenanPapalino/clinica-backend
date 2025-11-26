@@ -1,142 +1,122 @@
 <?php
 
-namespace App\Services\Integracao;
+namespace App\Services;
 
+use App\Models\OrdemServico;
 use App\Models\Cliente;
-use App\Services\Financeiro\TributoService;
-use Illuminate\Support\Collection;
-use Illuminate\Support\Str;
-use App\Services\Integracao\SocIntegrationService; // Importar
+use Illuminate\Support\Facades\DB;
+use Exception;
 
 class SocImportService
 {
-    protected $tributoService;
-
-public function sincronizarSoc(Request $request, SocIntegrationService $socService)
+    public function processarArquivo($caminhoArquivo)
     {
-        // Em produção, esses dados viriam do .env ou de uma tabela de configuração
-        $request->validate([
-            'empresa_id' => 'required|string', // Ex: 957
-            'codigo_soc' => 'required|string', // A senha/hash do SOC
-        ]);
+        $linhas = file($caminhoArquivo);
+        $cnpjEncontrado = null;
+        $inicioDados = false;
+        $mapaColunas = [];
+        $itensParaSalvar = [];
 
-        try {
-            $stats = $socService->sincronizarClientes(
-                $request->empresa_id,
-                $request->codigo_soc
-            );
+        // 1. Varredura Inicial (Metadados e Header)
+        foreach ($linhas as $idx => $linha) {
+            // Detecta encoding e converte para UTF-8
+            $linha = mb_convert_encoding($linha, 'UTF-8', mb_detect_encoding($linha, ['UTF-8', 'ISO-8859-1'], true));
+            $cols = str_getcsv($linha, count(explode(';', $linha)) > count(explode(',', $linha)) ? ';' : ',');
 
-            return response()->json([
-                'success' => true,
-                'message' => "Sincronização concluída: {$stats['criados']} criados, {$stats['atualizados']} atualizados.",
-                'stats' => $stats
-            ]);
+            // Busca CNPJ no cabeçalho
+            if (!$cnpjEncontrado) {
+                foreach ($cols as $c) {
+                    if (preg_match('/\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/', $c, $matches)) {
+                        $cnpjEncontrado = preg_replace('/\D/', '', $matches[0]);
+                    }
+                }
+            }
 
-        } catch (\Exception $e) {
-            return response()->json([
-                'success' => false, 
-                'message' => 'Falha na sincronização: ' . $e->getMessage()
-            ], 500);
-        }
-    }
+            // Identifica a linha de cabeçalho da tabela
+            if (!$inicioDados && (in_array('Produto/Serviço', $cols) || in_array('Total R$', $cols))) {
+                $inicioDados = true;
+                // Mapeia índices das colunas dinamicamente
+                $mapaColunas = [
+                    'descricao' => array_search('Produto/Serviço', $cols),
+                    'total'     => array_search('Total R$', $cols),
+                    'unidade'   => array_search('Unidade', $cols),
+                    'empresa'   => array_search('Empresa Cliente', $cols),
+                ];
+                continue;
+            }
 
-    public function __construct(TributoService $tributoService)
-    {
-        $this->tributoService = $tributoService;
-    }
+            // Processa linhas de dados
+            if ($inicioDados) {
+                // Validação mínima: tem descrição e valor?
+                $idxDesc = $mapaColunas['descricao'] ?? 0;
+                $idxTotal = $mapaColunas['total'] ?? 12; // Fallback para posição 12 do CSV CURY
 
-    /**
-     * Analisa o arquivo e retorna uma prévia do que será gerado
-     */
-    public function analisarArquivo(array $linhasCsv): array
-    {
-        $faturasDetectadas = [];
-        $erros = [];
-        
-        // Estrutura temporária para agrupar itens por "Empresa Cliente" (Coluna E do seu CSV)
-        $agrupamento = [];
+                $descricao = $cols[$idxDesc] ?? null;
+                $valorRaw = $cols[$idxTotal] ?? '0';
 
-        foreach ($linhasCsv as $index => $linha) {
-            // Pula cabeçalhos inúteis ou linhas vazias
-            if (count($linha) < 5 || empty($linha[4])) continue;
+                if (empty($descricao) || str_contains($descricao, 'Total')) continue;
 
-            // Detecção Inteligente: Tenta achar a coluna "Empresa Cliente" e "Total R$"
-            // Baseado no seu CSV, a empresa cliente está no índice 4 (Coluna E)
-            // O valor total está no índice 9 (Coluna J)
-            
-            $nomeCliente = trim($linha[4]);
-            $descricaoServico = trim($linha[0] ?? 'Serviço SOC');
-            $valorTotal = $this->parseMoney($linha[9] ?? '0');
+                $valor = $this->parseValor($valorRaw);
+                if ($valor <= 0) continue;
 
-            // Ignora linhas de cabeçalho repetidas
-            if ($nomeCliente === 'Empresa Cliente' || $nomeCliente === '') continue;
-
-            if (!isset($agrupamento[$nomeCliente])) {
-                $agrupamento[$nomeCliente] = [
-                    'cliente_nome' => $nomeCliente,
-                    'itens' => [],
-                    'valor_total_lote' => 0
+                $itensParaSalvar[] = [
+                    'descricao' => $descricao,
+                    'valor' => $valor,
+                    'unidade' => $cols[$mapaColunas['unidade'] ?? 6] ?? null,
+                    'cliente_origem' => $cols[$mapaColunas['empresa'] ?? 5] ?? null,
                 ];
             }
+        }
 
-            $agrupamento[$nomeCliente]['itens'][] = [
-                'descricao' => $descricaoServico,
-                'unidade' => $linha[5] ?? '', // Coluna F
-                'vidas' => $linha[7] ?? 0,    // Coluna H
-                'valor' => $valorTotal,
-                'data_evento' => $linha[6] ?? now()->format('Y-m-d'), // Data Cobrança
-            ];
+        if (empty($itensParaSalvar)) {
+            throw new Exception("Nenhum item válido encontrado. Verifique o layout do arquivo.");
+        }
+
+        // 2. Persistência (Transação)
+        return DB::transaction(function () use ($cnpjEncontrado, $itensParaSalvar) {
+            // Busca cliente pelo CNPJ do cabeçalho ou usa um padrão (ID 1) se falhar
+            $cliente = Cliente::where('cnpj', $cnpjEncontrado)->first();
             
-            $agrupamento[$nomeCliente]['valor_total_lote'] += $valorTotal;
-        }
-
-        // Validação: Verificar se os clientes existem no banco
-        $resultado = [
-            'validos' => [],
-            'com_pendencia' => []
-        ];
-
-        foreach ($agrupamento as $nomeCliente => $dados) {
-            // Tenta achar cliente por nome aproximado (LIKE) ou cria um hash temporário
-            $cliente = Cliente::where('razao_social', 'like', "%{$nomeCliente}%")
-                              ->orWhere('nome_fantasia', 'like', "%{$nomeCliente}%")
-                              ->first();
-
-            $faturaTemp = [
-                'temp_id' => Str::uuid(),
-                'cliente_nome_csv' => $nomeCliente,
-                'cliente_id' => $cliente ? $cliente->id : null,
-                'cliente_encontrado' => $cliente ? $cliente->razao_social : null,
-                'cnpj' => $cliente ? $cliente->cnpj : null,
-                'valor_total' => $dados['valor_total_lote'],
-                'itens_count' => count($dados['itens']),
-                'itens' => $dados['itens'],
-                'erros' => []
-            ];
-
-            if (!$cliente) {
-                $faturaTemp['erros'][] = "Cliente '{$nomeCliente}' não encontrado no cadastro.";
-                $resultado['com_pendencia'][] = $faturaTemp;
-            } else {
-                // Simula cálculo de impostos para mostrar ao usuário
-                $impostos = $this->tributoService->calcularRetencoes($dados['valor_total_lote'], $cliente);
-                $faturaTemp['previsao_impostos'] = $impostos['total_retido'];
-                $faturaTemp['valor_liquido'] = $impostos['valor_liquido'];
-                
-                $resultado['validos'][] = $faturaTemp;
+            if (!$cliente && count($itensParaSalvar) > 0) {
+                // Fallback: Tenta achar cliente pelo nome da primeira linha de dados?
+                // Por segurança, vamos exigir que o cliente exista ou usar um genérico.
+                // throw new Exception("Cliente com CNPJ $cnpjEncontrado não cadastrado.");
+                $cliente = Cliente::first(); // Em dev, pega o primeiro
             }
-        }
 
-        return $resultado;
+            // Cria a OS
+            $os = OrdemServico::create([
+                'cliente_id' => $cliente->id,
+                'codigo_os' => 'OS-' . date('Ymd-His'),
+                'competencia' => date('m/Y'),
+                'data_emissao' => now(),
+                'valor_total' => collect($itensParaSalvar)->sum('valor'),
+                'status' => 'pendente',
+                'observacoes' => 'Importado via planilha SOC'
+            ]);
+
+            // Salva Itens
+            foreach ($itensParaSalvar as $item) {
+                $os->itens()->create([
+                    'descricao' => $item['descricao'],
+                    'quantidade' => 1,
+                    'valor_unitario' => $item['valor'],
+                    'valor_total' => $item['valor'],
+                    'unidade_soc' => $item['unidade'],
+                    'centro_custo_cliente' => $item['cliente_origem'] // Guarda quem consumiu o serviço
+                ]);
+            }
+
+            return $os->load('itens', 'cliente');
+        });
     }
 
-    private function parseMoney($valor)
+    private function parseValor($val)
     {
-        if (is_numeric($valor)) return (float) $valor;
-        // Remove R$, troca vírgula por ponto se necessário (formato brasileiro)
-        // No seu CSV está "12067,89" (com aspas e vírgula)
-        $limpo = str_replace(['R$', '.', ' '], '', $valor);
-        $limpo = str_replace(',', '.', $limpo);
-        return (float) $limpo;
+        // Remove R$, espaços e converte "1.200,50" para 1200.50
+        $val = preg_replace('/[^0-9,.-]/', '', $val);
+        $val = str_replace('.', '', $val); // Tira ponto de milhar
+        $val = str_replace(',', '.', $val); // Troca vírgula por ponto
+        return (float) $val;
     }
 }

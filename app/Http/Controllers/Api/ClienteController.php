@@ -5,34 +5,35 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Cliente;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 class ClienteController extends Controller
 {
     public function index(Request $request)
     {
-        try {
-            $clientes = Cliente::orderBy('razao_social', 'asc')->get();
-            
-            return response()->json([
-                'success' => true,
-                'data' => $clientes,
-                'total' => $clientes->count()
-            ]);
-        } catch (\Exception $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Erro ao listar clientes',
-                'error' => $e->getMessage(),
-                'file' => $e->getFile(),
-                'line' => $e->getLine()
-            ], 500);
+        $query = Cliente::query();
+
+        if ($request->has('search')) {
+            $search = $request->search;
+            $query->where(function($q) use ($search) {
+                $q->where('razao_social', 'like', "%{$search}%")
+                  ->orWhere('nome_fantasia', 'like', "%{$search}%")
+                  ->orWhere('cnpj', 'like', "%{$search}%");
+            });
         }
+
+        $clientes = $query->orderBy('razao_social', 'asc')->paginate(50);
+        
+        return response()->json([
+            'success' => true,
+            'data' => $clientes
+        ]);
     }
 
     public function store(Request $request)
     {
         try {
-            // Validação básica
             $data = $request->validate([
                 'cnpj' => 'required|string',
                 'razao_social' => 'required|string|max:200',
@@ -45,10 +46,9 @@ class ClienteController extends Controller
                 'status' => 'nullable|in:ativo,inativo',
             ]);
 
-            // Garantir status padrão
-            if (!isset($data['status'])) {
-                $data['status'] = 'ativo';
-            }
+            // Limpa CNPJ
+            $data['cnpj'] = preg_replace('/\D/', '', $data['cnpj']);
+            $data['status'] = $data['status'] ?? 'ativo';
 
             $cliente = Cliente::create($data);
 
@@ -57,143 +57,108 @@ class ClienteController extends Controller
                 'message' => 'Cliente cadastrado com sucesso',
                 'data' => $cliente
             ], 201);
-        } catch (\Illuminate\Validation\ValidationException $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Erro de validação',
-                'errors' => $e->errors()
-            ], 422);
+
         } catch (\Exception $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Erro ao cadastrar cliente',
-                'error' => $e->getMessage(),
-                'file' => $e->getFile(),
-                'line' => $e->getLine()
-            ], 500);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
         }
     }
 
     public function show($id)
     {
-        try {
-            $cliente = Cliente::findOrFail($id);
-            
-            return response()->json([
-                'success' => true,
-                'data' => $cliente
-            ]);
-        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Cliente não encontrado'
-            ], 404);
-        }
+        $cliente = Cliente::findOrFail($id);
+        return response()->json(['success' => true, 'data' => $cliente]);
     }
 
     public function update(Request $request, $id)
     {
         try {
             $cliente = Cliente::findOrFail($id);
-            
-            $data = $request->validate([
-                'cnpj' => 'sometimes|string',
-                'razao_social' => 'sometimes|string|max:200',
-                'nome_fantasia' => 'nullable|string|max:200',
-                'email' => 'nullable|email|max:100',
-                'telefone' => 'nullable|string|max:20',
-                'status' => 'nullable|in:ativo,inativo',
-            ]);
-
-            $cliente->update($data);
-
-            return response()->json([
-                'success' => true,
-                'message' => 'Cliente atualizado com sucesso',
-                'data' => $cliente
-            ]);
-        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Cliente não encontrado'
-            ], 404);
+            $cliente->update($request->all());
+            return response()->json(['success' => true, 'message' => 'Atualizado com sucesso']);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
         }
     }
 
     public function destroy($id)
     {
         try {
-            $cliente = Cliente::findOrFail($id);
-            $cliente->delete();
+            Cliente::findOrFail($id)->delete();
+            return response()->json(['success' => true, 'message' => 'Removido com sucesso']);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Método crucial para a Importação via Planilha/IA
+     */
+    public function confirmarImportacao(Request $request)
+    {
+        Log::info('Iniciando importação de clientes', ['qtd' => count($request->input('clientes', []))]);
+
+        try {
+            $dados = $request->input('clientes');
+            
+            if (empty($dados) || !is_array($dados)) {
+                return response()->json(['success' => false, 'message' => 'Nenhum dado recebido.'], 400);
+            }
+
+            $stats = ['criados' => 0, 'atualizados' => 0, 'erros' => 0];
+
+            DB::beginTransaction();
+
+            foreach ($dados as $c) {
+                // Validação mínima: precisa de nome
+                if (empty($c['razao_social'])) continue;
+
+                // Limpa CNPJ para garantir unicidade (somente números)
+                $cnpjLimpo = isset($c['cnpj']) ? preg_replace('/\D/', '', $c['cnpj']) : null;
+                
+                // Prepara o array de dados
+                $clienteData = [
+                    'razao_social'  => mb_strtoupper(trim($c['razao_social'])),
+                    'nome_fantasia' => isset($c['nome_fantasia']) ? mb_strtoupper(trim($c['nome_fantasia'])) : null,
+                    'email'         => isset($c['email']) ? strtolower(trim($c['email'])) : null,
+                    'telefone'      => $c['telefone'] ?? null,
+                    'cnpj'          => $cnpjLimpo,
+                    'cidade'        => $c['cidade'] ?? null,
+                    'uf'            => $c['uf'] ?? null,
+                    'status'        => 'ativo'
+                ];
+
+                // Tenta encontrar cliente existente
+                $cliente = null;
+                if (!empty($cnpjLimpo)) {
+                    $cliente = Cliente::where('cnpj', $cnpjLimpo)->first();
+                } 
+                
+                // Se não achou por CNPJ (ou não tem CNPJ), tenta por Razão Social exata
+                if (!$cliente) {
+                    $cliente = Cliente::where('razao_social', $clienteData['razao_social'])->first();
+                }
+
+                if ($cliente) {
+                    $cliente->update($clienteData);
+                    $stats['atualizados']++;
+                } else {
+                    Cliente::create($clienteData);
+                    $stats['criados']++;
+                }
+            }
+
+            DB::commit();
 
             return response()->json([
                 'success' => true,
-                'message' => 'Cliente excluído com sucesso'
+                'message' => "Importação finalizada: {$stats['criados']} novos, {$stats['atualizados']} atualizados.",
+                'data' => $stats
             ]);
-        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Cliente não encontrado'
-            ], 404);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            Log::error('Erro Importação Cliente: ' . $e->getMessage());
+            return response()->json(['success' => false, 'message' => 'Erro no servidor: ' . $e->getMessage()], 500);
         }
     }
-
-/**
-     * Importar clientes em lote (para Agent/N8N)
-     * 
-     * Espera JSON no formato:
-     * {
-     *   "clientes": [
-     *     { "cnpj": "11.222.333/0001-44", "razao_social": "...", "email": "...", ... },
-     *     ...
-     *   ]
-     * }
-     */
-    public function importarLote(Request $request)
-    {
-        $data = $request->validate([
-            'clientes' => 'required|array|min:1',
-            'clientes.*.cnpj' => 'required|string',
-            'clientes.*.razao_social' => 'required|string|max:200',
-            'clientes.*.nome_fantasia' => 'nullable|string|max:200',
-            'clientes.*.email' => 'nullable|email|max:100',
-            'clientes.*.telefone' => 'nullable|string|max:20',
-            'clientes.*.celular' => 'nullable|string|max:20',
-            'clientes.*.cidade' => 'nullable|string|max:100',
-            'clientes.*.uf' => 'nullable|string|max:2',
-            'clientes.*.status' => 'nullable|in:ativo,inativo',
-        ]);
-
-        $importados = [];
-        $atualizados = [];
-
-        foreach ($data['clientes'] as $c) {
-            // Normaliza CNPJ (só números)
-            $cnpj = preg_replace('/\D/', '', $c['cnpj']);
-
-            // Status padrão
-            if (!isset($c['status'])) {
-                $c['status'] = 'ativo';
-            }
-
-            $cliente = Cliente::where('cnpj', $cnpj)->first();
-
-            if ($cliente) {
-                $cliente->update(array_merge($c, ['cnpj' => $cnpj]));
-                $atualizados[] = $cliente->id;
-            } else {
-                $novo = Cliente::create(array_merge($c, ['cnpj' => $cnpj]));
-                $importados[] = $novo->id;
-            }
-        }
-
-        return response()->json([
-            'success'    => true,
-            'message'    => 'Importação de clientes concluída',
-            'importados' => $importados,
-            'atualizados'=> $atualizados,
-            'total'      => count($importados) + count($atualizados),
-        ]);
-    }
-
 }

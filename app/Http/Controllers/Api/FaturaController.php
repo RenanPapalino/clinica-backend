@@ -12,6 +12,7 @@ use App\Services\Financeiro\TributoService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Maatwebsite\Excel\Facades\Excel;
+use App\Services\Fiscal\NfseDiretaService;
 
 class FaturaController extends Controller
 {
@@ -286,4 +287,70 @@ class FaturaController extends Controller
             'pendentes' => Fatura::where('status', 'pendente')->count()
         ]);
     }
+
+    public function importarSoc(Request $request)
+    {
+        $request->validate([
+            'arquivo' => 'required|file|mimes:csv,txt,xlsx,xls'
+        ]);
+
+        try {
+            $file = $request->file('arquivo');
+            
+            // Salva temporariamente para processar
+            $path = $file->storeAs('temp', 'import_soc_' . uniqid() . '.csv');
+            $fullPath = storage_path('app/' . $path);
+
+            $resultado = $this->socImportService->processarArquivo($fullPath);
+
+            // Remove arquivo temporário
+            @unlink($fullPath);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Fatura importada com sucesso!',
+                'data' => $resultado
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erro ao processar arquivo: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    public function emitirNfse(Request $request, $id, NfseDiretaService $nfseService)
+    {
+        try {
+            $fatura = Fatura::with('cliente')->findOrFail($id);
+
+            if ($fatura->nfse_emitida) {
+                return response()->json(['success' => false, 'message' => 'NFS-e já emitida.'], 400);
+            }
+
+            // Chama o serviço fiscal
+            $nfse = $nfseService->emitir($fatura);
+
+            // Atualiza status da fatura
+            $fatura->update([
+                'status' => 'processando_fiscal',
+                'nfse_status' => 'enviado'
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Lote RPS enviado para prefeitura! Aguardando processamento.',
+                'data' => $nfse
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error("Erro Emissão NFS-e Fatura #$id: " . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'message' => 'Erro na emissão: ' . $e->getMessage()
+            ], 500);
+        }
+    }
 }
+

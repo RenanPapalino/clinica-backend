@@ -11,5 +11,14 @@ class CentroCusto extends Model
 
     protected $table = 'centros_custo';
 
-    protected $fillable = ['nome', 'codigo', 'tipo', 'ativo'];
+    // O CAMPO AQUI PRECISA SER 'descricao'. SE ESTIVER 'nome', VAI DAR ERRO!
+    protected $fillable = [
+        'codigo', 
+        'descricao', 
+        'ativo'
+    ];
+    
+    protected $casts = [
+        'ativo' => 'boolean'
+    ];
 }

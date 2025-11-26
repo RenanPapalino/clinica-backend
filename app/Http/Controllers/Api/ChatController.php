@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\ChatMessage;
+use App\Models\Cliente;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -12,16 +13,11 @@ class ChatController extends Controller
 {
     public function enviarMensagem(Request $request)
     {
-        $request->validate([
-            'mensagem' => 'required|string',
-            'session_id' => 'nullable|string'
-        ]);
-
-        $mensagemUsuario = $request->input('mensagem');
         $user = $request->user();
         $sessionId = $request->input('session_id', 'session_' . $user->id);
+        $mensagemUsuario = $request->input('mensagem') ?? 'Envio de arquivo';
 
-        // 1. Salvar mensagem do usuário
+        // 1. Registra mensagem do usuário
         ChatMessage::create([
             'user_id' => $user->id,
             'role' => 'user',
@@ -29,35 +25,53 @@ class ChatController extends Controller
             'session_id' => $sessionId,
         ]);
 
-        // 2. Enviar para IA (n8n)
-        $n8nWebhookUrl = env('N8N_CHAT_WEBHOOK_URL');
-        $respostaIa = "Desculpe, o assistente está indisponível no momento.";
+        $n8nWebhookUrl = env('N8N_WEBHOOK_CHAT_URL');
+        $respostaIa = "Não consegui processar sua solicitação.";
 
         if ($n8nWebhookUrl) {
             try {
-                $response = Http::timeout(30)->post($n8nWebhookUrl, [
-                    'message' => $mensagemUsuario,
-                    'user_id' => $user->id,
-                    'user_name' => $user->name,
-                    'session_id' => $sessionId,
-                    'context' => 'financeiro' 
+                // Prepara a requisição para o N8N
+                $http = Http::timeout(60)
+                    ->attach('metadata', json_encode([
+                        'user_id' => $user->id,
+                        'user_name' => $user->name,
+                        'session_id' => $sessionId
+                    ]), 'metadata.json');
+
+                // Se tiver arquivo, anexa
+                if ($request->hasFile('arquivo')) {
+                    $file = $request->file('arquivo');
+                    $http->attach(
+                        'arquivo', 
+                        file_get_contents($file->getRealPath()), 
+                        $file->getClientOriginalName()
+                    );
+                }
+
+                // Envia
+                $response = $http->post($n8nWebhookUrl, [
+                    'message' => $mensagemUsuario
                 ]);
 
                 if ($response->successful()) {
                     $data = $response->json();
-                    // Aceita 'output', 'text' ou 'message' como resposta do n8n
-                    $respostaIa = $data['output'] ?? $data['text'] ?? $data['message'] ?? 'Recebi, mas não entendi a resposta da IA.';
+                    
+                    // --- LÓGICA DE CADASTRO AUTOMÁTICO ---
+                    // Se o N8N devolver uma lista de clientes identificados, salvamos aqui
+                    if (isset($data['clientes_identificados']) && is_array($data['clientes_identificados'])) {
+                        $qtdSalva = $this->salvarClientesAutomaticamente($data['clientes_identificados']);
+                        $respostaIa = "Recebi a planilha! ✅ {$qtdSalva} clientes foram cadastrados/atualizados com sucesso.";
+                    } else {
+                        $respostaIa = $data['output'] ?? $data['text'] ?? "Processado, mas sem resposta de texto.";
+                    }
+
                 } else {
-                    Log::error("Erro n8n: Status " . $response->status());
-                    $respostaIa = "Erro de comunicação com a IA (Código: " . $response->status() . ")";
+                    $respostaIa = "Erro no N8N: " . $response->status();
                 }
             } catch (\Exception $e) {
-                Log::error("Erro n8n Exception: " . $e->getMessage());
-                $respostaIa = "O assistente está demorando muito para responder.";
+                Log::error("Erro Chat N8N: " . $e->getMessage());
+                $respostaIa = "Ocorreu um erro técnico ao enviar o arquivo.";
             }
-        } else {
-            // Modo Simulação (se não tiver n8n configurado no .env)
-            $respostaIa = "Modo Demo: Recebi sua mensagem '{$mensagemUsuario}'. Configure o N8N_CHAT_WEBHOOK_URL no .env para ativar a IA real.";
         }
 
         // 3. Salvar resposta da IA
@@ -65,27 +79,39 @@ class ChatController extends Controller
             'user_id' => $user->id,
             'role' => 'assistant',
             'content' => $respostaIa,
-            'session_id' => 'session_' . $user->id, // Corrigido para salvar na mesma sessão
+            'session_id' => $sessionId,
         ]);
 
-        return response()->json([
-            'success' => true,
-            'data' => $chatMessage // Retorna o objeto completo para o front
-        ]);
+        return response()->json(['success' => true, 'data' => $chatMessage]);
     }
 
-    public function historico(Request $request)
+    /**
+     * Função auxiliar para salvar o que vier do N8N
+     */
+    private function salvarClientesAutomaticamente(array $clientes)
     {
-        $user = $request->user();
-        // Ordena por created_at ASC para o chat exibir na ordem correta (antigas em cima)
-        $messages = ChatMessage::where('user_id', $user->id)
-            ->orderBy('created_at', 'asc') 
-            ->take(50)
-            ->get();
+        $count = 0;
+        foreach ($clientes as $c) {
+            if (empty($c['razao_social'])) continue;
+            
+            $cnpj = isset($c['cnpj']) ? preg_replace('/\D/', '', $c['cnpj']) : null;
+            
+            $dados = [
+                'razao_social' => mb_strtoupper($c['razao_social']),
+                'email' => strtolower($c['email'] ?? ''),
+                'telefone' => $c['telefone'] ?? null,
+                'status' => 'ativo'
+            ];
 
-        return response()->json([
-            'success' => true,
-            'data' => $messages
-        ]);
+            if ($cnpj) {
+                Cliente::updateOrCreate(['cnpj' => $cnpj], $dados);
+                $count++;
+            } elseif (!Cliente::where('razao_social', $dados['razao_social'])->exists()) {
+                // Se não tem CNPJ, cria só se não existir nome igual
+                Cliente::create(array_merge($dados, ['cnpj' => null]));
+                $count++;
+            }
+        }
+        return $count;
     }
 }

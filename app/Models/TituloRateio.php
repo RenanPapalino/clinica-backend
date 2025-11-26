@@ -2,25 +2,30 @@
 
 namespace App\Models;
 
-use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
 
 class TituloRateio extends Model
 {
     use HasFactory;
 
     protected $fillable = [
-        'titulo_id', 'plano_conta_id', 'centro_custo_id', 
-        'valor', 'percentual', 'historico'
+        'titulo_id', 'centro_custo_id', 'plano_conta_id', 
+        'cliente_id', 'valor', 'percentual', 'historico'
     ];
 
-    public function planoConta()
+    public function titulo()
     {
-        return $this->belongsTo(PlanoConta::class);
+        return $this->belongsTo(Titulo::class);
     }
 
     public function centroCusto()
     {
         return $this->belongsTo(CentroCusto::class);
+    }
+
+    public function planoConta()
+    {
+        return $this->belongsTo(PlanoConta::class);
     }
 }

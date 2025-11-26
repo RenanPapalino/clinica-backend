@@ -2,28 +2,27 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
-class ChatMensagem extends Model
+class ChatMessage extends Model
 {
-    protected $table = 'chat_mensagens';
+    use HasFactory;
 
     protected $fillable = [
-        'cliente_id',
-        'canal',
-        'origem',
-        'identificador_externo',
-        'mensagem',
-        'metadata',
+        'user_id',
+        'session_id',
+        'role',
+        'content',
+        'metadata'
     ];
 
     protected $casts = [
-        'metadata' => 'array',
+        'metadata' => 'array'
     ];
 
-    public function cliente()
+    public function user()
     {
-        return $this->belongsTo(Cliente::class);
+        return $this->belongsTo(User::class);
     }
 }
-s

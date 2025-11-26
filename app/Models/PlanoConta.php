@@ -11,13 +11,23 @@ class PlanoConta extends Model
 
     protected $table = 'planos_contas';
 
+    // GARANTA QUE TODOS ESTES CAMPOS ESTEJAM AQUI
     protected $fillable = [
-        'codigo', 'descricao', 'tipo', 'natureza', 
-        'conta_contabil', 'analitica', 'inibir_relatorios', 
-        'conta_pai_id', 'ativo'
+        'codigo', 
+        'descricao', 
+        'tipo', 
+        'natureza', 
+        'conta_contabil', 
+        'analitica', 
+        'conta_pai_id', 
+        'ativo'
     ];
 
-    // Auto-relacionamento para hierarquia (Pai -> Filhos)
+    protected $casts = [
+        'analitica' => 'boolean',
+        'ativo' => 'boolean'
+    ];
+
     public function filhos()
     {
         return $this->hasMany(PlanoConta::class, 'conta_pai_id');

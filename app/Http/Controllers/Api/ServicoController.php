@@ -1,50 +1,51 @@
 <?php
+
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Servico;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 
 class ServicoController extends Controller
 {
     public function index(Request $request)
     {
-        try {
-            $query = Servico::query();
+        $query = Servico::query();
 
-            if ($request->has('status')) {
-                $query->where('status', $request->status);
-            }
-
-            if ($request->has('categoria')) {
-                $query->where('categoria', $request->categoria);
-            }
-
-            if ($request->has('search')) {
-                $termo = $request->search;
-                $query->where(function($q) use ($termo) {
-                    $q->where('descricao', 'like', "%{$termo}%")
-                      ->orWhere('codigo', 'like', "%{$termo}%");
-                });
-            }
-
-            $servicos = $query->orderBy('descricao', 'asc')->get();
-
-            return response()->json(['success' => true, 'data' => $servicos]);
-        } catch (\Exception $e) {
-            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        if ($request->has('search')) {
+            $termo = $request->search;
+            $query->where(function($q) use ($termo) {
+                $q->where('descricao', 'like', "%{$termo}%")
+                  ->orWhere('codigo', 'like', "%{$termo}%")
+                  ->orWhere('codigo_servico_municipal', 'like', "%{$termo}%");
+            });
         }
+
+        return response()->json([
+            'success' => true, 
+            'data' => $query->orderBy('descricao')->get()
+        ]);
     }
 
     public function store(Request $request)
     {
         try {
             $validated = $request->validate([
-                'codigo' => 'required|string|unique:servicos,codigo',
-                'descricao' => 'required|string|max:200',
+                'codigo' => 'required|string|unique:servicos,codigo', // Código interno
+                'descricao' => 'required|string|max:255',
                 'valor_unitario' => 'required|numeric|min:0',
-                'categoria' => 'required|in:exame,consulta,procedimento,outros',
+                'tipo_servico' => 'required|string', // ex: exame, consulta
+                
+                // Campos Fiscais (NFS-e)
+                'codigo_servico_municipal' => 'nullable|string', // LC116 (Ex: 04.03)
+                'cnae' => 'nullable|string',
+                'aliquota_iss' => 'nullable|numeric',
+                'ativo' => 'boolean'
             ]);
+
+            // Define ativo como true se não vier
+            $validated['ativo'] = $validated['ativo'] ?? true;
 
             $servico = Servico::create($validated);
 
@@ -53,18 +54,12 @@ class ServicoController extends Controller
                 'message' => 'Serviço cadastrado com sucesso',
                 'data' => $servico
             ], 201);
-        } catch (\Exception $e) {
-            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
-        }
-    }
 
-    public function show($id)
-    {
-        try {
-            $servico = Servico::findOrFail($id);
-            return response()->json(['success' => true, 'data' => $servico]);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            return response()->json(['success' => false, 'errors' => $e->errors()], 422);
         } catch (\Exception $e) {
-            return response()->json(['success' => false, 'error' => 'Serviço não encontrado'], 404);
+            Log::error("Erro ao criar serviço: " . $e->getMessage());
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
         }
     }
 
@@ -72,20 +67,34 @@ class ServicoController extends Controller
     {
         try {
             $servico = Servico::findOrFail($id);
-            $servico->update($request->all());
+            
+            $validated = $request->validate([
+                'codigo' => 'required|string|unique:servicos,codigo,'.$id,
+                'descricao' => 'required|string|max:255',
+                'valor_unitario' => 'required|numeric|min:0',
+                'tipo_servico' => 'required|string',
+                'codigo_servico_municipal' => 'nullable|string',
+                'cnae' => 'nullable|string',
+                'aliquota_iss' => 'nullable|numeric',
+                'ativo' => 'boolean'
+            ]);
+
+            $servico->update($validated);
+
             return response()->json(['success' => true, 'data' => $servico]);
         } catch (\Exception $e) {
-            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
         }
     }
 
     public function destroy($id)
     {
         try {
-            Servico::findOrFail($id)->delete();
-            return response()->json(['success' => true, 'message' => 'Serviço excluído']);
+            $servico = Servico::findOrFail($id);
+            $servico->delete();
+            return response()->json(['success' => true]);
         } catch (\Exception $e) {
-            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
         }
     }
 }

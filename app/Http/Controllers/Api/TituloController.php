@@ -7,6 +7,7 @@ use App\Models\Titulo;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use App\Services\Bancos\ItauService;
 
 class TituloController extends Controller
 {
@@ -338,3 +339,42 @@ class TituloController extends Controller
         return response()->json(['success' => true, 'data' => $response]);
     }
 }
+
+public function registrarBoleto(Request $request, $id, ItauService $bancoService)
+    {
+        try {
+            $titulo = Titulo::with('cliente')->findOrFail($id);
+
+            if ($titulo->tipo !== 'receber') {
+                return response()->json(['success' => false, 'message' => 'Apenas contas a receber geram boleto.'], 400);
+            }
+
+            if (!empty($titulo->nosso_numero)) {
+                return response()->json(['success' => false, 'message' => 'Boleto já registrado.'], 400);
+            }
+
+            // Chama o serviço bancário
+            $dadosBancarios = $bancoService->registrarBoleto($titulo);
+
+            // Atualiza o título com o retorno do banco
+            $titulo->update([
+                'nosso_numero' => $dadosBancarios['nosso_numero'],
+                'codigo_barras' => $dadosBancarios['codigo_barras'],
+                'linha_digitavel' => $dadosBancarios['linha_digitavel'],
+                'status' => 'aberto', // Confirma que está aberto e registrado
+                'url_boleto' => $dadosBancarios['url_boleto'] // Se houver
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Boleto registrado com sucesso no Itaú!',
+                'data' => $titulo
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erro na comunicação bancária: ' . $e->getMessage()
+            ], 500);
+        }
+    }
