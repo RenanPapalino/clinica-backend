@@ -51,7 +51,7 @@ class OrdemServicoController extends Controller
                 'cliente_id' => 'required'
             ]);
 
-            // Usando o serviço injetado no construtor
+            // Usa o serviço injetado no construtor
             $result = $this->socService->importar(
                 $request->file('arquivo'),
                 $request->input('cliente_id')
@@ -63,26 +63,26 @@ class OrdemServicoController extends Controller
                 'data' => $result
             ]);
         } catch (\Illuminate\Validation\ValidationException $e) {
-            // Erros de validação (ex: arquivo faltando)
             return response()->json([
                 'success' => false,
                 'message' => 'Erro de Validação: ' . $e->getMessage(),
                 'errors' => $e->errors()
             ], 422);
         } catch (\Throwable $e) {
-            // CAPTURA QUALQUER OUTRO ERRO E MOSTRA NO FRONTEND
             Log::error('Erro Importação: ' . $e->getMessage());
             Log::error($e->getTraceAsString());
 
             return response()->json([
                 'success' => false,
-                'message' => 'ERRO DETALHADO: ' . $e->getMessage() . ' | Linha: ' . $e->getLine() . ' | Arquivo: ' . basename($e->getFile())
+                'message' => 'ERRO DETALHADO: ' . $e->getMessage() .
+                    ' | Linha: ' . $e->getLine() .
+                    ' | Arquivo: ' . basename($e->getFile())
             ], 500);
         }
     }
 
     /**
-     * Faturar OS usando o serviço de faturamento (recomendado).
+     * Faturar OS usando o serviço de faturamento (fluxo principal).
      */
     public function faturar(Request $request, $id, FaturamentoService $faturamentoService)
     {
@@ -105,8 +105,8 @@ class OrdemServicoController extends Controller
     }
 
     /**
-     * Alternativa: faturamento direto, sem serviço (se quiser manter essa lógica).
-     * Se não for usar, pode remover esse método.
+     * Alternativa: faturamento direto, sem serviço (usa a lógica antiga).
+     * Se não precisar, pode remover esse método depois.
      */
     public function faturarDireto($id)
     {
