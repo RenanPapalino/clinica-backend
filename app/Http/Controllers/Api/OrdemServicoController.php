@@ -6,8 +6,10 @@ use App\Http\Controllers\Controller;
 use App\Models\OrdemServico;
 use App\Models\Fatura;
 use App\Services\SocImportService;
+use App\Services\FaturamentoService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+
 
 class OrdemServicoController extends Controller
 {
@@ -37,23 +39,72 @@ class OrdemServicoController extends Controller
         ]);
     }
 
-    public function importarSoc(Request $request)
+public function importarSoc(Request $request)
+{
+    // 1. Instancia o serviço manualmente para garantir que erros de classe sejam capturados
+    try {
+        // Validação
+        $request->validate([
+            'arquivo' => 'required|file',
+            'cliente_id' => 'required'
+        ]);
+
+        // Instanciação manual (Evita erro 500 antes de entrar no método)
+        $service = new \App\Services\SocImportService();
+
+        $result = $service->importar(
+            $request->file('arquivo'),
+            $request->input('cliente_id')
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Importação realizada com sucesso!',
+            'data' => $result
+        ]);
+
+    } catch (\Illuminate\Validation\ValidationException $e) {
+        // Erros de validação (ex: arquivo faltando)
+        return response()->json([
+            'success' => false, 
+            'message' => 'Erro de Validação: ' . $e->getMessage(),
+            'errors' => $e->errors()
+        ], 422);
+
+    } catch (\Throwable $e) {
+        // CAPTURA QUALQUER OUTRO ERRO E MOSTRA NO FRONTEND
+        // Loga no arquivo do servidor para garantia
+        \Illuminate\Support\Facades\Log::error('Erro Importação: ' . $e->getMessage());
+        \Illuminate\Support\Facades\Log::error($e->getTraceAsString());
+
+        return response()->json([
+            'success' => false,
+            'message' => 'ERRO DETALHADO: ' . $e->getMessage() . ' | Linha: ' . $e->getLine() . ' | Arquivo: ' . basename($e->getFile())
+        ], 500);
+    }
+}
+
+public function faturar(Request $request, $id, FaturamentoService $faturamentoService)
     {
-        $request->validate(['arquivo' => 'required|file']);
-        
         try {
-            $path = $request->file('arquivo')->store('temp');
-            $os = $this->socService->processarArquivo(storage_path('app/' . $path));
-            
+            $fatura = $faturamentoService->gerarFaturaDeOS($id);
+
             return response()->json([
                 'success' => true,
-                'message' => 'Ordem de Serviço criada com sucesso!',
-                'data' => $os
+                'message' => "Fatura #{$fatura->numero_fatura} gerada com sucesso!",
+                'fatura_id' => $fatura->id
             ]);
-        } catch (\Exception $e) {
-            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+
+        } catch (\Throwable $e) {
+            Log::error("Erro ao faturar OS {$id}: " . $e->getMessage());
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Erro ao processar faturamento: ' . $e->getMessage()
+            ], 500);
         }
     }
+}
 
     // Ação principal: Transforma OS Aprovada em Fatura Real
     public function faturar($id)

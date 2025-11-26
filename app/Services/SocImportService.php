@@ -3,120 +3,151 @@
 namespace App\Services;
 
 use App\Models\OrdemServico;
-use App\Models\Cliente;
+use App\Models\OrdemServicoItem;
+use App\Models\OrdemServicoRateio;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\DB;
 use Exception;
+use Carbon\Carbon;
 
 class SocImportService
 {
-    public function processarArquivo($caminhoArquivo)
+    public function importar(UploadedFile $file, $clienteId)
     {
-        $linhas = file($caminhoArquivo);
-        $cnpjEncontrado = null;
-        $inicioDados = false;
-        $mapaColunas = [];
+        $path = $file->getRealPath();
+        // Detectar encoding para evitar caracteres estranhos
+        $content = file_get_contents($path);
+        $encoding = mb_detect_encoding($content, ['UTF-8', 'ISO-8859-1'], true);
+        
+        if ($encoding !== 'UTF-8') {
+            $content = mb_convert_encoding($content, 'UTF-8', $encoding);
+        }
+
+        $lines = explode(PHP_EOL, $content);
+        
+        // Mapeamento dinâmico
+        $headerMap = [];
+        $headerFound = false;
         $itensParaSalvar = [];
+        $resumoRateio = [];
+        $valorTotalOS = 0;
 
-        // 1. Varredura Inicial (Metadados e Header)
-        foreach ($linhas as $idx => $linha) {
-            // Detecta encoding e converte para UTF-8
-            $linha = mb_convert_encoding($linha, 'UTF-8', mb_detect_encoding($linha, ['UTF-8', 'ISO-8859-1'], true));
-            $cols = str_getcsv($linha, count(explode(';', $linha)) > count(explode(',', $linha)) ? ';' : ',');
+        DB::beginTransaction();
 
-            // Busca CNPJ no cabeçalho
-            if (!$cnpjEncontrado) {
-                foreach ($cols as $c) {
-                    if (preg_match('/\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/', $c, $matches)) {
-                        $cnpjEncontrado = preg_replace('/\D/', '', $matches[0]);
+        try {
+            foreach ($lines as $lineIndex => $line) {
+                if (trim($line) === '') continue;
+
+                // Lê o CSV com ponto e vírgula (padrão SOC exportação BR)
+                $row = str_getcsv($line, ';');
+
+                // 1. Procura a linha de cabeçalho real
+                if (!$headerFound) {
+                    // Verifica se a linha contém as colunas chaves
+                    if (in_array('Nome do Funcionário', $row) && in_array('Valor', $row)) {
+                        $headerMap = array_flip($row); // Mapeia: 'Nome' => index 2, 'Valor' => index 6
+                        $headerFound = true;
                     }
+                    continue;
                 }
-            }
 
-            // Identifica a linha de cabeçalho da tabela
-            if (!$inicioDados && (in_array('Produto/Serviço', $cols) || in_array('Total R$', $cols))) {
-                $inicioDados = true;
-                // Mapeia índices das colunas dinamicamente
-                $mapaColunas = [
-                    'descricao' => array_search('Produto/Serviço', $cols),
-                    'total'     => array_search('Total R$', $cols),
-                    'unidade'   => array_search('Unidade', $cols),
-                    'empresa'   => array_search('Empresa Cliente', $cols),
-                ];
-                continue;
-            }
+                // 2. Processa as linhas de dados
+                // Pula se não tiver nome de funcionário ou for linha de total
+                $nomeFuncionario = $this->getData($row, $headerMap, 'Nome do Funcionário');
+                if (empty($nomeFuncionario) || stripos($nomeFuncionario, 'Total') !== false) continue;
 
-            // Processa linhas de dados
-            if ($inicioDados) {
-                // Validação mínima: tem descrição e valor?
-                $idxDesc = $mapaColunas['descricao'] ?? 0;
-                $idxTotal = $mapaColunas['total'] ?? 12; // Fallback para posição 12 do CSV CURY
+                $exame = $this->getData($row, $headerMap, 'Exame');
+                if (empty($exame)) $exame = $this->getData($row, $headerMap, 'Serviço', 'Serviço SOC');
 
-                $descricao = $cols[$idxDesc] ?? null;
-                $valorRaw = $cols[$idxTotal] ?? '0';
-
-                if (empty($descricao) || str_contains($descricao, 'Total')) continue;
-
-                $valor = $this->parseValor($valorRaw);
+                $valorBruto = $this->getData($row, $headerMap, 'Valor', '0');
+                $valor = $this->parseMoney($valorBruto);
+                
+                // Se valor for zero, ignorar (opcional)
                 if ($valor <= 0) continue;
 
+                $centroCusto = $this->getData($row, $headerMap, 'Centro de Custo', 'Geral');
+                $dataRealizacao = $this->getData($row, $headerMap, 'Data');
+
+                // Prepara o Item
                 $itensParaSalvar[] = [
-                    'descricao' => $descricao,
-                    'valor' => $valor,
-                    'unidade' => $cols[$mapaColunas['unidade'] ?? 6] ?? null,
-                    'cliente_origem' => $cols[$mapaColunas['empresa'] ?? 5] ?? null,
+                    'descricao' => "$exame - $nomeFuncionario",
+                    'quantidade' => 1,
+                    'valor_unitario' => $valor,
+                    'valor_total' => $valor,
+                    'centro_custo' => $centroCusto,
+                    'data_realizacao' => $this->parseDate($dataRealizacao)
                 ];
-            }
-        }
 
-        if (empty($itensParaSalvar)) {
-            throw new Exception("Nenhum item válido encontrado. Verifique o layout do arquivo.");
-        }
-
-        // 2. Persistência (Transação)
-        return DB::transaction(function () use ($cnpjEncontrado, $itensParaSalvar) {
-            // Busca cliente pelo CNPJ do cabeçalho ou usa um padrão (ID 1) se falhar
-            $cliente = Cliente::where('cnpj', $cnpjEncontrado)->first();
-            
-            if (!$cliente && count($itensParaSalvar) > 0) {
-                // Fallback: Tenta achar cliente pelo nome da primeira linha de dados?
-                // Por segurança, vamos exigir que o cliente exista ou usar um genérico.
-                // throw new Exception("Cliente com CNPJ $cnpjEncontrado não cadastrado.");
-                $cliente = Cliente::first(); // Em dev, pega o primeiro
+                // Acumula Rateio
+                if (!isset($resumoRateio[$centroCusto])) {
+                    $resumoRateio[$centroCusto] = 0;
+                }
+                $resumoRateio[$centroCusto] += $valor;
+                $valorTotalOS += $valor;
             }
 
-            // Cria a OS
+            if (empty($itensParaSalvar)) {
+                throw new Exception("Nenhum dado válido encontrado. Verifique se o arquivo é um CSV separado por ponto e vírgula (;).");
+            }
+
+            // 3. Cria a OS
             $os = OrdemServico::create([
-                'cliente_id' => $cliente->id,
-                'codigo_os' => 'OS-' . date('Ymd-His'),
-                'competencia' => date('m/Y'),
+                'cliente_id' => $clienteId,
+                'codigo_os' => 'IMP-' . date('Ymd-His'),
+                'competencia' => now()->format('m/Y'),
                 'data_emissao' => now(),
-                'valor_total' => collect($itensParaSalvar)->sum('valor'),
                 'status' => 'pendente',
-                'observacoes' => 'Importado via planilha SOC'
+                'valor_total' => $valorTotalOS,
+                'observacoes' => 'Importado via Planilha SOC: ' . $file->getClientOriginalName()
             ]);
 
-            // Salva Itens
+            // 4. Salva Itens
             foreach ($itensParaSalvar as $item) {
-                $os->itens()->create([
-                    'descricao' => $item['descricao'],
-                    'quantidade' => 1,
-                    'valor_unitario' => $item['valor'],
-                    'valor_total' => $item['valor'],
-                    'unidade_soc' => $item['unidade'],
-                    'centro_custo_cliente' => $item['cliente_origem'] // Guarda quem consumiu o serviço
+                $item['ordem_servico_id'] = $os->id;
+                OrdemServicoItem::create($item);
+            }
+
+            // 5. Salva Rateios (Fundamental para o Financeiro)
+            foreach ($resumoRateio as $cc => $val) {
+                OrdemServicoRateio::create([
+                    'ordem_servico_id' => $os->id,
+                    'centro_custo' => $cc,
+                    'valor' => $val,
+                    'percentual' => ($valorTotalOS > 0) ? ($val / $valorTotalOS * 100) : 0
                 ]);
             }
 
-            return $os->load('itens', 'cliente');
-        });
+            DB::commit();
+
+            return [
+                'os_id' => $os->id,
+                'total_itens' => count($itensParaSalvar),
+                'valor_total' => $valorTotalOS,
+                'rateio' => $resumoRateio
+            ];
+
+        } catch (Exception $e) {
+            DB::rollBack();
+            throw $e;
+        }
     }
 
-    private function parseValor($val)
-    {
-        // Remove R$, espaços e converte "1.200,50" para 1200.50
-        $val = preg_replace('/[^0-9,.-]/', '', $val);
+    private function getData($row, $map, $key, $default = '') {
+        return isset($map[$key]) && isset($row[$map[$key]]) ? trim($row[$map[$key]]) : $default;
+    }
+
+    private function parseMoney($val) {
+        $val = str_replace('R$', '', $val);
         $val = str_replace('.', '', $val); // Tira ponto de milhar
-        $val = str_replace(',', '.', $val); // Troca vírgula por ponto
-        return (float) $val;
+        $val = str_replace(',', '.', $val); // Troca vírgula decimal
+        return (float) preg_replace('/[^0-9.]/', '', $val);
+    }
+
+    private function parseDate($val) {
+        try {
+            return Carbon::createFromFormat('d/m/Y', $val)->format('Y-m-d');
+        } catch (\Exception $e) {
+            return now()->format('Y-m-d');
+        }
     }
 }

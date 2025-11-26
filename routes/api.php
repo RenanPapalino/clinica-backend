@@ -19,13 +19,16 @@ use App\Http\Controllers\Api\NfseController;
 use App\Http\Controllers\Api\TituloController;
 use App\Http\Controllers\Api\CobrancaController;
 use App\Http\Controllers\Api\RelatorioController;
-use App\Http\Controllers\Api\LancamentoContabilController;
+use App\Http\Controllers\Api\Contabilidade\LancamentoContabilController;
+//use App\Http\Controllers\Api\LancamentoContabilController;
 use App\Http\Controllers\Api\ChatController;
 use App\Http\Controllers\Api\N8nController;
 use App\Http\Controllers\Api\DashboardController;
 use App\Http\Controllers\Api\DespesaController;
 use App\Http\Controllers\Api\ConfiguracaoController;
 use App\Http\Controllers\Api\OrdemServicoController;
+use App\Http\Controllers\FaturamentoController;
+
 
 // ============================================
 // ROTAS PÚBLICAS (Health & Debug)
@@ -131,6 +134,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('importar-lote', [FaturaController::class, 'importarLote']);
         Route::post('importar-soc', [FaturaController::class, 'importarSoc']);
         Route::post('emitir-nfse/{id}', [FaturaController::class, 'emitirNfse']);
+        Route::post('/faturas/{id}/gerar-boleto', [FaturamentoController::class, 'gerarBoleto']);
     });
 
     // NFS-e (Hub Fiscal)
@@ -162,6 +166,19 @@ Route::middleware('auth:sanctum')->group(function () {
     });
 
     // ========== COBRANÇAS ==========
+
+    Route::prefix('contabilidade')->group(function () {
+    Route::get('lancamentos', [LancamentoContabilController::class, 'index']);
+    Route::get('balancete', [LancamentoContabilController::class, 'balancete']);
+
+    Route::post('livro-razao/auditar-ia', [LancamentoContabilController::class, 'auditarIa']);
+    Route::post('livro-razao/{id}/aprovar-ia', [LancamentoContabilController::class, 'aprovarIa']);
+    Route::post('livro-razao/{id}/revisar-ia', [LancamentoContabilController::class, 'revisarIa']);
+
+    Route::get('livro-razao/export-ofx', [LancamentoContabilController::class, 'exportOfx']);
+    Route::get('livro-razao/export-excel', [LancamentoContabilController::class, 'exportExcel']);
+});
+
     Route::prefix('cobrancas')->group(function () {
         Route::get('inadimplentes', [CobrancaController::class, 'inadimplentes']);
         Route::post('enviar-whatsapp/{clienteId}', [CobrancaController::class, 'enviarWhatsApp']);
@@ -176,6 +193,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('contabilidade/processar-titulo/{id}', [LancamentoContabilController::class, 'processarTitulo']);
     Route::get('contabilidade/balancete', [LancamentoContabilController::class, 'balancete']);
     Route::get('contabilidade/dre-real', [LancamentoContabilController::class, 'dreReal']);
+  
 
     // Relatórios
     Route::prefix('relatorios')->group(function () {

@@ -135,4 +135,14 @@ class ItauService implements BancoInterface
     {
         // Implementação futura para atualização de status
     }
+
+    public function gerarBoleto($titulo, $cliente) {
+    // Lógica de chamada à API do Itaú...
+    // ...
+    return [
+        'nosso_numero' => '123456',
+        'link_pdf' => 'https://itau.com.br/boleto/pdf/xyz...',
+        'linha_digitavel' => '34191.00000 00000.00000 ...'
+    ];
+}
 }

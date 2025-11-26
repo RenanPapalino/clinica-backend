@@ -27,6 +27,8 @@ class Fatura extends Model
         'nfse_emitida',  // boolean
         'observacoes',
         'metadata',
+        'nfse_numero',
+        'nfse_link',
     ];
 
     protected $casts = [
@@ -56,17 +58,17 @@ class Fatura extends Model
 
     public function cliente()
     {
-        return $this->belongsTo(Cliente::class, 'cliente_id');
+        return $this->belongsTo(Cliente::class);
     }
 
     public function itens()
     {
-        return $this->hasMany(FaturaItem::class, 'fatura_id');
+        return $this->hasMany(FaturaItem::class);
     }
 
     public function titulos()
     {
-        return $this->hasMany(Titulo::class, 'fatura_id');
+        return $this->hasMany(Titulo::class);
     }
 
     public function cobrancas()

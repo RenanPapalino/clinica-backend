@@ -31,15 +31,18 @@ class FaturaController extends Controller
 
     public function index(Request $request)
     {
-        $query = Fatura::with('cliente');
+        $query = Fatura::with(['cliente', 'itens']);
         
+        if ($request->has('status')) {
+            $query->where('status', $request->status);
+        }
+
         if ($request->filled('cliente_id')) $query->where('cliente_id', $request->cliente_id);
         if ($request->filled('status')) $query->where('status', $request->status);
 
-        return response()->json([
-            'success' => true,
-            'data' => $query->orderByDesc('id')->paginate(20)
-        ]);
+        $faturas = $query->orderBy('id', 'desc')->paginate(50);
+
+        return response()->json($faturas);
     }
     
     public function show($id)
