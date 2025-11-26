@@ -9,7 +9,7 @@ use App\Services\SocImportService;
 use App\Services\FaturamentoService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-
+use Illuminate\Support\Facades\Log;
 
 class OrdemServicoController extends Controller
 {
@@ -23,8 +23,11 @@ class OrdemServicoController extends Controller
     public function index(Request $request)
     {
         $query = OrdemServico::with('cliente')->orderByDesc('id');
-        if ($request->has('status')) $query->where('status', $request->status);
-        
+
+        if ($request->has('status')) {
+            $query->where('status', $request->status);
+        }
+
         return response()->json([
             'success' => true,
             'data' => $query->paginate(20)
@@ -39,52 +42,49 @@ class OrdemServicoController extends Controller
         ]);
     }
 
-public function importarSoc(Request $request)
-{
-    // 1. Instancia o serviço manualmente para garantir que erros de classe sejam capturados
-    try {
-        // Validação
-        $request->validate([
-            'arquivo' => 'required|file',
-            'cliente_id' => 'required'
-        ]);
+    public function importarSoc(Request $request)
+    {
+        try {
+            // Validação
+            $request->validate([
+                'arquivo' => 'required|file',
+                'cliente_id' => 'required'
+            ]);
 
-        // Instanciação manual (Evita erro 500 antes de entrar no método)
-        $service = new \App\Services\SocImportService();
+            // Usando o serviço injetado no construtor
+            $result = $this->socService->importar(
+                $request->file('arquivo'),
+                $request->input('cliente_id')
+            );
 
-        $result = $service->importar(
-            $request->file('arquivo'),
-            $request->input('cliente_id')
-        );
+            return response()->json([
+                'success' => true,
+                'message' => 'Importação realizada com sucesso!',
+                'data' => $result
+            ]);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            // Erros de validação (ex: arquivo faltando)
+            return response()->json([
+                'success' => false,
+                'message' => 'Erro de Validação: ' . $e->getMessage(),
+                'errors' => $e->errors()
+            ], 422);
+        } catch (\Throwable $e) {
+            // CAPTURA QUALQUER OUTRO ERRO E MOSTRA NO FRONTEND
+            Log::error('Erro Importação: ' . $e->getMessage());
+            Log::error($e->getTraceAsString());
 
-        return response()->json([
-            'success' => true,
-            'message' => 'Importação realizada com sucesso!',
-            'data' => $result
-        ]);
-
-    } catch (\Illuminate\Validation\ValidationException $e) {
-        // Erros de validação (ex: arquivo faltando)
-        return response()->json([
-            'success' => false, 
-            'message' => 'Erro de Validação: ' . $e->getMessage(),
-            'errors' => $e->errors()
-        ], 422);
-
-    } catch (\Throwable $e) {
-        // CAPTURA QUALQUER OUTRO ERRO E MOSTRA NO FRONTEND
-        // Loga no arquivo do servidor para garantia
-        \Illuminate\Support\Facades\Log::error('Erro Importação: ' . $e->getMessage());
-        \Illuminate\Support\Facades\Log::error($e->getTraceAsString());
-
-        return response()->json([
-            'success' => false,
-            'message' => 'ERRO DETALHADO: ' . $e->getMessage() . ' | Linha: ' . $e->getLine() . ' | Arquivo: ' . basename($e->getFile())
-        ], 500);
+            return response()->json([
+                'success' => false,
+                'message' => 'ERRO DETALHADO: ' . $e->getMessage() . ' | Linha: ' . $e->getLine() . ' | Arquivo: ' . basename($e->getFile())
+            ], 500);
+        }
     }
-}
 
-public function faturar(Request $request, $id, FaturamentoService $faturamentoService)
+    /**
+     * Faturar OS usando o serviço de faturamento (recomendado).
+     */
+    public function faturar(Request $request, $id, FaturamentoService $faturamentoService)
     {
         try {
             $fatura = $faturamentoService->gerarFaturaDeOS($id);
@@ -94,26 +94,30 @@ public function faturar(Request $request, $id, FaturamentoService $faturamentoSe
                 'message' => "Fatura #{$fatura->numero_fatura} gerada com sucesso!",
                 'fatura_id' => $fatura->id
             ]);
-
         } catch (\Throwable $e) {
             Log::error("Erro ao faturar OS {$id}: " . $e->getMessage());
-            
+
             return response()->json([
                 'success' => false,
                 'message' => 'Erro ao processar faturamento: ' . $e->getMessage()
             ], 500);
         }
     }
-}
 
-    // Ação principal: Transforma OS Aprovada em Fatura Real
-    public function faturar($id)
+    /**
+     * Alternativa: faturamento direto, sem serviço (se quiser manter essa lógica).
+     * Se não for usar, pode remover esse método.
+     */
+    public function faturarDireto($id)
     {
         return DB::transaction(function () use ($id) {
             $os = OrdemServico::with('itens')->findOrFail($id);
 
             if ($os->status === 'faturada') {
-                return response()->json(['success' => false, 'message' => 'OS já faturada.'], 400);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'OS já faturada.'
+                ], 400);
             }
 
             // 1. Cria Fatura
@@ -151,9 +155,8 @@ public function faturar(Request $request, $id, FaturamentoService $faturamentoSe
             ]);
         });
     }
-}
 
-public function store(Request $request)
+    public function store(Request $request)
     {
         $request->validate([
             'cliente_id' => 'required|exists:clientes,id',
@@ -167,7 +170,9 @@ public function store(Request $request)
 
         return DB::transaction(function () use ($request) {
             // 1. Cria o Cabeçalho
-            $valorTotal = collect($request->itens)->sum(fn($i) => $i['valor'] * $i['quantidade']);
+            $valorTotal = collect($request->itens)->sum(
+                fn ($i) => $i['valor'] * $i['quantidade']
+            );
 
             $os = OrdemServico::create([
                 'cliente_id' => $request->cliente_id,
@@ -198,3 +203,4 @@ public function store(Request $request)
             ]);
         });
     }
+}
