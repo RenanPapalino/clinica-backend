@@ -222,10 +222,15 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Chat IA
     Route::prefix('chat')->group(function () {
-        Route::post('/mensagem', [ChatController::class, 'enviarMensagem']);
-        Route::get('/historico', [ChatController::class, 'historico']);
-    });
-
+    // Enviar mensagem (com ou sem arquivo)
+    Route::post('/mensagem', [ChatController::class, 'enviarMensagem']);
+    
+    // Buscar histórico de mensagens
+    Route::get('/historico', [ChatController::class, 'historico']);
+    
+    // Limpar histórico (opcional)
+    Route::delete('/historico', [ChatController::class, 'limparHistorico']);
+});
     // N8N Integrations
     Route::prefix('n8n')->group(function () {
         Route::post('/webhook', [N8nController::class, 'webhook']);
@@ -459,4 +464,75 @@ Route::get('/criar-admin-teste', function () {
     } catch (\Exception $e) {
         return response()->json(['erro' => $e->getMessage()], 500);
     }
+});
+
+
+// ROTA TEMPORÁRIA - Corrigir tabela chat_messages
+Route::get('/fix-chat-messages', function () {
+    $log = [];
+    
+    try {
+        if (!Schema::hasTable('chat_messages')) {
+            Schema::create('chat_messages', function ($table) {
+                $table->id();
+                $table->foreignId('user_id')->constrained()->onDelete('cascade');
+                $table->string('session_id')->index();
+                $table->enum('role', ['user', 'assistant', 'system'])->default('user');
+                $table->longText('content');
+                $table->json('metadata')->nullable();
+                $table->timestamps();
+            });
+            $log[] = '✅ Tabela chat_messages criada.';
+        } else {
+            $log[] = '📋 Tabela chat_messages já existe. Verificando colunas...';
+            
+            // Verificar e adicionar colunas faltantes
+            if (!Schema::hasColumn('chat_messages', 'session_id')) {
+                Schema::table('chat_messages', function ($table) {
+                    $table->string('session_id')->nullable()->after('user_id');
+                });
+                $log[] = '✅ Coluna session_id adicionada.';
+            }
+            
+            if (!Schema::hasColumn('chat_messages', 'role')) {
+                Schema::table('chat_messages', function ($table) {
+                    $table->string('role')->default('user')->after('session_id');
+                });
+                $log[] = '✅ Coluna role adicionada.';
+            }
+            
+            if (!Schema::hasColumn('chat_messages', 'content')) {
+                Schema::table('chat_messages', function ($table) {
+                    $table->longText('content')->nullable()->after('role');
+                });
+                $log[] = '✅ Coluna content adicionada.';
+            }
+            
+            if (!Schema::hasColumn('chat_messages', 'metadata')) {
+                Schema::table('chat_messages', function ($table) {
+                    $table->json('metadata')->nullable()->after('content');
+                });
+                $log[] = '✅ Coluna metadata adicionada.';
+            }
+            
+            if (!Schema::hasColumn('chat_messages', 'user_id')) {
+                Schema::table('chat_messages', function ($table) {
+                    $table->unsignedBigInteger('user_id')->nullable()->after('id');
+                });
+                $log[] = '✅ Coluna user_id adicionada.';
+            }
+        }
+        
+        // Mostrar estrutura atual
+        $colunas = Schema::getColumnListing('chat_messages');
+        $log[] = '📊 Colunas atuais: ' . implode(', ', $colunas);
+        
+    } catch (\Exception $e) {
+        $log[] = '❌ Erro: ' . $e->getMessage();
+    }
+    
+    return response()->json([
+        'status' => 'Verificação concluída',
+        'log' => $log
+    ]);
 });
