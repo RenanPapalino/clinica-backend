@@ -1,4 +1,3 @@
-cat > app/Http/Controllers/Api/AuthController.php << 'PHP'
 <?php
 
 namespace App\Http\Controllers\Api;
@@ -13,68 +12,62 @@ class AuthController extends Controller
 {
     public function login(Request $request)
     {
-        // Log inicial pra garantir que entramos aqui
-        Log::info('LOGIN DEBUG: entrou no AuthController@Api@login', [
-            'email' => $request->input('email'),
-        ]);
+        Log::info('LOGIN: Tentativa de acesso', ['email' => $request->input('email')]);
 
-        // Valida entrada
-        $data = $request->validate([
+        // 1. Validação
+        $request->validate([
             'email'    => 'required|email',
             'password' => 'required|string',
         ]);
 
-        // Procura usuário
-        $user = User::where('email', $data['email'])->first();
+        // 2. Buscar Usuário
+        $user = User::where('email', $request->email)->first();
 
-        if (!$user) {
-            Log::warning('LOGIN DEBUG: usuário não encontrado', [
-                'email' => $data['email'],
-            ]);
-
+        // 3. Verificar Senha
+        if (!$user || !Hash::check($request->password, $user->password)) {
+            Log::warning('LOGIN: Falha de credenciais', ['email' => $request->email]);
+            
             return response()->json([
                 'success' => false,
-                'message' => 'Credenciais inválidas',
-                'errors'  => null,
+                'message' => 'E-mail ou senha incorretos.',
             ], 401);
         }
 
-        // Verifica senha
-        if (!Hash::check($data['password'], $user->password)) {
-            Log::warning('LOGIN DEBUG: senha incorreta', [
-                'email' => $data['email'],
-            ]);
+        // 4. Limpeza de tokens antigos (Opcional: mantém apenas um login ativo por vez)
+        // Se quiser permitir múltiplos dispositivos, comente a linha abaixo.
+        $user->tokens()->delete();
 
-            return response()->json([
-                'success' => false,
-                'message' => 'Credenciais inválidas',
-                'errors'  => null,
-            ], 401);
-        }
+        // 5. Gerar Token "Opaco" (Salvo no banco, não é JWT)
+        $token = $user->createToken('auth_token')->plainTextToken;
 
-        Log::info('LOGIN DEBUG: usuário autenticado com sucesso', [
-            'id'    => $user->id,
-            'email' => $user->email,
-        ]);
-
-        // Se tiver Sanctum
-        if (method_exists($user, 'createToken')) {
-            if (method_exists($user, 'tokens')) {
-                $user->tokens()->delete();
-            }
-
-            $token = $user->createToken('api')->plainTextToken;
-        } else {
-            // fallback simples
-            $token = base64_encode($user->id . '|' . now());
-        }
+        Log::info('LOGIN: Sucesso', ['id' => $user->id]);
 
         return response()->json([
             'success' => true,
             'message' => 'Login realizado com sucesso.',
             'token'   => $token,
-            'user'    => $user,
+            'user'    => [
+                'id' => $user->id,
+                'name' => $user->name,
+                'email' => $user->email,
+                // Adicione outros campos se necessário, evite mandar tudo
+            ]
         ]);
     }
+
+    public function logout(Request $request)
+    {
+        // Revoga o token atual
+        $request->user()->currentAccessToken()->delete();
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Logout realizado com sucesso.'
+        ]);
+    }
+
+    public function me(Request $request)
+    {
+        return response()->json($request->user());
+    }
 }
-PHP

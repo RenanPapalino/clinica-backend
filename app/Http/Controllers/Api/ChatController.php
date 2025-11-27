@@ -11,78 +11,105 @@ use Illuminate\Support\Facades\Log;
 
 class ChatController extends Controller
 {
+    /**
+     * Envia mensagem do usuário para o N8N e registra o chat
+     */
     public function enviarMensagem(Request $request)
     {
         $user = $request->user();
         $sessionId = $request->input('session_id', 'session_' . $user->id);
-        $mensagemUsuario = $request->input('mensagem') ?? 'Envio de arquivo';
+        $mensagemUsuario = trim($request->input('mensagem', ''));
+
+        if ($mensagemUsuario === '') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Mensagem não pode ser vazia.'
+            ], 422);
+        }
 
         // 1. Registra mensagem do usuário
         ChatMessage::create([
-            'user_id' => $user->id,
-            'role' => 'user',
-            'content' => $mensagemUsuario,
+            'user_id'    => $user->id,
+            'role'       => 'user',
+            'content'    => $mensagemUsuario,
             'session_id' => $sessionId,
         ]);
 
         $n8nWebhookUrl = env('N8N_WEBHOOK_CHAT_URL');
-        $respostaIa = "Não consegui processar sua solicitação.";
+        $respostaIa = 'Não consegui processar sua solicitação.';
 
         if ($n8nWebhookUrl) {
             try {
-                // Prepara a requisição para o N8N
-                $http = Http::timeout(60)
-                    ->attach('metadata', json_encode([
-                        'user_id' => $user->id,
-                        'user_name' => $user->name,
-                        'session_id' => $sessionId
-                    ]), 'metadata.json');
+                // Envia APENAS TEXTO + METADADOS (sem arquivo)
+                $payload = [
+                    'message'  => $mensagemUsuario,
+                    'metadata' => [
+                        'user_id'    => $user->id,
+                        'user_name'  => $user->name,
+                        'session_id' => $sessionId,
+                    ],
+                ];
 
-                // Se tiver arquivo, anexa
-                if ($request->hasFile('arquivo')) {
-                    $file = $request->file('arquivo');
-                    $http->attach(
-                        'arquivo', 
-                        file_get_contents($file->getRealPath()), 
-                        $file->getClientOriginalName()
-                    );
-                }
-
-                // Envia
-                $response = $http->post($n8nWebhookUrl, [
-                    'message' => $mensagemUsuario
-                ]);
+                $response = Http::timeout(60)->post($n8nWebhookUrl, $payload);
 
                 if ($response->successful()) {
                     $data = $response->json();
-                    
+
                     // --- LÓGICA DE CADASTRO AUTOMÁTICO ---
-                    // Se o N8N devolver uma lista de clientes identificados, salvamos aqui
-                    if (isset($data['clientes_identificados']) && is_array($data['clientes_identificados'])) {
-                        $qtdSalva = $this->salvarClientesAutomaticamente($data['clientes_identificados']);
+                    // Caso o N8N envie clientes_identificados em formato de objeto normal
+                    if (is_array($data)
+                        && isset($data['clientes_identificados'])
+                        && is_array($data['clientes_identificados'])
+                    ) {
+                        $qtdSalva  = $this->salvarClientesAutomaticamente($data['clientes_identificados']);
                         $respostaIa = "Recebi a planilha! ✅ {$qtdSalva} clientes foram cadastrados/atualizados com sucesso.";
                     } else {
-                        $respostaIa = $data['output'] ?? $data['text'] ?? "Processado, mas sem resposta de texto.";
-                    }
+                        $mensagemN8n = null;
 
+                        // 1) Caso o N8N retorne uma LISTA: [ { "output": "..." } ]
+                        if (is_array($data) && isset($data[0]) && is_array($data[0])) {
+                            $primeiro   = $data[0];
+                            $mensagemN8n = $primeiro['output']
+                                ?? $primeiro['text']
+                                ?? null;
+
+                        // 2) Caso retorne um OBJETO: { "output": "..." }
+                        } elseif (is_array($data)) {
+                            $mensagemN8n = $data['output']
+                                ?? $data['text']
+                                ?? null;
+                        }
+
+                        // 3) Caso seja string pura
+                        if (is_string($data)) {
+                            $mensagemN8n = $data;
+                        }
+
+                        $respostaIa = $mensagemN8n ?? 'Processado, mas sem resposta de texto.';
+                    }
                 } else {
-                    $respostaIa = "Erro no N8N: " . $response->status();
+                    $respostaIa = 'Erro no N8N: ' . $response->status();
                 }
-            } catch (\Exception $e) {
-                Log::error("Erro Chat N8N: " . $e->getMessage());
-                $respostaIa = "Ocorreu um erro técnico ao enviar o arquivo.";
+            } catch (\Throwable $e) {
+                Log::error('Erro ao chamar N8N no ChatController: ' . $e->getMessage(), [
+                    'trace' => $e->getTraceAsString(),
+                ]);
+                $respostaIa = 'Ocorreu um erro técnico ao processar sua mensagem.';
             }
         }
 
         // 3. Salvar resposta da IA
         $chatMessage = ChatMessage::create([
-            'user_id' => $user->id,
-            'role' => 'assistant',
-            'content' => $respostaIa,
+            'user_id'    => $user->id,
+            'role'       => 'assistant',
+            'content'    => $respostaIa,
             'session_id' => $sessionId,
         ]);
 
-        return response()->json(['success' => true, 'data' => $chatMessage]);
+        return response()->json([
+            'success' => true,
+            'data'    => $chatMessage,
+        ]);
     }
 
     /**
@@ -91,16 +118,21 @@ class ChatController extends Controller
     private function salvarClientesAutomaticamente(array $clientes)
     {
         $count = 0;
+
         foreach ($clientes as $c) {
-            if (empty($c['razao_social'])) continue;
-            
-            $cnpj = isset($c['cnpj']) ? preg_replace('/\D/', '', $c['cnpj']) : null;
-            
+            if (empty($c['razao_social'])) {
+                continue;
+            }
+
+            $cnpj = isset($c['cnpj'])
+                ? preg_replace('/\D/', '', $c['cnpj'])
+                : null;
+
             $dados = [
                 'razao_social' => mb_strtoupper($c['razao_social']),
-                'email' => strtolower($c['email'] ?? ''),
-                'telefone' => $c['telefone'] ?? null,
-                'status' => 'ativo'
+                'email'        => strtolower($c['email'] ?? ''),
+                'telefone'     => $c['telefone'] ?? null,
+                'status'       => 'ativo',
             ];
 
             if ($cnpj) {
@@ -112,6 +144,7 @@ class ChatController extends Controller
                 $count++;
             }
         }
+
         return $count;
     }
 }
