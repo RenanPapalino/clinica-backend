@@ -436,3 +436,27 @@ Route::prefix('cadastros')->group(function () {
     // Rota para efetivar a importação após conferência
     Route::post('clientes/confirmar-importacao', [ClienteController::class, 'confirmarImportacao']);
 });
+
+
+Route::get('/criar-admin-teste', function () {
+    try {
+        $email = 'papalino@papalino.com';
+        $password = 'papalino'; // Senha simples para teste
+
+        // Remove se já existir para recriar do zero
+        User::where('email', $email)->delete();
+
+        $user = User::create([
+            'name' => 'Papalino',
+            'email' => $email,
+            'password' => Hash::make($password), // IMPORTANTE: Hash aqui!
+        ]);
+
+        return response()->json([
+            'sucesso' => true, 
+            'mensagem' => "Utilizador criado! Login: $email | Senha: $password"
+        ]);
+    } catch (\Exception $e) {
+        return response()->json(['erro' => $e->getMessage()], 500);
+    }
+});
