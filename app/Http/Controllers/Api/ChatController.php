@@ -239,33 +239,45 @@ class ChatController extends Controller
             
             curl_close($ch);
 
-            Log::info('Resposta N8N Arquivo:', [
+            Log::info('Resposta N8N Arquivo (RAW):', [
                 'http_code' => $httpCode,
-                'response'  => substr($response, 0, 500),
+                'response'  => $response,
+                'response_length' => strlen($response ?? ''),
                 'error'     => $error
             ]);
 
+            // Verificar erro de cURL
             if ($error) {
                 Log::error("Erro cURL: {$error}");
                 return "❌ Erro de conexão: {$error}";
             }
 
+            // Verificar código HTTP
             if ($httpCode < 200 || $httpCode >= 300) {
+                Log::error("HTTP Error: {$httpCode} - Response: {$response}");
                 return "❌ Erro ao enviar arquivo (HTTP {$httpCode}).";
             }
 
-            // Decodificar resposta JSON
+            // Se resposta vazia
+            if (empty($response)) {
+                Log::warning('N8N retornou resposta vazia');
+                return '✅ Arquivo enviado com sucesso! (Aguardando processamento)';
+            }
+
+            // Tentar decodificar JSON
             $data = json_decode($response, true);
             
             if (json_last_error() !== JSON_ERROR_NONE) {
-                return $response ?: 'Arquivo recebido pelo servidor.';
+                // Se não for JSON, retornar a resposta como texto
+                Log::info('Resposta N8N não é JSON, retornando como texto');
+                return trim($response);
             }
 
             return $this->extrairResposta($data);
 
         } catch (\Exception $e) {
             Log::error('Erro enviarArquivoParaN8n: ' . $e->getMessage());
-            return '❌ Erro ao processar arquivo.';
+            return '❌ Erro ao processar arquivo: ' . $e->getMessage();
         }
     }
 
@@ -274,10 +286,15 @@ class ChatController extends Controller
      */
     private function extrairResposta($data): string
     {
-        Log::info('Resposta N8N:', ['data' => $data]);
+        Log::info('Extraindo resposta N8N:', ['data' => $data, 'type' => gettype($data)]);
 
         if (empty($data)) {
-            return 'Resposta vazia do servidor.';
+            return '✅ Processado com sucesso!';
+        }
+
+        // String direta
+        if (is_string($data)) {
+            return trim($data);
         }
 
         // Formato: [{"output": "texto"}]
@@ -310,13 +327,18 @@ class ChatController extends Controller
             return $data[0]['text'];
         }
 
-        // String direta
-        if (is_string($data)) {
-            return $data;
+        // Formato: {"result": "texto"}
+        if (is_array($data) && isset($data['result'])) {
+            return is_string($data['result']) ? $data['result'] : json_encode($data['result'], JSON_UNESCAPED_UNICODE);
+        }
+
+        // Formato: {"data": "texto"} ou {"data": {...}}
+        if (is_array($data) && isset($data['data'])) {
+            return is_string($data['data']) ? $data['data'] : json_encode($data['data'], JSON_UNESCAPED_UNICODE);
         }
 
         // Fallback: JSON formatado
-        return json_encode($data, JSON_UNESCAPED_UNICODE);
+        return json_encode($data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
     }
 
     /**
