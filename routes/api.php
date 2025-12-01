@@ -20,7 +20,6 @@ use App\Http\Controllers\Api\TituloController;
 use App\Http\Controllers\Api\CobrancaController;
 use App\Http\Controllers\Api\RelatorioController;
 use App\Http\Controllers\Api\Contabilidade\LancamentoContabilController;
-//use App\Http\Controllers\Api\LancamentoContabilController;
 use App\Http\Controllers\Api\ChatController;
 use App\Http\Controllers\Api\N8nController;
 use App\Http\Controllers\Api\DashboardController;
@@ -39,7 +38,7 @@ Route::get('/health', function () {
         'status' => 'ok',
         'timestamp' => now()->toISOString(),
         'service' => 'MedIntelligence API',
-        'version' => '2.1.0',
+        'version' => '2.2.0',
     ]);
 });
 
@@ -85,39 +84,32 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/taxa-inadimplencia', [DashboardController::class, 'taxaInadimplencia']);
     });
 
+    // ========== ORDENS DE SERVIÇO ==========
     Route::prefix('ordens-servico')->group(function () {
-    Route::get('/', [OrdemServicoController::class, 'index']);
-    Route::get('/{id}', [OrdemServicoController::class, 'show']);
-    Route::post('/', [OrdemServicoController::class, 'store']); // <--- NOVA ROTA
-    Route::post('/importar-soc', [OrdemServicoController::class, 'importarSoc']);
-    Route::post('/{id}/faturar', [OrdemServicoController::class, 'faturar']);
-});
+        Route::get('/', [OrdemServicoController::class, 'index']);
+        Route::get('/{id}', [OrdemServicoController::class, 'show']);
+        Route::post('/', [OrdemServicoController::class, 'store']);
+        Route::post('/importar-soc', [OrdemServicoController::class, 'importarSoc']);
+        Route::post('/{id}/faturar', [OrdemServicoController::class, 'faturar']);
+    });
 
-    // Cadastros Gerais (Hub)
+    // ========== CADASTROS GERAIS ==========
     Route::prefix('cadastros')->group(function () {
         Route::apiResource('clientes', ClienteController::class);
         Route::post('clientes/importar', [ClienteController::class, 'importarLote']);
         Route::post('clientes/sincronizar-soc', [ClienteController::class, 'sincronizarSoc']);
+        Route::post('clientes/analisar-importacao', [ClienteController::class, 'analisarImportacao']);
+        Route::post('clientes/confirmar-importacao', [ClienteController::class, 'confirmarImportacao']);
         
         Route::apiResource('servicos', ServicoController::class);
-        
-        // Rota de Importação Inteligente
-        Route::post('clientes/confirmar-importacao', [ClienteController::class, 'confirmarImportacao']);
-     
-
-        // --- AQUI ESTAVAM FALTANDO AS ROTAS CORRETAS ---
         Route::apiResource('planos-contas', PlanoContaController::class);
         Route::apiResource('centros-custo', CentroCustoController::class);
     });
 
-    // Financeiro Avançado (Tabelas Auxiliares)
+    // Fornecedores
     Route::apiResource('fornecedores', FornecedorController::class);
-    
-    // Rotas de leitura legadas (Mantidas para compatibilidade se necessário, mas fora do padrão REST completo)
-    // Route::get('planos-contas', [PlanoContaController::class, 'index']); 
-    // Route::get('centros-custo', [CentroCustoController::class, 'index']);
 
-    // Faturamento Inteligente
+    // ========== FATURAMENTO INTELIGENTE ==========
     Route::prefix('faturamento')->group(function () {
         Route::get('faturas', [FaturaController::class, 'index']);
         Route::post('faturas', [FaturaController::class, 'store']);
@@ -128,16 +120,15 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('faturas/{id}/itens', [FaturaController::class, 'adicionarItem']);
         Route::get('estatisticas', [FaturaController::class, 'estatisticas']);
         
-        // Novas rotas inteligentes
         Route::post('analisar', [FaturaController::class, 'analisarArquivo']);
         Route::post('processar-confirmados', [FaturaController::class, 'processarLoteConfirmado']);
         Route::post('importar-lote', [FaturaController::class, 'importarLote']);
         Route::post('importar-soc', [FaturaController::class, 'importarSoc']);
         Route::post('emitir-nfse/{id}', [FaturaController::class, 'emitirNfse']);
-        Route::post('/faturas/{id}/gerar-boleto', [FaturamentoController::class, 'gerarBoleto']);
+        Route::post('faturas/{id}/gerar-boleto', [FaturamentoController::class, 'gerarBoleto']);
     });
 
-    // NFS-e (Hub Fiscal)
+    // ========== NFS-e (Hub Fiscal) ==========
     Route::prefix('nfse')->group(function () {
         Route::get('/', [NfseController::class, 'index']);
         Route::post('/emitir-lote', [NfseController::class, 'emitirLote']);
@@ -147,7 +138,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('/{id}/cancelar', [NfseController::class, 'cancelar']);
     });
 
-    // Contas a Receber & Pagar (Títulos Unificados)
+    // ========== TÍTULOS / CONTAS A RECEBER ==========
     Route::apiResource('titulos', TituloController::class);
     
     Route::prefix('contas-receber')->group(function () {
@@ -157,7 +148,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('aging', [TituloController::class, 'relatorioAging']);
     });
 
-    // Contas a Pagar (Despesas)
+    // ========== CONTAS A PAGAR (Despesas) ==========
     Route::prefix('contas-pagar')->group(function () {
         Route::get('despesas', [DespesaController::class, 'index']);
         Route::post('despesas', [DespesaController::class, 'store']);
@@ -165,20 +156,24 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('despesas/{id}/pagar', [DespesaController::class, 'pagar']);
     });
 
-    // ========== COBRANÇAS ==========
-
+    // ========== CONTABILIDADE ==========
     Route::prefix('contabilidade')->group(function () {
-    Route::get('lancamentos', [LancamentoContabilController::class, 'index']);
-    Route::get('balancete', [LancamentoContabilController::class, 'balancete']);
+        Route::get('lancamentos', [LancamentoContabilController::class, 'index']);
+        Route::get('balancete', [LancamentoContabilController::class, 'balancete']);
+        Route::get('dre-real', [LancamentoContabilController::class, 'dreReal']);
+        Route::post('processar-titulo/{id}', [LancamentoContabilController::class, 'processarTitulo']);
 
-    Route::post('livro-razao/auditar-ia', [LancamentoContabilController::class, 'auditarIa']);
-    Route::post('livro-razao/{id}/aprovar-ia', [LancamentoContabilController::class, 'aprovarIa']);
-    Route::post('livro-razao/{id}/revisar-ia', [LancamentoContabilController::class, 'revisarIa']);
+        Route::post('livro-razao/auditar-ia', [LancamentoContabilController::class, 'auditarIa']);
+        Route::post('livro-razao/{id}/aprovar-ia', [LancamentoContabilController::class, 'aprovarIa']);
+        Route::post('livro-razao/{id}/revisar-ia', [LancamentoContabilController::class, 'revisarIa']);
 
-    Route::get('livro-razao/export-ofx', [LancamentoContabilController::class, 'exportOfx']);
-    Route::get('livro-razao/export-excel', [LancamentoContabilController::class, 'exportExcel']);
-});
+        Route::get('livro-razao/export-ofx', [LancamentoContabilController::class, 'exportOfx']);
+        Route::get('livro-razao/export-excel', [LancamentoContabilController::class, 'exportExcel']);
+    });
 
+    Route::apiResource('lancamentos-contabeis', LancamentoContabilController::class)->only(['index', 'store', 'show']);
+
+    // ========== COBRANÇAS ==========
     Route::prefix('cobrancas')->group(function () {
         Route::get('inadimplentes', [CobrancaController::class, 'inadimplentes']);
         Route::post('enviar-whatsapp/{clienteId}', [CobrancaController::class, 'enviarWhatsApp']);
@@ -187,15 +182,8 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::post('gerar-remessa', [CobrancaController::class, 'gerarRemessa']);
         Route::post('processar-retorno', [CobrancaController::class, 'processarRetorno']);
     });
-    
-    // Contabilidade Inteligente
-    Route::apiResource('lancamentos-contabeis', LancamentoContabilController::class)->only(['index', 'store', 'show']);
-    Route::post('contabilidade/processar-titulo/{id}', [LancamentoContabilController::class, 'processarTitulo']);
-    Route::get('contabilidade/balancete', [LancamentoContabilController::class, 'balancete']);
-    Route::get('contabilidade/dre-real', [LancamentoContabilController::class, 'dreReal']);
-  
 
-    // Relatórios
+    // ========== RELATÓRIOS ==========
     Route::prefix('relatorios')->group(function () {
         Route::get('/dashboard', [RelatorioController::class, 'dashboard']);
         Route::get('/faturamento-periodo', [RelatorioController::class, 'faturamentoPorPeriodo']);
@@ -220,18 +208,48 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::put('/fiscal', [ConfiguracaoController::class, 'updateFiscal']);
     });
 
-    // Chat IA
+    // ============================================
+    // CHAT IA - ROTAS ATUALIZADAS
+    // ============================================
     Route::prefix('chat')->group(function () {
-    // Enviar mensagem (com ou sem arquivo)
-    Route::post('/mensagem', [ChatController::class, 'enviarMensagem']);
-    
-    // Buscar histórico de mensagens
-    Route::get('/historico', [ChatController::class, 'historico']);
-    
-    // Limpar histórico (opcional)
-    Route::delete('/historico', [ChatController::class, 'limparHistorico']);
-});
-    // N8N Integrations
+        /**
+         * Enviar mensagem (com ou sem arquivo)
+         * 
+         * POST /api/chat/enviar
+         * 
+         * Body (FormData para upload):
+         * - mensagem: string (opcional se tiver arquivo)
+         * - arquivo: file (opcional)
+         * - tipo_processamento: 'auto'|'clientes'|'servicos'|'financeiro'
+         * - session_id: string (opcional)
+         */
+        Route::post('/enviar', [ChatController::class, 'enviarMensagem']);
+        
+        /**
+         * Buscar histórico de mensagens
+         * GET /api/chat/historico
+         */
+        Route::get('/historico', [ChatController::class, 'historico']);
+        
+        /**
+         * Limpar histórico de mensagens
+         * DELETE /api/chat/limpar
+         */
+        Route::delete('/limpar', [ChatController::class, 'limparHistorico']);
+        
+        /**
+         * Confirmar ação sugerida pela IA (importar, criar fatura, etc)
+         * 
+         * POST /api/chat/confirmar
+         * 
+         * Body:
+         * - acao: 'importar_clientes'|'criar_fatura'|'cadastrar_servicos'
+         * - dados: array de registros a processar
+         */
+        Route::post('/confirmar', [ChatController::class, 'confirmarAcao']);
+    });
+
+    // ========== N8N INTEGRATIONS ==========
     Route::prefix('n8n')->group(function () {
         Route::post('/webhook', [N8nController::class, 'webhook']);
         Route::get('/buscar-cliente', [N8nController::class, 'buscarClientePorCnpj']);
@@ -241,220 +259,24 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/titulos-vencidos', [N8nController::class, 'titulosVencidos']);
     });
 
-});
-
-// Rota de Correção de Emergência
-Route::get('/fix-database-manual', function () {
-    $log = [];
-    try {
-        if (!Schema::hasTable('centros_custo')) {
-            $log[] = '❌ ERRO CRÍTICO: Tabela centros_custo não existe!';
-        } else {
-            if (Schema::hasColumn('centros_custo', 'nome') && !Schema::hasColumn('centros_custo', 'descricao')) {
-                DB::statement('ALTER TABLE centros_custo CHANGE nome descricao VARCHAR(255)');
-                $log[] = '✅ Coluna "nome" renomeada para "descricao".';
-            }
-            if (!Schema::hasColumn('centros_custo', 'codigo')) {
-                Schema::table('centros_custo', function ($table) { $table->string('codigo')->nullable(); });
-                $log[] = '✅ Coluna "codigo" criada.';
-            }
-            if (!Schema::hasColumn('centros_custo', 'ativo')) {
-                Schema::table('centros_custo', function ($table) { $table->boolean('ativo')->default(true); });
-                $log[] = '✅ Coluna "ativo" criada.';
-            }
-        }
-        return response()->json(['status' => 'Concluído', 'log' => $log]);
-    } catch (\Exception $e) {
-        return response()->json(['erro' => $e->getMessage()], 500);
-    }
-});
+}); // Fim do middleware auth:sanctum
 
 
-// Rota para ver o erro real (Diagnóstico)
-Route::get('/debug-logs', function () {
-    $logFile = storage_path('logs/laravel.log');
-    if (!file_exists($logFile)) {
-        return "Arquivo de log não encontrado.";
-    }
-    
-    // Lê as últimas 50 linhas do log
-    $lines = file($logFile);
-    $lastLines = array_slice($lines, -50);
-    
-    return response()->json([
-        'status' => 'Debug Logs',
-        'last_errors' => $lastLines
-    ]);
-});
-
-Route::get('/fix-database-manual', function () {
-    $log = [];
-    
-    try {
-        // 1. CORREÇÃO CRÍTICA: CONFIGURACOES
-        if (!Schema::hasTable('configuracoes')) {
-            Schema::create('configuracoes', function ($table) {
-                $table->id();
-                $table->string('chave')->unique();
-                $table->text('valor')->nullable();
-                $table->string('descricao')->nullable();
-                $table->timestamps();
-            });
-            $log[] = '✅ Tabela "configuracoes" CRIADA (estava faltando).';
-        }
-
-        // Adicionar campos de segurança se faltarem
-        Schema::table('configuracoes', function ($table) {
-            if (!Schema::hasColumn('configuracoes', 'certificado_digital_path')) {
-                $table->text('certificado_digital_path')->nullable()->after('valor');
-                $table->string('certificado_senha')->nullable()->after('certificado_digital_path');
-                $table->string('prefeitura_usuario')->nullable()->after('certificado_senha');
-                $table->string('prefeitura_senha')->nullable()->after('prefeitura_usuario');
-                $table->string('banco_client_id')->nullable()->after('prefeitura_senha');
-                $table->string('banco_client_secret')->nullable()->after('banco_client_id');
-                $table->text('banco_certificado_crt')->nullable();
-                $table->text('banco_certificado_key')->nullable();
-                // Retorno para log
-            }
-        });
-        $log[] = '✅ Campos de segurança verificados em "configuracoes".';
-
-        // 2. CORREÇÃO: CENTROS DE CUSTO
-        if (!Schema::hasTable('centros_custo')) {
-            $log[] = '❌ ERRO CRÍTICO: Tabela centros_custo não existe! (Verifique migrations)';
-        } else {
-            if (Schema::hasColumn('centros_custo', 'nome') && !Schema::hasColumn('centros_custo', 'descricao')) {
-                DB::statement('ALTER TABLE centros_custo CHANGE nome descricao VARCHAR(255)');
-                $log[] = '✅ Coluna "nome" renomeada para "descricao".';
-            }
-            if (!Schema::hasColumn('centros_custo', 'codigo')) {
-                Schema::table('centros_custo', function ($table) { $table->string('codigo')->nullable()->after('id'); });
-                $log[] = '✅ Coluna "codigo" criada.';
-            }
-            if (!Schema::hasColumn('centros_custo', 'ativo')) {
-                Schema::table('centros_custo', function ($table) { $table->boolean('ativo')->default(true); });
-                $log[] = '✅ Coluna "ativo" criada.';
-            }
-        }
-
-        // 3. CORREÇÃO: PLANO DE CONTAS
-        if (!Schema::hasTable('planos_contas')) {
-            $log[] = '❌ ERRO CRÍTICO: Tabela planos_contas não existe!';
-        } else {
-            Schema::table('planos_contas', function ($table) {
-                if (!Schema::hasColumn('planos_contas', 'natureza')) {
-                    $table->string('natureza')->nullable()->after('tipo');
-                }
-                if (!Schema::hasColumn('planos_contas', 'conta_contabil')) {
-                    $table->string('conta_contabil')->nullable();
-                }
-                if (!Schema::hasColumn('planos_contas', 'analitica')) {
-                    $table->boolean('analitica')->default(true);
-                }
-                // Verificação da coluna conta_pai_id
-                if (!Schema::hasColumn('planos_contas', 'conta_pai_id')) {
-                    $table->unsignedBigInteger('conta_pai_id')->nullable()->after('analitica');
-                    $log[] = '✅ Coluna "conta_pai_id" criada.';
-                }
-            });
-            $log[] = '✅ Tabela planos_contas verificada.';
-        }
-
-        // Limpeza de Cache
-        \Illuminate\Support\Facades\Artisan::call('cache:clear');
-        \Illuminate\Support\Facades\Artisan::call('route:clear');
-        \Illuminate\Support\Facades\Artisan::call('config:clear');
-        $log[] = '🧹 Caches do Laravel limpos.';
-
-    } catch (\Exception $e) {
-        return response()->json(['erro' => $e->getMessage(), 'trace' => $e->getTraceAsString()], 500);
-    }
-
-    return response()->json(['status' => 'Banco de Dados Corrigido', 'log' => $log]);
-});
-
-// CORREÇÃO DE EMERGÊNCIA: SERVIÇOS
-Route::get('/fix-servicos-db', function () {
-    $log = [];
-    try {
-        if (!Schema::hasTable('servicos')) {
-            return response()->json(['erro' => 'Tabela servicos não existe! Rode as migrations.'], 500);
-        }
-
-        Schema::table('servicos', function ($table) use (&$log) {
-            // 1. Padronizar 'categoria' -> 'tipo_servico'
-            if (Schema::hasColumn('servicos', 'categoria') && !Schema::hasColumn('servicos', 'tipo_servico')) {
-                // Tenta renomear (requer doctrine/dbal) ou criar nova
-                try {
-                    DB::statement('ALTER TABLE servicos CHANGE categoria tipo_servico VARCHAR(255)');
-                    $log[] = '✅ Coluna "categoria" renomeada para "tipo_servico".';
-                } catch (\Exception $e) {
-                    $table->string('tipo_servico')->default('exame')->after('descricao');
-                    $log[] = '✅ Coluna "tipo_servico" criada (não foi possível renomear).';
-                }
-            } elseif (!Schema::hasColumn('servicos', 'tipo_servico')) {
-                $table->string('tipo_servico')->default('exame')->after('descricao');
-                $log[] = '✅ Coluna "tipo_servico" criada.';
-            }
-
-            // 2. Garantir Campos Fiscais
-            if (!Schema::hasColumn('servicos', 'cnae')) {
-                $table->string('cnae')->nullable()->after('valor_unitario');
-                $log[] = '✅ Coluna "cnae" criada.';
-            }
-            if (!Schema::hasColumn('servicos', 'codigo_servico_municipal')) {
-                $table->string('codigo_servico_municipal')->nullable()->after('cnae');
-                $log[] = '✅ Coluna "codigo_servico_municipal" criada.';
-            }
-            if (!Schema::hasColumn('servicos', 'aliquota_iss')) {
-                $table->decimal('aliquota_iss', 5, 2)->nullable()->after('codigo_servico_municipal');
-                $log[] = '✅ Coluna "aliquota_iss" criada.';
-            }
-            
-            // 3. Garantir Status
-            if (!Schema::hasColumn('servicos', 'ativo')) {
-                $table->boolean('ativo')->default(true);
-                $log[] = '✅ Coluna "ativo" criada.';
-            }
-        });
-
-        // Limpar Cache
-        \Illuminate\Support\Facades\Artisan::call('optimize:clear');
-        $log[] = '🧹 Cache limpo.';
-
-    } catch (\Exception $e) {
-        return response()->json(['erro' => $e->getMessage()], 500);
-    }
-
-    return response()->json(['status' => 'Tabela Serviços Corrigida', 'log' => $log]);
-});
-
-
-
-Route::prefix('cadastros')->group(function () {
-    // ... outras rotas
-    Route::apiResource('clientes', ClienteController::class);
-    
-    // Nova rota para análise inteligente de arquivo (antes de salvar)
-    Route::post('clientes/analisar-importacao', [ClienteController::class, 'analisarImportacao']);
-    
-    // Rota para efetivar a importação após conferência
-    Route::post('clientes/confirmar-importacao', [ClienteController::class, 'confirmarImportacao']);
-});
-
+// ============================================
+// ROTAS DE MANUTENÇÃO (Públicas - usar com cuidado)
+// ============================================
 
 Route::get('/criar-admin-teste', function () {
     try {
         $email = 'papalino@papalino.com';
-        $password = 'papalino'; // Senha simples para teste
+        $password = 'papalino';
 
-        // Remove se já existir para recriar do zero
         User::where('email', $email)->delete();
 
         $user = User::create([
             'name' => 'Papalino',
             'email' => $email,
-            'password' => Hash::make($password), // IMPORTANTE: Hash aqui!
+            'password' => Hash::make($password),
         ]);
 
         return response()->json([
@@ -466,8 +288,6 @@ Route::get('/criar-admin-teste', function () {
     }
 });
 
-
-// ROTA TEMPORÁRIA - Corrigir tabela chat_messages
 Route::get('/fix-chat-messages', function () {
     $log = [];
     
@@ -486,7 +306,6 @@ Route::get('/fix-chat-messages', function () {
         } else {
             $log[] = '📋 Tabela chat_messages já existe. Verificando colunas...';
             
-            // Verificar e adicionar colunas faltantes
             if (!Schema::hasColumn('chat_messages', 'session_id')) {
                 Schema::table('chat_messages', function ($table) {
                     $table->string('session_id')->nullable()->after('user_id');
@@ -514,16 +333,8 @@ Route::get('/fix-chat-messages', function () {
                 });
                 $log[] = '✅ Coluna metadata adicionada.';
             }
-            
-            if (!Schema::hasColumn('chat_messages', 'user_id')) {
-                Schema::table('chat_messages', function ($table) {
-                    $table->unsignedBigInteger('user_id')->nullable()->after('id');
-                });
-                $log[] = '✅ Coluna user_id adicionada.';
-            }
         }
         
-        // Mostrar estrutura atual
         $colunas = Schema::getColumnListing('chat_messages');
         $log[] = '📊 Colunas atuais: ' . implode(', ', $colunas);
         
@@ -535,4 +346,111 @@ Route::get('/fix-chat-messages', function () {
         'status' => 'Verificação concluída',
         'log' => $log
     ]);
+});
+
+Route::get('/fix-database-manual', function () {
+    $log = [];
+    try {
+        if (!Schema::hasTable('centros_custo')) {
+            $log[] = '❌ ERRO CRÍTICO: Tabela centros_custo não existe!';
+        } else {
+            if (Schema::hasColumn('centros_custo', 'nome') && !Schema::hasColumn('centros_custo', 'descricao')) {
+                DB::statement('ALTER TABLE centros_custo CHANGE nome descricao VARCHAR(255)');
+                $log[] = '✅ Coluna "nome" renomeada para "descricao".';
+            }
+            if (!Schema::hasColumn('centros_custo', 'codigo')) {
+                Schema::table('centros_custo', function ($table) { 
+                    $table->string('codigo')->nullable(); 
+                });
+                $log[] = '✅ Coluna "codigo" criada.';
+            }
+            if (!Schema::hasColumn('centros_custo', 'ativo')) {
+                Schema::table('centros_custo', function ($table) { 
+                    $table->boolean('ativo')->default(true); 
+                });
+                $log[] = '✅ Coluna "ativo" criada.';
+            }
+            $log[] = '✅ Tabela centros_custo verificada.';
+        }
+
+        if (!Schema::hasTable('planos_contas')) {
+            $log[] = '❌ ERRO CRÍTICO: Tabela planos_contas não existe!';
+        } else {
+            Schema::table('planos_contas', function ($table) use (&$log) {
+                if (!Schema::hasColumn('planos_contas', 'tipo')) {
+                    $table->enum('tipo', ['receita', 'despesa', 'ativo', 'passivo'])->default('despesa');
+                    $log[] = '✅ Coluna "tipo" criada.';
+                }
+                if (!Schema::hasColumn('planos_contas', 'ativo')) {
+                    $table->boolean('ativo')->default(true);
+                    $log[] = '✅ Coluna "ativo" criada.';
+                }
+                if (!Schema::hasColumn('planos_contas', 'conta_pai_id')) {
+                    $table->unsignedBigInteger('conta_pai_id')->nullable();
+                    $log[] = '✅ Coluna "conta_pai_id" criada.';
+                }
+            });
+            $log[] = '✅ Tabela planos_contas verificada.';
+        }
+
+        \Illuminate\Support\Facades\Artisan::call('cache:clear');
+        \Illuminate\Support\Facades\Artisan::call('route:clear');
+        \Illuminate\Support\Facades\Artisan::call('config:clear');
+        $log[] = '🧹 Caches do Laravel limpos.';
+
+    } catch (\Exception $e) {
+        return response()->json(['erro' => $e->getMessage(), 'trace' => $e->getTraceAsString()], 500);
+    }
+
+    return response()->json(['status' => 'Banco de Dados Corrigido', 'log' => $log]);
+});
+
+Route::get('/fix-servicos-db', function () {
+    $log = [];
+    try {
+        if (!Schema::hasTable('servicos')) {
+            return response()->json(['erro' => 'Tabela servicos não existe! Rode as migrations.'], 500);
+        }
+
+        Schema::table('servicos', function ($table) use (&$log) {
+            if (Schema::hasColumn('servicos', 'categoria') && !Schema::hasColumn('servicos', 'tipo_servico')) {
+                try {
+                    DB::statement('ALTER TABLE servicos CHANGE categoria tipo_servico VARCHAR(255)');
+                    $log[] = '✅ Coluna "categoria" renomeada para "tipo_servico".';
+                } catch (\Exception $e) {
+                    $table->string('tipo_servico')->default('exame')->after('descricao');
+                    $log[] = '✅ Coluna "tipo_servico" criada (não foi possível renomear).';
+                }
+            } elseif (!Schema::hasColumn('servicos', 'tipo_servico')) {
+                $table->string('tipo_servico')->default('exame')->after('descricao');
+                $log[] = '✅ Coluna "tipo_servico" criada.';
+            }
+
+            if (!Schema::hasColumn('servicos', 'cnae')) {
+                $table->string('cnae')->nullable()->after('valor_unitario');
+                $log[] = '✅ Coluna "cnae" criada.';
+            }
+            if (!Schema::hasColumn('servicos', 'codigo_servico_municipal')) {
+                $table->string('codigo_servico_municipal')->nullable()->after('cnae');
+                $log[] = '✅ Coluna "codigo_servico_municipal" criada.';
+            }
+            if (!Schema::hasColumn('servicos', 'aliquota_iss')) {
+                $table->decimal('aliquota_iss', 5, 2)->nullable()->after('codigo_servico_municipal');
+                $log[] = '✅ Coluna "aliquota_iss" criada.';
+            }
+            
+            if (!Schema::hasColumn('servicos', 'ativo')) {
+                $table->boolean('ativo')->default(true);
+                $log[] = '✅ Coluna "ativo" criada.';
+            }
+        });
+
+        \Illuminate\Support\Facades\Artisan::call('optimize:clear');
+        $log[] = '🧹 Cache limpo.';
+
+    } catch (\Exception $e) {
+        return response()->json(['erro' => $e->getMessage()], 500);
+    }
+
+    return response()->json(['status' => 'Tabela Serviços Corrigida', 'log' => $log]);
 });
