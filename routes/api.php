@@ -89,6 +89,8 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('/', [OrdemServicoController::class, 'index']);
         Route::get('/{id}', [OrdemServicoController::class, 'show']);
         Route::post('/', [OrdemServicoController::class, 'store']);
+        Route::put('/{id}', [OrdemServicoController::class, 'update']);
+        Route::delete('/{id}', [OrdemServicoController::class, 'destroy']);
         Route::post('/importar-soc', [OrdemServicoController::class, 'importarSoc']);
         Route::post('/{id}/faturar', [OrdemServicoController::class, 'faturar']);
     });

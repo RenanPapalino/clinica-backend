@@ -5,26 +5,28 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\ChatMessage;
 use App\Models\Cliente;
-use App\Models\Servico;
-use App\Models\Funcionario;
-use App\Models\Fatura;
-use App\Models\FaturaItem;
 use App\Models\OrdemServico;
 use App\Models\OrdemServicoItem;
 use App\Models\OrdemServicoRateio;
+use App\Models\Fatura;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+use Carbon\Carbon;
+use Illuminate\Database\QueryException;
 
 class ChatController extends Controller
 {
-    private const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+    private const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB limit
+    private array $cacheColunasClientes = [];
 
-    // ========================================
-    // ENDPOINT PRINCIPAL: ENVIAR MENSAGEM
-    // ========================================
-
+    /**
+     * =========================================================================
+     * 1. FLUXO DE CHAT (ENVIO DE MENSAGEM PARA N8N)
+     * =========================================================================
+     */
     public function enviarMensagem(Request $request)
     {
         try {
@@ -38,17 +40,14 @@ class ChatController extends Controller
             $tipoProcessamento = $request->input('tipo_processamento', 'auto');
             $arquivoData = null;
 
-            // 1. Processar Upload de Arquivo
-            if ($request->hasFile('arquivo')) {
+            // 1.1 Processamento e Validação de Arquivo
+            if ($request->hasFile('arquivo') && $request->file('arquivo')->isValid()) {
                 $arquivo = $request->file('arquivo');
                 
                 if ($arquivo->getSize() > self::MAX_FILE_SIZE) {
-                    return response()->json([
-                        'success' => false, 
-                        'message' => 'Arquivo muito grande (Máx 10MB).'
-                    ], 422);
+                    return response()->json(['success' => false, 'message' => 'Arquivo muito grande (Máx 10MB).'], 422);
                 }
-                
+
                 $arquivoData = [
                     'nome'      => $arquivo->getClientOriginalName(),
                     'extensao'  => strtolower($arquivo->getClientOriginalExtension()),
@@ -58,17 +57,13 @@ class ChatController extends Controller
                 ];
             }
 
+            // Validação: Não pode enviar nada vazio
             if ($mensagem === '' && !$arquivoData) {
-                return response()->json([
-                    'success' => false, 
-                    'message' => 'Envie uma mensagem ou arquivo.'
-                ], 422);
+                return response()->json(['success' => false, 'message' => 'Envie uma mensagem ou arquivo.'], 422);
             }
 
-            // 2. Salvar mensagem do usuário
-            $conteudoLog = $arquivoData 
-                ? "[Arquivo: {$arquivoData['nome']}] " . $mensagem 
-                : $mensagem;
+            // 1.2 Persistência da Mensagem do Usuário
+            $conteudoLog = $arquivoData ? "[Arquivo: {$arquivoData['nome']}] " . $mensagem : $mensagem;
             
             ChatMessage::create([
                 'user_id'    => $user->id,
@@ -78,10 +73,32 @@ class ChatController extends Controller
                 'metadata'   => $arquivoData ? ['file_name' => $arquivoData['nome']] : null
             ]);
 
-            // 3. Enviar para N8N
-            $respostaIa = $this->enviarParaN8n($mensagem, $user, $sessionId, $arquivoData, $tipoProcessamento);
+            // Respostas rápidas locais (consultas simples a clientes/faturas/OS)
+            $respostaRapida = $this->responderLocalmente($mensagem);
+            if ($respostaRapida) {
+                $chatMessage = ChatMessage::create([
+                    'user_id'    => $user->id,
+                    'role'       => 'assistant',
+                    'content'    => $respostaRapida,
+                    'session_id' => $sessionId,
+                    'metadata'   => null
+                ]);
 
-            // 4. Salvar resposta da IA
+                return response()->json([
+                    'success'            => true,
+                    'id'                 => $chatMessage->id,
+                    'role'               => $chatMessage->role,
+                    'content'            => $chatMessage->content,
+                    'created_at'         => $chatMessage->created_at->toISOString(),
+                    'dados_estruturados' => null,
+                    'acao_sugerida'      => null,
+                ]);
+            }
+
+            // 1.3 Envio para N8N (Core Logic)
+            $respostaIa = $this->conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tipoProcessamento);
+
+            // 1.4 Persistência da Resposta da IA
             $chatMessage = ChatMessage::create([
                 'user_id'    => $user->id,
                 'role'       => 'assistant',
@@ -90,7 +107,6 @@ class ChatController extends Controller
                 'metadata'   => $respostaIa['dados_estruturados'] ?? null
             ]);
 
-            // 5. Retornar resposta
             return response()->json([
                 'success'            => true,
                 'id'                 => $chatMessage->id,
@@ -102,35 +118,26 @@ class ChatController extends Controller
             ]);
 
         } catch (\Throwable $e) {
-            Log::error('Erro ChatController: ' . $e->getMessage() . ' | Linha: ' . $e->getLine());
-            return response()->json([
-                'success' => false, 
-                'message' => 'Erro interno: ' . $e->getMessage()
-            ], 500);
+            Log::error('Erro ChatController@enviarMensagem: ' . $e->getMessage());
+            return response()->json(['success' => false, 'message' => 'Erro interno: ' . $e->getMessage()], 500);
         }
     }
 
-    // ========================================
-    // COMUNICAÇÃO COM N8N
-    // ========================================
-
-    private function enviarParaN8n($mensagem, $user, $sessionId, $arquivoData, $tipoProcessamento): array
+    /**
+     * Comunicação HTTP com o N8N
+     */
+private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tipoProcessamento): array
     {
-        if ($arquivoData) {
-            $webhookUrl = env('N8N_WEBHOOK_URL');
-            $timeout = 600;
-            $rotaNome = "ARQUIVO";
-        } else {
-            $webhookUrl = env('N8N_WEBHOOK_CHAT_URL');
-            $timeout = 120;
-            $rotaNome = "CHAT";
-        }
-        
+        // Define Rota: Se tem arquivo, vai para rota de arquivo. Se não, rota de chat.
+        $isArquivo = !empty($arquivoData);
+        $webhookUrl = $isArquivo ? env('N8N_WEBHOOK_URL') : env('N8N_WEBHOOK_CHAT_URL');
+        $timeout = $isArquivo ? 600 : 120; // Mais tempo para arquivos
+        $rotaNome = $isArquivo ? "ARQUIVO" : "CHAT";
+
+        Log::info("📡 Enviando para N8N [{$rotaNome}]", ['url' => $webhookUrl]);
+
         if (!$webhookUrl) {
-            return [
-                'mensagem' => "⚠️ Webhook N8N ({$rotaNome}) não configurado.",
-                'dados_estruturados' => null
-            ];
+            return ['mensagem' => "⚠️ Erro de Configuração: Webhook {$rotaNome} não definido no .env.", 'dados_estruturados' => null];
         }
 
         try {
@@ -144,1105 +151,1089 @@ class ChatController extends Controller
                 'timestamp'          => now()->toISOString(),
             ];
 
-            if ($arquivoData) {
+            if ($isArquivo) {
                 $payload['arquivo'] = $arquivoData;
             }
 
-            Log::info("📤 Enviando para N8N [{$rotaNome}]...");
-
-            $response = Http::timeout($timeout)
-                ->connectTimeout(30)
-                ->withHeaders([
-                    'Content-Type' => 'application/json',
-                    'Accept'       => 'application/json'
-                ])
-                ->post($webhookUrl, $payload);
+            $response = Http::timeout($timeout)->post($webhookUrl, $payload);
 
             if (!$response->successful()) {
-                return [
-                    'mensagem' => "❌ Erro ao processar (HTTP {$response->status()}).",
-                    'dados_estruturados' => null
-                ];
+                Log::error("❌ Erro N8N {$rotaNome}: " . $response->body());
+                return ['mensagem' => "❌ Erro ao processar (HTTP {$response->status()}).", 'dados_estruturados' => null];
             }
 
-            $body = $response->body();
+            // Processa o retorno JSON
+            $body = $response->json() ?? json_decode($response->body(), true);
 
-            if (empty($body)) {
-                return [
-                    'mensagem' => "⚠️ O N8N respondeu vazio. Configure: Respond When Last Node Finishes.",
-                    'dados_estruturados' => null
-                ];
-            }
+            $normalizado = $this->normalizarRespostaN8n($body);
 
-            $json = json_decode($body, true);
-
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                if (str_contains($body, 'Workflow started')) {
-                    return [
-                        'mensagem' => "⚠️ Configure N8N: Webhook > Respond > When Last Node Finishes",
-                        'dados_estruturados' => null
-                    ];
-                }
-                return ['mensagem' => $body, 'dados_estruturados' => null];
-            }
-
-            Log::info("📥 Resposta N8N recebida", ['keys' => array_keys($json)]);
-
-            return $this->processarRespostaN8n($json);
+            return [
+                'mensagem'           => $normalizado['mensagem'] ?? json_encode($body),
+                'dados_estruturados' => $normalizado['dados_estruturados'] ?? null,
+                'acao_sugerida'      => $normalizado['acao_sugerida'] ?? ($normalizado['dados_estruturados']['acao_sugerida'] ?? null)
+            ];
 
         } catch (\Exception $e) {
             Log::error('Exceção N8N: ' . $e->getMessage());
-            return [
-                'mensagem' => '❌ Falha de conexão: ' . $e->getMessage(),
-                'dados_estruturados' => null
-            ];
-        }
-    }
-
-    // ========================================
-    // PROCESSAMENTO DE RESPOSTA N8N
-    // ========================================
-
-    private function processarRespostaN8n($data): array
-    {
-        if (is_string($data)) {
-            return $this->extrairJsonDeString($data);
-        }
-
-        // Se é lista de resultados do N8N
-        if (is_array($data) && array_is_list($data) && count($data) > 0) {
-            $first = $data[0];
-            
-            if (isset($first['output']) || isset($first['message']) || isset($first['text'])) {
-                return $this->processarRespostaN8n($first);
-            }
-            if (isset($first['json'])) {
-                return $this->processarRespostaN8n($first['json']);
-            }
-            
-            return $this->formatarResposta($data);
-        }
-
-        // Tentar achar conteúdo encapsulado
-        $chavesConteudo = ['output', 'message', 'response', 'data', 'json', 'text', 'resultado'];
-        
-        foreach ($chavesConteudo as $chave) {
-            if (isset($data[$chave])) {
-                $conteudo = $data[$chave];
-                
-                if (is_string($conteudo) && (
-                    str_starts_with(trim($conteudo), '{') || 
-                    str_starts_with(trim($conteudo), '[')
-                )) {
-                    return $this->extrairJsonDeString($conteudo);
-                }
-                
-                if (is_array($conteudo)) {
-                    return $this->formatarResposta($conteudo);
-                }
-                
-                if (is_string($conteudo)) {
-                    return ['mensagem' => $conteudo, 'dados_estruturados' => null];
-                }
-            }
-        }
-
-        return $this->formatarResposta($data);
-    }
-
-    private function extrairJsonDeString(string $texto): array
-    {
-        if (preg_match('/```(?:json)?\s*([\s\S]*?)\s*```/', $texto, $matches)) {
-            $json = json_decode(trim($matches[1]), true);
-            if ($json) {
-                return $this->formatarResposta($json);
-            }
-        }
-        
-        $json = json_decode($texto, true);
-        if ($json) {
-            return $this->formatarResposta($json);
-        }
-
-        return ['mensagem' => $texto, 'dados_estruturados' => null];
-    }
-
-    // ========================================
-    // FORMATAÇÃO DE RESPOSTA
-    // ========================================
-
-    private function formatarResposta($data): array
-    {
-        $dadosMapeados = [];
-        $textoMensagem = null;
-        $tipoDetectado = null;
-        $colunas = [];
-        $metadata = [];
-
-        if (is_array($data)) {
-            // Extrair dados mapeados primeiro
-            $dadosMapeados = $this->extrairDadosMapeados($data);
-            
-            // Detectar tipo baseado nos dados extraídos
-            $tipoDetectado = $data['tipo'] ?? null;
-            
-            // Se tipo é generico ou não definido, detectar automaticamente pelos campos
-            if (empty($tipoDetectado) || $tipoDetectado === 'generico') {
-                $tipoDetectado = $this->detectarTipoPelosCampos($dadosMapeados);
-                Log::info("🔍 Tipo detectado automaticamente: {$tipoDetectado}");
-            }
-            
-            if (!empty($dadosMapeados)) {
-                $colunas = $this->definirColunas($tipoDetectado, $dadosMapeados);
-            }
-
-            $textoMensagem = $this->extrairTextoMensagem($data);
-            
-            $metadata = [
-                'empresa_nome' => $data['empresa_nome'] ?? $data['metadata']['empresa_nome'] ?? null,
-                'periodo'      => $data['periodo'] ?? $data['metadata']['periodo'] ?? null,
-                'total_valor'  => $data['total_valor'] ?? $data['metadata']['total_valor'] ?? null,
-                'cliente_id'   => $data['cliente_id'] ?? $data['metadata']['cliente_id'] ?? null,
-            ];
-        }
-
-        if (!empty($dadosMapeados)) {
-            $acaoSugerida = $this->definirAcaoSugerida($tipoDetectado);
-            
-            $mensagens = [
-                'clientes'            => "📋 Encontrei **%d cliente(s)** para importação.",
-                'fatura_titulos'      => "💰 Processada fatura com **%d título(s)**.",
-                'fatura_funcionarios' => "👥 Encontrei **%d registro(s) de funcionários/exames**.",
-                'funcionarios'        => "👤 Encontrei **%d funcionário(s)** para importação.",
-                'servicos'            => "🔧 Encontrei **%d serviço(s)** para importação.",
-            ];
-            
-            $mensagemPreview = $textoMensagem ?? sprintf(
-                $mensagens[$tipoDetectado] ?? "✅ Processados **%d** registro(s).",
-                count($dadosMapeados)
-            );
-            
-            Log::info("📊 Formatando resposta", [
-                'tipo' => $tipoDetectado,
-                'acao' => $acaoSugerida,
-                'registros' => count($dadosMapeados)
-            ]);
-            
-            return [
-                'mensagem' => $mensagemPreview,
-                'dados_estruturados' => [
-                    'sucesso'         => true,
-                    'tipo'            => $tipoDetectado,
-                    'dados_mapeados'  => $dadosMapeados,
-                    'colunas'         => $colunas,
-                    'acao_sugerida'   => $acaoSugerida,
-                    'total_registros' => count($dadosMapeados),
-                    'confianca'       => $data['confianca'] ?? 1.0,
-                    'erros'           => $data['erros'] ?? [],
-                    'avisos'          => $data['avisos'] ?? [],
-                    'metadata'        => $metadata,
-                ],
-                'acao_sugerida' => $acaoSugerida,
-            ];
-        }
-
-        if ($textoMensagem) {
-            return ['mensagem' => $textoMensagem, 'dados_estruturados' => null];
-        }
-
-        return [
-            'mensagem' => json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE),
-            'dados_estruturados' => null
-        ];
-    }
-
-    private function extrairDadosMapeados(array $data): array
-    {
-        if (array_is_list($data) && count($data) > 0 && is_array($data[0])) {
-            return $data;
-        }
-        
-        $chavesDados = [
-            'dados_mapeados', 'registros', 'data', 'items', 'rows', 
-            'clientes', 'servicos', 'funcionarios', 'empresas',
-            'lista', 'fatura', 'titulos', 'exames', 'linhas'
-        ];
-        
-        foreach ($chavesDados as $chave) {
-            if (isset($data[$chave]) && is_array($data[$chave]) && count($data[$chave]) > 0) {
-                return $data[$chave];
-            }
-        }
-
-        if (isset($data['empresa']) && is_array($data['empresa'])) {
-            return [$data['empresa']];
-        }
-
-        return [];
-    }
-
-    private function extrairTextoMensagem(array $data): ?string
-    {
-        $chavesTexto = [
-            'mensagem', 'message', 'output', 'text', 'response', 
-            'answer', 'content', 'reply', 'texto', 'body', 'resumo'
-        ];
-        
-        foreach ($chavesTexto as $chave) {
-            if (!empty($data[$chave]) && is_string($data[$chave])) {
-                return $data[$chave];
-            }
-        }
-        
-        return null;
-    }
-
-    // ========================================
-    // DETECÇÃO DE TIPO PELOS CAMPOS
-    // ========================================
-
-    /**
-     * Detecta o tipo de dados baseado nos campos presentes
-     */
-    private function detectarTipoPelosCampos(array $dados): string
-    {
-        if (empty($dados)) {
-            return 'generico';
-        }
-
-        // Pegar primeiro registro como amostra
-        $amostra = $dados[0] ?? [];
-        if (!is_array($amostra)) {
-            return 'generico';
-        }
-
-        // Normalizar nomes das colunas
-        $camposNormalizados = [];
-        foreach (array_keys($amostra) as $campo) {
-            $camposNormalizados[] = $this->normalizarNomeColuna((string) $campo);
-        }
-        $camposStr = implode(',', $camposNormalizados);
-
-        Log::info("🔎 Campos para detecção: {$camposStr}");
-
-        // CLIENTES: tem CNPJ
-        if (str_contains($camposStr, 'cnpj')) {
-            return 'clientes';
-        }
-
-        // FATURA FUNCIONÁRIOS: tem matricula + (exame ou setor)
-        if (str_contains($camposStr, 'matricula') && 
-            (str_contains($camposStr, 'exame') || str_contains($camposStr, 'setor') || str_contains($camposStr, 'nome'))) {
-            return 'fatura_funcionarios';
-        }
-
-        // FATURA TÍTULOS: tem produto/serviço ou vidas
-        if (str_contains($camposStr, 'produtoservico') || 
-            str_contains($camposStr, 'produto') ||
-            str_contains($camposStr, 'vidasativas') ||
-            str_contains($camposStr, 'vidas') ||
-            (str_contains($camposStr, 'total') && str_contains($camposStr, 'servico'))) {
-            return 'fatura_titulos';
-        }
-
-        // FUNCIONÁRIOS: tem CPF
-        if (str_contains($camposStr, 'cpf')) {
-            return 'funcionarios';
-        }
-
-        // SERVIÇOS: tem código TUSS ou código + descrição
-        if (str_contains($camposStr, 'tuss') || 
-            (str_contains($camposStr, 'codigo') && str_contains($camposStr, 'descricao'))) {
-            return 'servicos';
-        }
-
-        return 'generico';
-    }
-
-    private function normalizarNomeColuna(string $nome): string
-    {
-        $nome = strtolower($nome);
-        $nome = str_replace([' ', '_', '-', '.', '/', '\\'], '', $nome);
-        return $this->removerAcentos($nome);
-    }
-
-    private function removerAcentos(string $string): string
-    {
-        return preg_replace(
-            ['/[áàãâä]/u', '/[éèêë]/u', '/[íìîï]/u', '/[óòõôö]/u', '/[úùûü]/u', '/[ç]/u'],
-            ['a', 'e', 'i', 'o', 'u', 'c'],
-            $string
-        );
-    }
-
-    // ========================================
-    // DEFINIÇÃO DE COLUNAS
-    // ========================================
-
-    private function definirColunas(?string $tipo, array $dados): array
-    {
-        $primeiroRegistro = $dados[0] ?? [];
-        $todasColunas = array_keys($primeiroRegistro);
-        
-        $mapaColunasReais = [];
-        foreach ($todasColunas as $coluna) {
-            $normalizada = $this->normalizarNomeColuna($coluna);
-            $mapaColunasReais[$normalizada] = $coluna;
-        }
-
-        $colunasPreferidas = match($tipo) {
-            'clientes' => [
-                ['key' => 'razaosocial', 'label' => 'Razão Social', 'width' => 200],
-                ['key' => 'nomefantasia', 'label' => 'Nome Fantasia', 'width' => 150],
-                ['key' => 'cnpj', 'label' => 'CNPJ', 'width' => 150],
-                ['key' => 'email', 'label' => 'E-mail', 'width' => 180],
-                ['key' => 'telefone', 'label' => 'Telefone', 'width' => 120],
-                ['key' => 'cidade', 'label' => 'Cidade', 'width' => 120],
-                ['key' => 'uf', 'label' => 'UF', 'width' => 50],
-            ],
-            'fatura_funcionarios' => [
-                ['key' => 'nome', 'label' => 'Funcionário', 'width' => 200],
-                ['key' => 'matricula', 'label' => 'Matrícula', 'width' => 100],
-                ['key' => 'setor', 'label' => 'Setor', 'width' => 120],
-                ['key' => 'situacao', 'label' => 'Situação', 'width' => 80],
-                ['key' => 'exame', 'label' => 'Exame', 'width' => 180],
-                ['key' => 'tipo', 'label' => 'Tipo', 'width' => 60],
-                ['key' => 'dtexame', 'label' => 'Data Exame', 'width' => 100],
-                ['key' => 'vlcobrar', 'label' => 'Valor (R$)', 'width' => 100, 'align' => 'right', 'format' => 'currency'],
-            ],
-            'fatura_titulos' => [
-                ['key' => 'produtoservico', 'label' => 'Produto/Serviço', 'width' => 250],
-                ['key' => 'datacobranca', 'label' => 'Data Cobrança', 'width' => 120],
-                ['key' => 'vidasativas', 'label' => 'Vidas', 'width' => 80, 'align' => 'center'],
-                ['key' => 'valorvida', 'label' => 'Valor/Vida', 'width' => 100, 'align' => 'right', 'format' => 'currency'],
-                ['key' => 'totalreais', 'label' => 'Total (R$)', 'width' => 120, 'align' => 'right', 'format' => 'currency'],
-            ],
-            default => []
-        };
-
-        if (empty($colunasPreferidas)) {
-            return array_map(fn($key) => [
-                'key'   => $key,
-                'label' => $this->formatarLabelColuna($key),
-                'width' => 150
-            ], array_slice($todasColunas, 0, 8));
-        }
-
-        $colunasFinais = [];
-        foreach ($colunasPreferidas as $col) {
-            $keyNormalizada = $col['key'];
-            
-            if (isset($mapaColunasReais[$keyNormalizada])) {
-                $col['key'] = $mapaColunasReais[$keyNormalizada];
-                $colunasFinais[] = $col;
-            }
-        }
-
-        if (empty($colunasFinais)) {
-            return array_map(fn($key) => [
-                'key'   => $key,
-                'label' => $this->formatarLabelColuna($key),
-                'width' => 150
-            ], array_slice($todasColunas, 0, 8));
-        }
-
-        return $colunasFinais;
-    }
-
-    private function formatarLabelColuna(string $key): string
-    {
-        return ucfirst(str_replace(['_', '-'], ' ', $key));
-    }
-
-    private function definirAcaoSugerida(?string $tipo): string
-    {
-        return match($tipo) {
-            'clientes'            => 'importar_clientes',
-            'fatura_titulos'      => 'gerar_fatura',
-            'fatura_funcionarios' => 'gerar_os_detalhada',
-            'funcionarios'        => 'importar_funcionarios',
-            'servicos'            => 'importar_servicos',
-            default               => 'importar_generico'
-        };
-    }
-
-    // ========================================
-    // ENDPOINTS AUXILIARES
-    // ========================================
-
-    public function historico(Request $request)
-    {
-        $user = $request->user();
-        $sessionId = $request->input('session_id', 'session_' . $user->id);
-        
-        $mensagens = ChatMessage::where('user_id', $user->id)
-            ->where('session_id', $sessionId)
-            ->orderBy('created_at', 'asc')
-            ->limit(50)
-            ->get()
-            ->map(function ($msg) {
-                return [
-                    'id'                 => $msg->id,
-                    'role'               => $msg->role,
-                    'content'            => $msg->content,
-                    'created_at'         => $msg->created_at->toISOString(),
-                    'dados_estruturados' => $msg->metadata,
-                ];
-            });
-            
-        return response()->json(['success' => true, 'data' => $mensagens]);
-    }
-
-    public function limparHistorico(Request $request)
-    {
-        $user = $request->user();
-        $sessionId = $request->input('session_id', 'session_' . $user->id);
-        
-        ChatMessage::where('user_id', $user->id)
-            ->where('session_id', $sessionId)
-            ->delete();
-            
-        return response()->json(['success' => true, 'message' => 'Histórico limpo.']);
-    }
-
-    // ========================================
-    // CONFIRMAÇÃO DE AÇÃO (IMPORTAÇÃO)
-    // ========================================
-
-    public function confirmarAcao(Request $request)
-    {
-        $acao = $request->input('acao') ?? $request->input('tipo');
-        $dados = $request->input('dados', []);
-        $metadata = $request->input('metadata', []);
-        
-        // Garantir que metadata é array
-        if (!is_array($metadata)) {
-            $metadata = [];
-        }
-        
-        if (empty($dados) || !is_array($dados)) {
-            return response()->json([
-                'success' => false, 
-                'message' => 'Nenhum dado para importar.'
-            ], 422);
-        }
-
-        Log::info("📥 ===== CONFIRMANDO AÇÃO =====");
-        Log::info("📥 Ação recebida: {$acao}");
-        Log::info("📥 Total de registros: " . count($dados));
-        Log::info("📥 Metadata: " . json_encode($metadata));
-        Log::info("📥 Primeiro registro: " . json_encode($dados[0] ?? []));
-
-        // Se ação for genérica, tentar detectar pelo conteúdo dos dados
-        if ($acao === 'importar_generico' || $acao === 'generico' || empty($acao)) {
-            $tipoDetectado = $this->detectarTipoPelosCampos($dados);
-            $acao = $this->definirAcaoSugerida($tipoDetectado);
-            Log::info("🔄 Ação reclassificada para: {$acao} (tipo: {$tipoDetectado})");
-        }
-
-        DB::beginTransaction();
-        try {
-            Log::info("🔧 Executando ação: {$acao}");
-            
-            $resultado = match($acao) {
-                'importar_clientes', 'clientes' 
-                    => $this->importarClientes($dados),
-                
-                'importar_funcionarios', 'funcionarios' 
-                    => $this->importarFuncionarios($dados),
-                
-                'importar_servicos', 'servicos' 
-                    => $this->importarServicos($dados),
-                
-                'gerar_fatura', 'fatura', 'fatura_titulos' 
-                    => $this->gerarOrdemServico($dados, $metadata),
-                
-                'gerar_os_detalhada', 'fatura_funcionarios', 'importar_fatura', 'relatorio_fatura' 
-                    => $this->gerarOrdemServicoDetalhada($dados, $metadata),
-                
-                default => $this->tentarImportacaoAutomatica($dados, $metadata)
-            };
-
-            DB::commit();
-            
-            Log::info("✅ Ação concluída com sucesso: " . ($resultado['message'] ?? 'OK'));
-            
-            return response()->json([
-                'success'  => true,
-                'message'  => $resultado['message'],
-                'detalhes' => $resultado['detalhes'] ?? null
-            ]);
-            
-        } catch (\Exception $e) {
-            DB::rollBack();
-            Log::error("❌ ERRO ao confirmar ação: " . $e->getMessage());
-            Log::error("❌ Linha: " . $e->getLine());
-            Log::error("❌ Arquivo: " . $e->getFile());
-            
-            return response()->json([
-                'success' => false, 
-                'message' => 'Erro: ' . $e->getMessage()
-            ], 500);
+            return ['mensagem' => '❌ Falha de conexão com IA.', 'dados_estruturados' => null];
         }
     }
 
     /**
-     * Tenta importação automática baseada nos campos dos dados
+     * =========================================================================
+     * 2. CONFIRMAÇÃO DE AÇÃO (IMPORTAÇÃO E CADASTROS)
+     * =========================================================================
      */
-    private function tentarImportacaoAutomatica(array $dados, array $metadata): array
-    {
-        Log::info("🤖 Tentando importação automática...");
-        
-        $tipo = $this->detectarTipoPelosCampos($dados);
-        
-        Log::info("🤖 Tipo detectado automaticamente: {$tipo}");
-        
-        return match($tipo) {
-            'clientes'            => $this->importarClientes($dados),
-            'fatura_titulos'      => $this->gerarOrdemServico($dados, $metadata),
-            'fatura_funcionarios' => $this->gerarOrdemServicoDetalhada($dados, $metadata),
-            'funcionarios'        => $this->importarFuncionarios($dados),
-            'servicos'            => $this->importarServicos($dados),
-            default               => [
-                'message' => "⚠️ Não foi possível identificar o tipo de dados para importação. " .
-                            "Campos encontrados: " . implode(', ', array_keys($dados[0] ?? [])),
-                'detalhes' => ['tipo_detectado' => $tipo, 'campos' => array_keys($dados[0] ?? [])]
-            ]
-        };
+   public function confirmarAcao(Request $request)
+{
+    $inputDados = $request->input('dados', []);
+    $acao = $request->input('acao') ?? $request->input('tipo');
+    $metadata = $request->input('metadata', []);
+
+    // 2.1 PASSO CRÍTICO: Extrair a lista real de dentro do JSON complexo
+    $dadosParaProcessar = $this->extrairDadosParaProcessamento($inputDados);
+
+    if (empty($dadosParaProcessar)) {
+        Log::warning("⚠️ Tentativa de importação sem dados válidos.", [
+            'input_bruto' => $inputDados
+        ]);
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Nenhum registro encontrado para processar.'
+        ], 422);
     }
 
-    // ========================================
-    // IMPORTAR CLIENTES
-    // ========================================
+    // 2.2 Auto-detecção de ação se não vier especificada
+    if (empty($acao) || $acao === 'generico') {
+        $acao = $this->detectarAcaoPelosDados($dadosParaProcessar);
+    }
+    // Se o front mandou importar_clientes mas o payload é de OS, força gerar_os
+    if ($acao === 'importar_clientes' && $this->pareceOrdemServico($dadosParaProcessar)) {
+        $acao = 'gerar_os';
+    }
 
-    private function importarClientes(array $dados): array
+    Log::info("📥 Iniciando Ação: '{$acao}' | Qtd Registros: " . count($dadosParaProcessar), [
+        'metadata' => $metadata,
+    ]);
+
+    DB::beginTransaction();
+
+    try {
+        $resultado = match ($acao) {
+            // Clientes
+            'importar_clientes', 'clientes', 'cadastro_cliente'
+                => $this->processarImportacaoClientes($dadosParaProcessar),
+
+            // Ordens de serviço
+            'gerar_os', 'ordem_servico'
+                => $this->processarImportacaoOrdensServico($dadosParaProcessar),
+
+            default
+                => $this->processarImportacaoClientes($dadosParaProcessar), // fallback seguro
+        };
+
+        DB::commit();
+
+        // Se houve erros de linha na importação, NÃO considera sucesso total
+        $detalhes = $resultado['detalhes'] ?? null;
+        $success  = $this->avaliarSucessoImportacao($detalhes, $acao);
+
+        return response()->json([
+            'success'  => $success,
+            'message'  => $resultado['message'] ?? '',
+            'detalhes' => $detalhes,
+        ]);
+
+    } catch (\Exception $e) {
+        DB::rollBack();
+
+        Log::error("❌ Erro fatal ao confirmar ação: " . $e->getMessage(), [
+            'acao'     => $acao,
+            'metadata' => $metadata,
+            'trace'    => $e->getTraceAsString(),
+        ]);
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Erro: ' . $e->getMessage(),
+        ], 500);
+    }
+}
+
+    /**
+     * =========================================================================
+     * 3. LÓGICA DE IMPORTAÇÃO DE CLIENTES
+     * =========================================================================
+     */
+   private function processarImportacaoClientes(array $listaClientes): array
     {
-        Log::info("👥 Iniciando importação de clientes: " . count($dados) . " registros");
-        
-        $criados = 0;
-        $atualizados = 0;
-        $erros = [];
+        $stats = ['novos' => 0, 'atualizados' => 0, 'erros' => 0];
+        $errosDetalhados = [];
+        $colunasTabelaFlip = $this->obterColunasClientes();
 
-        foreach ($dados as $index => $d) {
+        // Pré-carrega clientes para reduzir queries (por CNPJ e Razão Social)
+        $listaClientes = array_values($listaClientes);
+        $cnpjsBusca = [];
+        $razoesBusca = [];
+        foreach ($listaClientes as $row) {
+            if (!is_array($row)) continue;
+            $cnpjRaw = $this->buscarValorFlexivel($row, 'cnpj', 'cpf', 'doc');
+            $cnpj = $cnpjRaw ? preg_replace('/\D/', '', (string) $cnpjRaw) : null;
+            if ($cnpj && strlen($cnpj) >= 11) {
+                $cnpjsBusca[] = $cnpj;
+            }
+            $razaoSocial = $this->buscarValorFlexivel($row, 'razao_social', 'nome', 'empresa', 'cliente');
+            if ($razaoSocial) {
+                $razoesBusca[] = mb_strtoupper($razaoSocial);
+            }
+        }
+
+        $clientesMapaCnpj = [];
+        $clientesMapaRazao = [];
+        if (!empty($cnpjsBusca) || !empty($razoesBusca)) {
+            $clientes = Cliente::withTrashed()
+                ->where(function ($q) use ($cnpjsBusca, $razoesBusca) {
+                    if (!empty($cnpjsBusca)) {
+                        $q->whereIn('cnpj', $cnpjsBusca);
+                    }
+                    if (!empty($razoesBusca)) {
+                        $q->orWhereIn(DB::raw('upper(razao_social)'), $razoesBusca);
+                    }
+                })
+                ->get();
+
+            foreach ($clientes as $cli) {
+                if ($cli->cnpj) {
+                    $clientesMapaCnpj[$cli->cnpj] = $cli;
+                }
+                $clientesMapaRazao[mb_strtoupper($cli->razao_social)] = $cli;
+            }
+        }
+
+        foreach ($listaClientes as $index => $row) {
+            if (!is_array($row)) continue;
+
             try {
-                if (!is_array($d)) {
-                    $erros[] = "Registro {$index}: não é array";
-                    continue;
-                }
+                $cnpjRaw = $this->buscarValorFlexivel($row, 'cnpj', 'cpf', 'doc');
+                $cnpj = preg_replace('/\D/', '', (string) $cnpjRaw);
 
-                $cnpjRaw = $this->getValorFlexivel($d, 'cnpj', 'CNPJ');
-                $cnpj = preg_replace('/\D/', '', (string) $this->converterParaString($cnpjRaw));
+                $razaoSocial = $this->buscarValorFlexivel($row, 'razao_social', 'nome', 'empresa', 'cliente');
                 
-                Log::info("👥 Processando registro {$index}: CNPJ={$cnpj}");
-                
+                if (empty($razaoSocial)) {
+                     throw new \Exception("Razão Social obrigatória.");
+                }
                 if (empty($cnpj)) {
-                    $erros[] = "Registro {$index}: CNPJ vazio";
-                    continue;
+                    throw new \Exception("CNPJ/CPF obrigatório para importar cliente.");
                 }
 
-                if (strlen($cnpj) !== 14) {
-                    $erros[] = "Registro {$index}: CNPJ inválido ({$cnpj})";
-                    continue;
-                }
-
-                $cliente = Cliente::where('cnpj', $cnpj)->first();
-                
-                $dadosCliente = [
-                    'cnpj'          => $cnpj,
-                    'razao_social'  => $this->converterParaString($this->getValorFlexivel($d, 'razao_social', 'razaosocial', 'RAZAO SOCIAL', 'razão social')) ?? 'Cliente ' . $cnpj,
-                    'nome_fantasia' => $this->converterParaString($this->getValorFlexivel($d, 'nome_fantasia', 'nomefantasia', 'NOME FANTASIA', 'nome fantasia')),
-                    'email'         => $this->converterParaString($this->getValorFlexivel($d, 'email', 'EMAIL', 'e-mail')),
-                    'telefone'      => $this->converterParaString($this->getValorFlexivel($d, 'telefone', 'TELEFONE', 'fone')),
-                    'celular'       => $this->converterParaString($this->getValorFlexivel($d, 'celular', 'CELULAR')),
-                    'cep'           => preg_replace('/\D/', '', (string) ($this->converterParaString($this->getValorFlexivel($d, 'cep', 'CEP')) ?? '')),
-                    'logradouro'    => $this->converterParaString($this->getValorFlexivel($d, 'logradouro', 'LOGRADOURO', 'endereco', 'endereço')),
-                    'numero'        => $this->converterParaString($this->getValorFlexivel($d, 'numero', 'NUMERO', 'número')),
-                    'bairro'        => $this->converterParaString($this->getValorFlexivel($d, 'bairro', 'BAIRRO')),
-                    'cidade'        => $this->converterParaString($this->getValorFlexivel($d, 'cidade', 'CIDADE')),
-                    'uf'            => strtoupper((string) ($this->converterParaString($this->getValorFlexivel($d, 'uf', 'UF', 'estado')) ?? '')),
-                    'status'        => 'ativo',
+                $clienteData = [
+                    'cnpj'          => (strlen($cnpj) >= 11) ? $cnpj : null,
+                    'razao_social'  => mb_strtoupper($razaoSocial),
+                    'nome_fantasia' => mb_strtoupper($this->buscarValorFlexivel($row, 'nome_fantasia', 'fantasia') ?? ''),
+                    'email'         => strtolower($this->buscarValorFlexivel($row, 'email', 'e-mail') ?? ''),
+                    'telefone'      => $this->buscarValorFlexivel($row, 'telefone', 'tel', 'fixo'),
+                    'celular'       => $this->buscarValorFlexivel($row, 'celular', 'cel', 'whatsapp'),
+                    'cep'           => preg_replace('/\D/', '', $this->buscarValorFlexivel($row, 'cep') ?? ''),
+                    'logradouro'    => $this->buscarValorFlexivel($row, 'logradouro', 'endereco', 'rua'),
+                    'numero'        => $this->buscarValorFlexivel($row, 'numero', 'num'),
+                    'bairro'        => $this->buscarValorFlexivel($row, 'bairro'),
+                    'cidade'        => $this->buscarValorFlexivel($row, 'cidade', 'municipio'),
+                    'uf'            => strtoupper($this->buscarValorFlexivel($row, 'uf', 'estado') ?? ''),
+                    'status'        => 'ativo'
                 ];
 
-                // Remover valores vazios
-                $dadosCliente = array_filter($dadosCliente, fn($v) => $v !== null && $v !== '');
-                $dadosCliente['cnpj'] = $cnpj;
-                $dadosCliente['status'] = 'ativo';
-                
-                if (!isset($dadosCliente['razao_social']) || empty($dadosCliente['razao_social'])) {
-                    $dadosCliente['razao_social'] = 'Cliente ' . $cnpj;
+                // Ajuste de coluna: se a base não tem "logradouro", usa "endereco"
+                if (!isset($colunasTabelaFlip['logradouro']) && isset($colunasTabelaFlip['endereco'])) {
+                    $clienteData['endereco'] = $clienteData['logradouro'] ?? null;
+                    unset($clienteData['logradouro']);
                 }
 
-                Log::info("👥 Dados do cliente: " . json_encode($dadosCliente));
+                // Remove campos que não existem na tabela para evitar erro de coluna inexistente
+                $clienteData = array_intersect_key($clienteData, $colunasTabelaFlip);
+
+                // Upsert Logic
+                $cliente = null;
+                if (!empty($clienteData['cnpj'])) {
+                    $cliente = $clientesMapaCnpj[$clienteData['cnpj']] ?? null;
+                }
+                
+                // Fallback para nome se não tiver CNPJ (cuidado com homônimos, mas útil para importação suja)
+                if (!$cliente && empty($clienteData['cnpj'])) {
+                    $cliente = $clientesMapaRazao[$clienteData['razao_social']] ?? null;
+                }
 
                 if ($cliente) {
-                    $cliente->update($dadosCliente);
-                    $atualizados++;
-                    Log::info("👥 Cliente atualizado: ID={$cliente->id}");
+                    if ($cliente->trashed()) {
+                        $cliente->restore();
+                    }
+                    $cliente->update($clienteData);
+                    $stats['atualizados']++;
                 } else {
-                    $novoCliente = Cliente::create($dadosCliente);
-                    $criados++;
-                    Log::info("👥 Cliente criado: ID={$novoCliente->id}");
+                    Cliente::create($clienteData);
+                    $stats['novos']++;
                 }
+
             } catch (\Exception $e) {
-                Log::error("👥 Erro no registro {$index}: " . $e->getMessage());
-                $erros[] = "Registro {$index}: " . $e->getMessage();
+                $stats['erros']++;
+                $errosDetalhados[] = "Linha " . ($index + 1) . ": " . $e->getMessage();
             }
         }
 
-        $mensagem = "✅ Clientes importados: {$criados} novos, {$atualizados} atualizados.";
-        if (count($erros) > 0) {
-            $mensagem .= " (" . count($erros) . " erro(s))";
-            Log::warning("👥 Erros: " . json_encode($erros));
-        }
-
-        Log::info("👥 Importação concluída: {$criados} criados, {$atualizados} atualizados");
+        $msg = "✅ {$stats['novos']} novos, {$stats['atualizados']} atualizados.";
+        if ($stats['erros'] > 0) $msg .= " ({$stats['erros']} erros).";
 
         return [
-            'message' => $mensagem,
-            'detalhes' => compact('criados', 'atualizados', 'erros')
+            'message' => $msg,
+            'detalhes' => [
+                'resumo' => $stats,
+                'erros_lista' => array_slice($errosDetalhados, 0, 5)
+            ]
         ];
     }
 
-    private function converterParaString($valor): ?string
+    /**
+     * =========================================================================
+     * 3.2 IMPORTAÇÃO DE ORDENS DE SERVIÇO (GERADAS PELO RELATÓRIO DE FATURA)
+     * =========================================================================
+     */
+    private function processarImportacaoOrdensServico(array $listaOs): array
     {
-        if ($valor === null) {
-            return null;
-        }
-        
-        if (is_array($valor)) {
-            if (empty($valor)) {
-                return null;
-            }
-            return (string) ($valor[0] ?? implode(', ', array_filter($valor)));
-        }
-        
-        if (is_object($valor)) {
-            if (method_exists($valor, '__toString')) {
-                return (string) $valor;
-            }
-            return json_encode($valor);
-        }
-        
-        $str = trim((string) $valor);
-        return $str === '' ? null : $str;
-    }
+        $stats = ['criados' => 0, 'erros' => 0];
+        $errosDetalhados = [];
 
-    private function importarFuncionarios(array $dados): array
-    {
-        Log::info("👤 Iniciando importação de funcionários");
-        
-        $total = 0;
-        $erros = [];
+        foreach ($listaOs as $index => $row) {
+            if (!is_array($row)) continue;
 
-        foreach ($dados as $d) {
+            DB::beginTransaction();
+
             try {
-                if (!is_array($d)) continue;
+                $empresa = $this->buscarValorFlexivel($row, 'empresa', 'cliente', 'razao_social', 'nome');
+                $cnpjRaw = $this->buscarValorFlexivel($row, 'cnpj', 'doc');
+                $cnpj = $cnpjRaw ? preg_replace('/\D/', '', $cnpjRaw) : null;
 
-                $cpfRaw = $this->getValorFlexivel($d, 'cpf');
-                $cpf = preg_replace('/\D/', '', (string) $this->converterParaString($cpfRaw));
-                
-                if (empty($cpf)) {
-                    continue;
+                if (empty($empresa) && empty($cnpj)) {
+                    throw new \Exception("Empresa/cliente não informado.");
                 }
 
-                Funcionario::updateOrCreate(
-                    ['cpf' => $cpf],
-                    [
-                        'nome'      => $this->converterParaString($this->getValorFlexivel($d, 'nome', 'Nome')),
-                        'matricula' => $this->converterParaString($this->getValorFlexivel($d, 'matricula', 'Matricula')),
-                        'cargo'     => $this->converterParaString($this->getValorFlexivel($d, 'cargo', 'Cargo')),
-                        'setor'     => $this->converterParaString($this->getValorFlexivel($d, 'setor', 'Setor')),
-                        'situacao'  => $this->converterParaString($this->getValorFlexivel($d, 'situacao', 'Situação')) ?? 'Ativo',
-                    ]
-                );
-                $total++;
+                $cliente = $this->buscarOuCriarClienteParaOs($empresa, $cnpj);
+                if (!$cliente || !$cliente->id) {
+                    throw new \Exception("Cliente não encontrado ou não pôde ser criado.");
+                }
+
+                $titulos = $row['titulos'] ?? ($row['raw']['titulos'] ?? []);
+                if (!is_array($titulos) || empty($titulos)) {
+                    throw new \Exception("Nenhum título encontrado para gerar OS.");
+                }
+
+                $dataCobrancaStr = $titulos[0]['data_cobranca'] ?? ($row['data_cobranca'] ?? null);
+                $dataCobranca = $this->parseDataBr($dataCobrancaStr);
+                $competencia = $dataCobranca ? $dataCobranca->format('m/Y') : now()->format('m/Y');
+
+                $os = OrdemServico::create([
+                    'cliente_id'  => $cliente->id,
+                    'codigo_os'   => 'OS-' . date('Ymd-His') . '-' . ($index + 1) . '-' . uniqid(),
+                    'competencia' => $competencia,
+                    'data_emissao'=> $dataCobranca ? $dataCobranca->toDateString() : now()->toDateString(),
+                    'status'      => 'pendente',
+                    'valor_total' => 0,
+                    'observacoes' => 'Gerado via chat/N8N',
+                ]);
+                if (!$os || !$os->id) {
+                    throw new \Exception("Falha ao criar ordem de serviço (sem ID).");
+                }
+
+                $valorTotal = 0;
+                $rateios = [];
+
+                foreach ($titulos as $titulo) {
+                    if (!is_array($titulo)) continue;
+
+                    $descricao = $this->buscarValorFlexivel($titulo, 'produto_servico', 'descricao', 'servico') ?? 'SERVICO';
+                    if (!$descricao) $descricao = 'SERVICO';
+                    $quantidade = (int) ($this->buscarValorFlexivel($titulo, 'vidas_ativas', 'quantidade') ?? 0);
+                    if ($quantidade <= 0) $quantidade = 1;
+
+                    $valorUnit = $this->parseMoneyString(
+                        $this->buscarValorFlexivel($titulo, 'valor_por_vida', 'valor_por_vida_r$', 'valor_por_vida_R$', 'valor', 'valor_unitario') ?? 0
+                    );
+                    $valorUnit = $valorUnit > 0 ? $valorUnit : 0.0;
+
+                    $valorTotalItem = $this->parseMoneyString(
+                        $this->buscarValorFlexivel($titulo, 'total', 'total_r$', 'total_R$', 'valor_total') ?? null
+                    );
+                    if ($valorTotalItem <= 0) {
+                        $valorTotalItem = $quantidade * $valorUnit;
+                    }
+                    if ($valorTotalItem < 0) $valorTotalItem = 0.0;
+
+                    $valorTotal += $valorTotalItem;
+
+                    OrdemServicoItem::create([
+                        'ordem_servico_id'    => $os->id,
+                        'descricao'           => $descricao,
+                        'quantidade'          => $quantidade,
+                        'valor_unitario'      => $valorUnit,
+                        'valor_total'         => $valorTotalItem,
+                        'unidade_soc'         => $titulo['unidade'] ?? null,
+                        'funcionario_soc'     => $titulo['gerente_da_conta'] ?? null,
+                        'centro_custo_cliente'=> $titulo['centro_custo'] ?? null,
+                        'centro_custo'        => $titulo['centro_custo'] ?? ($titulo['produto_servico'] ?? null),
+                    ]);
+
+                    // Rateio por produto/serviço
+                    $cc = $titulo['centro_custo'] ?? ($titulo['produto_servico'] ?? 'SERVICO');
+                    if (!isset($rateios[$cc])) {
+                        $rateios[$cc] = 0;
+                    }
+                    $rateios[$cc] += $valorTotalItem;
+                }
+
+                // Itens/exames detalhados (quando vierem em outro array)
+                $exames = $row['exames'] ?? ($row['raw']['exames'] ?? []);
+                if (is_array($exames)) {
+                    foreach ($exames as $exame) {
+                        if (!is_array($exame)) continue;
+                        $descricao = $this->buscarValorFlexivel($exame, 'nome', 'exame', 'descricao') ?? 'EXAME';
+                        if (!$descricao) $descricao = 'EXAME';
+                        $quantidade = (int) ($this->buscarValorFlexivel($exame, 'quantidade', 'qtd') ?? 0);
+                        if ($quantidade <= 0) $quantidade = 1;
+                        $valorUnit = $this->parseMoneyString(
+                            $this->buscarValorFlexivel($exame, 'valor_cobrar', 'valor_cobrar_r$', 'valor', 'valor_unitario') ?? 0
+                        );
+                        $valorUnit = $valorUnit > 0 ? $valorUnit : 0.0;
+                        $valorTotalItem = $quantidade * $valorUnit;
+                        if ($valorTotalItem < 0) $valorTotalItem = 0.0;
+                        $valorTotal += $valorTotalItem;
+
+                        OrdemServicoItem::create([
+                            'ordem_servico_id' => $os->id,
+                            'descricao'        => $descricao,
+                            'quantidade'       => $quantidade,
+                            'valor_unitario'   => $valorUnit,
+                            'valor_total'      => $valorTotalItem,
+                            'centro_custo'     => 'EXAMES',
+                        ]);
+
+                        if (!isset($rateios['EXAMES'])) {
+                            $rateios['EXAMES'] = 0;
+                        }
+                        $rateios['EXAMES'] += $valorTotalItem;
+                    }
+                }
+
+                $os->valor_total = $valorTotal;
+                $os->save();
+
+                // Salva rateios
+                if ($valorTotal > 0 && !empty($rateios)) {
+                    foreach ($rateios as $cc => $val) {
+                        OrdemServicoRateio::create([
+                            'ordem_servico_id' => $os->id,
+                            'centro_custo'     => $cc,
+                            'valor'            => $val,
+                            'percentual'       => $valorTotal > 0 ? ($val / $valorTotal) * 100 : 0,
+                        ]);
+                    }
+                }
+
+                DB::commit();
+                $stats['criados']++;
+
             } catch (\Exception $e) {
-                $erros[] = $e->getMessage();
-            }
-        }
-
-        return [
-            'message' => "✅ {$total} funcionário(s) importado(s).",
-            'detalhes' => ['total' => $total, 'erros' => $erros]
-        ];
-    }
-
-    private function importarServicos(array $dados): array
-    {
-        Log::info("🔧 Iniciando importação de serviços");
-        
-        $total = 0;
-
-        foreach ($dados as $d) {
-            if (!is_array($d)) continue;
-
-            $codigo = $this->converterParaString($this->getValorFlexivel($d, 'codigo', 'tuss', 'TUSS'));
-            
-            if (empty($codigo)) {
-                continue;
-            }
-
-            Servico::updateOrCreate(
-                ['codigo' => $codigo],
-                [
-                    'descricao' => $this->converterParaString($this->getValorFlexivel($d, 'descricao', 'nome', 'Descrição')),
-                    'valor'     => $this->parseValor($this->getValorFlexivel($d, 'valor', 'valor_unitario') ?? 0),
-                    'unidade'   => $this->converterParaString($this->getValorFlexivel($d, 'unidade')),
-                ]
-            );
-            $total++;
-        }
-
-        return [
-            'message' => "✅ {$total} serviço(s) importado(s)."
-        ];
-    }
-
-    // ========================================
-    // GERAÇÃO DE ORDEM DE SERVIÇO
-    // ========================================
-
-    private function gerarOrdemServico(array $dados, array $metadata): array
-    {
-        Log::info("📄 Gerando Ordem de Serviço (Títulos)");
-        Log::info("📄 Dados recebidos: " . count($dados) . " itens");
-        
-        $clienteId = $this->identificarCliente($metadata);
-        
-        $valorTotal = 0;
-        $rateio = [];
-        $itensValidos = [];
-
-        foreach ($dados as $item) {
-            if (!is_array($item)) continue;
-
-            // Tentar múltiplas variações do campo produto/serviço
-            $descricao = $this->converterParaString(
-                $this->getValorFlexivel($item, 
-                    'produto_servico', 'Produto/Serviço', 'produtoservico',
-                    'produto servico', 'descricao', 'servico', 'produto'
-                )
-            ) ?? '';
-            
-            Log::info("📄 Item: {$descricao}");
-            
-            // Ignorar linha de TOTAL
-            $descricaoUpper = strtoupper(trim($descricao));
-            if ($descricaoUpper === 'TOTAL R$' || str_starts_with($descricaoUpper, 'TOTAL')) {
-                Log::info("📄 Ignorando linha de TOTAL");
-                continue;
-            }
-
-            // Tentar múltiplas variações do campo valor
-            $valorItem = $this->parseValor(
-                $this->getValorFlexivel($item, 
-                    'total_reais', 'Total R$', 'totalreais', 'total',
-                    'valor', 'valor_total', 'valortotal'
-                ) ?? 0
-            );
-            
-            Log::info("📄 Valor: {$valorItem}");
-            
-            if (empty($descricao) && $valorItem == 0) {
-                continue;
-            }
-
-            $valorTotal += $valorItem;
-            $itensValidos[] = $item;
-        }
-
-        Log::info("📄 Itens válidos: " . count($itensValidos) . " | Total: {$valorTotal}");
-
-        if (empty($itensValidos)) {
-            return [
-                'message' => '⚠️ Nenhum item válido encontrado para gerar OS.',
-                'detalhes' => ['motivo' => 'Todos os itens foram filtrados']
-            ];
-        }
-
-        $codigoOs = 'OS-CHAT-' . date('ymd') . '-' . str_pad(random_int(1, 9999), 4, '0', STR_PAD_LEFT);
-        $competencia = $this->converterParaString($metadata['periodo'] ?? null) ?? now()->format('m/Y');
-
-        Log::info("📄 Criando OS: {$codigoOs}");
-
-        $os = OrdemServico::create([
-            'cliente_id'    => $clienteId,
-            'codigo_os'     => $codigoOs,
-            'competencia'   => $competencia,
-            'data_emissao'  => now(),
-            'valor_total'   => $valorTotal,
-            'status'        => 'pendente',
-            'observacoes'   => "Importado via Chat IA - " . count($itensValidos) . " título(s)",
-        ]);
-
-        Log::info("📄 OS criada: ID={$os->id}");
-
-        foreach ($itensValidos as $item) {
-            $descricao = $this->converterParaString(
-                $this->getValorFlexivel($item, 
-                    'produto_servico', 'Produto/Serviço', 'produtoservico',
-                    'produto servico', 'descricao', 'servico', 'produto'
-                )
-            ) ?? 'Serviço';
-
-            $quantidade = (int)($this->getValorFlexivel($item, 
-                'vidas_ativas', 'vidasativas', 'vidas', 'quantidade', 'qtd'
-            ) ?? 1) ?: 1;
-            
-            $valorUnitario = $this->parseValor(
-                $this->getValorFlexivel($item, 
-                    'valor_por_vida_reais', 'valorporvida', 'valor_unitario', 
-                    'valorunitario', 'Valor por Vida R$'
-                ) ?? 0
-            );
-            
-            $valorTotalItem = $this->parseValor(
-                $this->getValorFlexivel($item, 
-                    'total_reais', 'Total R$', 'totalreais', 'total',
-                    'valor', 'valor_total', 'valortotal'
-                ) ?? 0
-            );
-            
-            if ($valorUnitario == 0 && $quantidade > 0 && $valorTotalItem > 0) {
-                $valorUnitario = $valorTotalItem / $quantidade;
-            }
-
-            $centroCusto = $this->converterParaString(
-                $this->getValorFlexivel($item, 'centro_custo', 'setor', 'unidade')
-            ) ?? 'Geral';
-
-            OrdemServicoItem::create([
-                'ordem_servico_id' => $os->id,
-                'descricao'        => $descricao,
-                'quantidade'       => $quantidade,
-                'valor_unitario'   => $valorUnitario,
-                'valor_total'      => $valorTotalItem,
-                'centro_custo'     => $centroCusto,
-                'data_realizacao'  => now()->format('Y-m-d'),
-            ]);
-
-            if (!isset($rateio[$centroCusto])) {
-                $rateio[$centroCusto] = 0;
-            }
-            $rateio[$centroCusto] += $valorTotalItem;
-        }
-
-        foreach ($rateio as $cc => $valor) {
-            if ($valor > 0) {
-                OrdemServicoRateio::create([
-                    'ordem_servico_id' => $os->id,
-                    'centro_custo'     => $cc,
-                    'valor'            => $valor,
-                    'percentual'       => $valorTotal > 0 ? round(($valor / $valorTotal) * 100, 2) : 0,
+                DB::rollBack();
+                $stats['erros']++;
+                $msgErro = $this->formatarErroBd($e);
+                $errosDetalhados[] = "Linha " . ($index + 1) . ": " . $msgErro;
+                Log::error('Erro ao importar OS', [
+                    'linha' => $index + 1,
+                    'erro' => $msgErro,
+                    'trace' => $e->getTraceAsString(),
+                    'row' => $row,
+                    'debug' => $this->extrairDebugQuery($e),
                 ]);
             }
         }
 
-        Log::info("📄 OS finalizada: {$os->codigo_os} | Total: R$ {$valorTotal}");
+        $msg = "✅ {$stats['criados']} ordens geradas.";
+        if ($stats['erros'] > 0) $msg .= " ({$stats['erros']} erros).";
 
         return [
-            'message' => "✅ Ordem de Serviço #{$os->codigo_os} criada! Total: R$ " . number_format($valorTotal, 2, ',', '.'),
+            'message' => $msg,
             'detalhes' => [
-                'os_id'       => $os->id,
-                'codigo_os'   => $os->codigo_os,
-                'valor_total' => $valorTotal,
-                'itens'       => $os->itens()->count(),
-                'rateio'      => $rateio
+                'resumo' => $stats,
+                'erros_lista' => array_slice($errosDetalhados, 0, 5)
             ]
         ];
     }
 
-    private function gerarOrdemServicoDetalhada(array $dados, array $metadata): array
+    private function formatarErroBd(\Exception $e): string
     {
-        Log::info("📋 Gerando OS Detalhada (Funcionários/Exames)");
-        
-        $clienteId = $this->identificarCliente($metadata);
-
-        $itensPorExame = [];
-        $valorTotal = 0;
-        $rateio = [];
-
-        foreach ($dados as $item) {
-            if (!is_array($item)) continue;
-
-            $exame = $this->converterParaString(
-                $this->getValorFlexivel($item, 'exame', 'Exame', 'descricao', 'servico')
-            ) ?? 'Serviço';
-            
-            $valor = $this->parseValor(
-                $this->getValorFlexivel($item, 
-                    'valor', 'Vl.Cobrar R$', 'vlcobrar', 'vlcobrarrs',
-                    'valor_cobrar', 'total', 'vl cobrar'
-                ) ?? 0
-            );
-            
-            $setor = $this->converterParaString(
-                $this->getValorFlexivel($item, 'setor', 'Setor', 'centro_custo')
-            ) ?? 'Geral';
-            
-            $funcionario = $this->converterParaString(
-                $this->getValorFlexivel($item, 'nome', 'Nome', 'funcionario')
-            );
-            
-            $tipoExame = $this->converterParaString(
-                $this->getValorFlexivel($item, 'tipo', 'Tipo')
-            ) ?? '';
-
-            $chaveExame = $exame . '|' . $tipoExame;
-            if (!isset($itensPorExame[$chaveExame])) {
-                $itensPorExame[$chaveExame] = [
-                    'descricao'    => $exame . ($tipoExame ? " ({$tipoExame})" : ''),
-                    'quantidade'   => 0,
-                    'valor_total'  => 0,
-                    'funcionarios' => []
-                ];
-            }
-            
-            $itensPorExame[$chaveExame]['quantidade']++;
-            $itensPorExame[$chaveExame]['valor_total'] += $valor;
-            
-            if ($funcionario) {
-                $itensPorExame[$chaveExame]['funcionarios'][] = $funcionario;
+        if ($e instanceof QueryException) {
+            $detalhe = $e->errorInfo[2] ?? $e->getMessage();
+            // Extrai coluna se vier na mensagem
+            if (preg_match("/Column '([^']+)'/", $detalhe, $m)) {
+                return "Coluna '{$m[1]}' não pode ser nula ou é inválida. ({$detalhe})";
             }
 
-            $valorTotal += $valor;
+            // Fallback completo para facilitar debug
+            $info = implode(' | ', array_filter($e->errorInfo ?? []));
+            $sql  = method_exists($e, 'getSql') ? $e->getSql() : '';
+            $bind = method_exists($e, 'getBindings') ? json_encode($e->getBindings()) : '';
 
-            if (!isset($rateio[$setor])) {
-                $rateio[$setor] = 0;
-            }
-            $rateio[$setor] += $valor;
+            return trim($detalhe . " | info: {$info} | sql: {$sql} | bind: {$bind}");
         }
+        return $e->getMessage();
+    }
 
-        $codigoOs = 'OS-DET-' . date('ymd') . '-' . str_pad(random_int(1, 9999), 4, '0', STR_PAD_LEFT);
-        $competencia = $this->converterParaString($metadata['periodo'] ?? null) ?? now()->format('m/Y');
-
-        $os = OrdemServico::create([
-            'cliente_id'    => $clienteId,
-            'codigo_os'     => $codigoOs,
-            'competencia'   => $competencia,
-            'data_emissao'  => now(),
-            'valor_total'   => $valorTotal,
-            'status'        => 'pendente',
-            'observacoes'   => "Importado via Chat IA (Detalhado) - " . count($dados) . " registros",
-        ]);
-
-        foreach ($itensPorExame as $item) {
-            if ($item['valor_total'] > 0 || $item['quantidade'] > 0) {
-                $valorUnitario = $item['quantidade'] > 0 
-                    ? $item['valor_total'] / $item['quantidade'] 
-                    : 0;
-                
-                OrdemServicoItem::create([
-                    'ordem_servico_id' => $os->id,
-                    'descricao'        => $item['descricao'],
-                    'quantidade'       => $item['quantidade'],
-                    'valor_unitario'   => $valorUnitario,
-                    'valor_total'      => $item['valor_total'],
-                    'centro_custo'     => 'Consolidado',
-                    'data_realizacao'  => now()->format('Y-m-d'),
-                ]);
-            }
-        }
-
-        foreach ($rateio as $cc => $valor) {
-            if ($valor > 0) {
-                OrdemServicoRateio::create([
-                    'ordem_servico_id' => $os->id,
-                    'centro_custo'     => $cc,
-                    'valor'            => $valor,
-                    'percentual'       => $valorTotal > 0 ? round(($valor / $valorTotal) * 100, 2) : 0,
-                ]);
-            }
-        }
-
-        $totalExames = array_sum(array_column($itensPorExame, 'quantidade'));
-
-        Log::info("📋 OS Detalhada criada: {$os->codigo_os}");
+    /**
+     * Extrai detalhes adicionais da QueryException para debug (SQL e bindings).
+     */
+    private function extrairDebugQuery(\Exception $e): ?array
+    {
+        if (!($e instanceof QueryException)) return null;
 
         return [
-            'message' => "✅ OS #{$os->codigo_os} criada com {$totalExames} exame(s). Total: R$ " . number_format($valorTotal, 2, ',', '.'),
-            'detalhes' => [
-                'os_id'        => $os->id,
-                'codigo_os'    => $os->codigo_os,
-                'valor_total'  => $valorTotal,
-                'total_exames' => $totalExames,
-                'tipos_exame'  => count($itensPorExame),
-                'rateio'       => $rateio
-            ]
+            'sqlstate'  => $e->errorInfo[0] ?? null,
+            'code'      => $e->errorInfo[1] ?? null,
+            'message'   => $e->errorInfo[2] ?? $e->getMessage(),
+            'sql'       => method_exists($e, 'getSql') ? $e->getSql() : null,
+            'bindings'  => method_exists($e, 'getBindings') ? $e->getBindings() : null,
         ];
     }
 
-    // ========================================
-    // UTILITÁRIOS
-    // ========================================
+    /**
+     * =========================================================================
+     * 4. HELPERS E UTILITÁRIOS (O "CÉREBRO" DA EXTRAÇÃO)
+     * =========================================================================
+     */
 
-    private function identificarCliente(array $metadata): ?int
+    /**
+     * Extrai a lista de registros de dentro da estrutura complexa do N8N
+     */
+    private function extrairDadosParaProcessamento($dados)
     {
-        $clienteId = $metadata['cliente_id'] ?? null;
-        
-        if ($clienteId) {
-            return (int) $clienteId;
+        // Estruturas do N8N no formato [{ output: [...] }]
+        if (is_array($dados)) {
+            if (isset($dados['output']) && is_array($dados['output'])) {
+                // Se output for objeto com chave de clientes/empresas, extrai a lista interna
+                if ($this->contemListaClientes($dados['output'])) {
+                    return $this->pegarListaClientesDeContainer($dados['output']);
+                }
+                if ($this->pareceOrdemServico($dados['output'])) {
+                    return [$dados['output']];
+                }
+                return $dados['output'];
+            }
+
+            if (array_is_list($dados) && !empty($dados) && isset($dados[0]['output']) && is_array($dados[0]['output'])) {
+                if ($this->contemListaClientes($dados[0]['output'])) {
+                    return $this->pegarListaClientesDeContainer($dados[0]['output']);
+                }
+                if ($this->pareceOrdemServico($dados[0]['output'])) {
+                    return [$dados[0]['output']];
+                }
+                return $dados[0]['output'];
+            }
         }
 
-        $empresaNome = $this->converterParaString($metadata['empresa_nome'] ?? null);
-        
-        if ($empresaNome) {
-            $cliente = Cliente::where('razao_social', 'like', "%{$empresaNome}%")
-                ->orWhere('nome_fantasia', 'like', "%{$empresaNome}%")
-                ->first();
-            
-            return $cliente?->id;
+        // Se já for lista limpa
+        if (is_array($dados) && array_is_list($dados) && !empty($dados) && isset($dados[0]) && is_array($dados[0])) {
+            return $dados;
         }
 
-        return null;
-    }
+        // Chaves comuns do N8N ou do seu JSON
+        $chaves = ['dados_mapeados', 'empresas', 'clientes', 'registros', 'data', 'output'];
 
-    private function getValorFlexivel(array $dados, string ...$chaves): mixed
-    {
         foreach ($chaves as $chave) {
-            if (isset($dados[$chave])) {
+            if (isset($dados[$chave]) && is_array($dados[$chave])) {
                 return $dados[$chave];
             }
         }
-        
+
+        // Se for um único objeto de OS, envelopa em array
+        if (is_array($dados) && $this->pareceOrdemServico($dados)) {
+            return [$dados];
+        }
+        return [];
+    }
+
+    /**
+     * Busca um valor dentro de um array usando múltiplas possibilidades de chaves
+     * Ex: buscarValorFlexivel($row, 'razao_social', 'nome', 'empresa')
+     */
+    private function buscarValorFlexivel(array $dados, string ...$chavesPossiveis)
+    {
+        // 1. Tenta correspondência exata
+        foreach ($chavesPossiveis as $chave) {
+            if (isset($dados[$chave])) return $dados[$chave];
+        }
+
+        // 2. Tenta correspondência normalizada (sem acentos, minúsculo)
+        // Cria um mapa normalizado da linha atual apenas se necessário
         $dadosNormalizados = [];
-        foreach ($dados as $key => $value) {
-            $keyNormalizada = $this->normalizarNomeColuna((string) $key);
-            $dadosNormalizados[$keyNormalizada] = $value;
+        foreach ($dados as $k => $v) {
+            $keyNorm = strtolower(preg_replace('/[^a-zA-Z0-9]/', '', iconv('UTF-8', 'ASCII//TRANSLIT', $k)));
+            $dadosNormalizados[$keyNorm] = $v;
         }
-        
-        foreach ($chaves as $chave) {
-            $chaveNormalizada = $this->normalizarNomeColuna($chave);
-            if (isset($dadosNormalizados[$chaveNormalizada])) {
-                return $dadosNormalizados[$chaveNormalizada];
-            }
+
+        foreach ($chavesPossiveis as $chave) {
+            $chaveNorm = strtolower(preg_replace('/[^a-zA-Z0-9]/', '', iconv('UTF-8', 'ASCII//TRANSLIT', $chave)));
+            if (isset($dadosNormalizados[$chaveNorm])) return $dadosNormalizados[$chaveNorm];
         }
-        
+
         return null;
     }
 
-    private function parseValor($valor): float
+    private function buscarOuCriarClienteParaOs(?string $razaoSocial, ?string $cnpj): Cliente
     {
-        if (is_numeric($valor)) {
-            return (float) $valor;
+        $cnpj = $cnpj ? preg_replace('/\D/', '', $cnpj) : null;
+        $razao = $razaoSocial ? mb_strtoupper(trim($razaoSocial)) : null;
+
+        $cliente = null;
+        $colunasTabelaFlip = $this->obterColunasClientes();
+        if ($cnpj) {
+            $cliente = Cliente::withTrashed()->where('cnpj', $cnpj)->first();
         }
-        
-        if (is_array($valor)) {
-            $valor = $valor[0] ?? '0';
+
+        if (!$cliente && $razao) {
+            $cliente = Cliente::withTrashed()
+                ->whereRaw('upper(razao_social) = ?', [$razao])
+                ->first();
         }
-        
-        if (!is_string($valor)) {
-            return 0;
+
+        if ($cliente) {
+            if ($cliente->trashed()) {
+                $cliente->restore();
+            }
+            return $cliente;
         }
+
+        // Se não há CNPJ, gera um placeholder para permitir a criação e posterior ajuste pelo usuário
+        if (!$cnpj) {
+            $cnpj = $this->gerarCnpjPlaceholder();
+        }
+
+        if (empty($razao)) {
+            $razao = 'CLIENTE IMPORTADO';
+        }
+
+        return Cliente::create([
+            'cnpj'         => $cnpj,
+            'razao_social' => $razao,
+            'status'       => 'ativo',
+            'observacoes'  => 'Criado automaticamente via importação (CNPJ placeholder, ajuste posteriormente).',
+        ]);
+    }
+
+    /**
+     * Cache das colunas da tabela de clientes para evitar chamadas repetidas ao schema.
+     */
+    private function obterColunasClientes(): array
+    {
+        if (empty($this->cacheColunasClientes)) {
+            $colunas = Schema::getColumnListing('clientes');
+            $this->cacheColunasClientes = array_flip($colunas);
+        }
+        return $this->cacheColunasClientes;
+    }
+
+    private function parseMoneyString($valor): float
+    {
+        if (is_null($valor) || $valor === '') return 0.0;
+        if (is_numeric($valor)) return (float) $valor;
+
+        $str = preg_replace('/[^0-9,.-]/', '', (string) $valor);
+        if ($str === '') return 0.0;
+
+        // Se houver vírgula na parte decimal (padrão BR)
+        if (str_contains($str, ',') && strrpos($str, ',') > strrpos($str, '.')) {
+            $str = str_replace('.', '', $str);
+            $str = str_replace(',', '.', $str);
+        }
+
+        return is_numeric($str) ? (float) $str : 0.0;
+    }
+
+    private function parseDataBr(?string $data): ?Carbon
+    {
+        if (empty($data)) return null;
+        try {
+            return Carbon::createFromFormat('d/m/Y', str_replace(' ', '', $data));
+        } catch (\Exception $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Gera um CNPJ placeholder (14 dígitos) para permitir criação de cliente quando a planilha não traz documento.
+     */
+    private function gerarCnpjPlaceholder(): string
+    {
+        do {
+            $fake = (string) random_int(10000000000000, 99999999999999); // 14 dígitos
+        } while (Cliente::withTrashed()->where('cnpj', $fake)->exists());
+
+        return $fake;
+    }
+
+private function detectarAcaoPelosDados(array $dados): string
+    {
+        if (empty($dados)) return 'generico';
         
-        // Remover texto como "(Mínimo)"
-        $valor = preg_replace('/\s*\([^)]*\)/', '', $valor);
-        
-        // Tratar formato brasileiro: 1.234,56
-        $valor = str_replace('.', '', $valor);
-        $valor = str_replace(',', '.', $valor);
-        $valor = preg_replace('/[^\d.]/', '', $valor);
-        
-        return (float) $valor;
+        // Pega as chaves da primeira linha para análise
+        $primeiraLinha = $dados[0] ?? [];
+        if (!is_array($primeiraLinha)) return 'generico';
+
+        $keys = strtolower(implode(',', array_keys($primeiraLinha)));
+
+        // Regras de detecção
+        if (str_contains($keys, 'titulos') || (str_contains($keys, 'servico') && str_contains($keys, 'total'))) return 'gerar_os';
+        if (str_contains($keys, 'cnpj') && !str_contains($keys, 'servico')) return 'importar_clientes';
+        if (str_contains($keys, 'servico') || str_contains($keys, 'valor')) return 'gerar_os';
+
+        return 'importar_clientes'; // Default mais seguro para seu caso de uso
+    }
+
+    /**
+     * Define sucesso da importação: considera sucesso se houve ao menos um novo/atualizado.
+     * Se nenhum registro foi salvo e só houveram erros, sinaliza failure para o front.
+     */
+    private function avaliarSucessoImportacao(?array $detalhes, string $acao): bool
+    {
+        if (!is_array($detalhes) || !isset($detalhes['resumo'])) {
+            return false;
+        }
+
+        $stats = $detalhes['resumo'];
+        if (in_array($acao, ['gerar_os', 'ordem_servico'])) {
+            return (int)($stats['criados'] ?? 0) > 0;
+        }
+
+        $importados = (int)($stats['novos'] ?? 0) + (int)($stats['atualizados'] ?? 0);
+        return $importados > 0;
+    }
+
+    /**
+     * Normaliza o retorno do N8N para garantir que o front receba dados estruturados
+     * compatíveis com o botão de importação.
+     */
+    private function normalizarRespostaN8n($body): array
+    {
+        $mensagem = is_array($body) ? ($body['mensagem'] ?? null) : null;
+        $acaoSugerida = is_array($body) ? ($body['acao_sugerida'] ?? null) : null;
+
+        $dadosEstruturados = is_array($body)
+            ? ($body['dados_estruturados'] ?? ($body['dados'] ?? null))
+            : null;
+
+        // Se já veio estruturado, apenas completa campos que faltam
+        if (is_array($dadosEstruturados) && isset($dadosEstruturados['dados_mapeados'])) {
+            // Completa metadados de clientes ou OS (reavalie tipo pelo conteúdo)
+            if (($dadosEstruturados['tipo'] ?? null) === 'gerar_os' || $this->pareceOrdemServico($dadosEstruturados['dados_mapeados'])) {
+                $dadosEstruturados = $this->completarMetadadosOrdensServico(
+                    ($dadosEstruturados['tipo'] ?? null) === 'gerar_os'
+                        ? $dadosEstruturados
+                        : $this->montarPayloadOrdensServico($dadosEstruturados['dados_mapeados'])
+                );
+                $acaoSugerida = 'gerar_os';
+            } else {
+                $dadosEstruturados = $this->completarMetadadosClientes($dadosEstruturados);
+            }
+            $acaoSugerida ??= $dadosEstruturados['acao_sugerida'] ?? null;
+        } else {
+            $listaClientes = $this->extrairListaBrutaClientes($dadosEstruturados ?? $body);
+
+            if ($listaClientes) {
+                $dadosEstruturados = $this->montarPayloadClientes($listaClientes);
+                $acaoSugerida ??= 'importar_clientes';
+            } else {
+                $listaOs = $this->extrairListaBrutaOrdensServico($dadosEstruturados ?? $body);
+                if ($listaOs) {
+                    $dadosEstruturados = $this->montarPayloadOrdensServico($listaOs);
+                    $acaoSugerida ??= 'gerar_os';
+                }
+            }
+        }
+
+        if (!$mensagem && $dadosEstruturados && isset($dadosEstruturados['dados_mapeados'])) {
+            $tipoMsg = ($dadosEstruturados['tipo'] ?? '') === 'gerar_os'
+                ? 'ordens de serviço'
+                : 'clientes';
+            $mensagem = "📥 Encontrei " . count($dadosEstruturados['dados_mapeados']) . " {$tipoMsg} prontos para importar.";
+        }
+
+        if (!$mensagem) {
+            $mensagem = $this->extrairMensagemTexto($body);
+        }
+
+        return [
+            'mensagem' => $mensagem,
+            'dados_estruturados' => $dadosEstruturados,
+            'acao_sugerida' => $acaoSugerida,
+        ];
+    }
+
+    /**
+     * Extrai uma lista de clientes quando o N8N retorna em formatos como
+     * [{ output: [...] }] ou simplesmente uma lista de registros.
+     */
+    private function extrairListaBrutaClientes($dados)
+    {
+        if (!is_array($dados)) return null;
+
+        // Se parecer OS, devolve null para não cair em importação de clientes
+        if ($this->pareceOrdemServico($dados)) {
+            return null;
+        }
+
+        if (isset($dados['dados_mapeados']) && is_array($dados['dados_mapeados']) && $this->pareceListaClientes($dados['dados_mapeados'])) {
+            return $dados['dados_mapeados'];
+        }
+
+        if (isset($dados['output']) && is_array($dados['output'])) {
+            if ($this->pareceListaClientes($dados['output'])) {
+                return $dados['output'];
+            }
+            if ($this->contemListaClientes($dados['output'])) {
+                return $this->pegarListaClientesDeContainer($dados['output']);
+            }
+            if ($this->pareceOrdemServico($dados['output'])) {
+                return [$dados['output']];
+            }
+        }
+
+        if (isset($dados['dados']) && is_array($dados['dados']) && $this->pareceListaClientes($dados['dados'])) {
+            return $dados['dados'];
+        }
+
+        if (array_is_list($dados) && $this->pareceListaClientes($dados)) {
+            return $dados;
+        }
+
+        if (array_is_list($dados)) {
+            foreach ($dados as $item) {
+                if ($this->pareceOrdemServico($item)) {
+                    continue;
+                }
+                if (isset($item['output']) && is_array($item['output']) && $this->pareceListaClientes($item['output'])) {
+                    return $item['output'];
+                }
+                if (isset($item['output']) && is_array($item['output']) && $this->contemListaClientes($item['output'])) {
+                    return $this->pegarListaClientesDeContainer($item['output']);
+                }
+                if (isset($item['output']) && is_array($item['output']) && $this->pareceOrdemServico($item['output'])) {
+                    return [$item['output']];
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private function extrairListaBrutaOrdensServico($dados)
+    {
+        if (!is_array($dados)) return null;
+
+        if ($this->pareceListaClientes($dados)) {
+            return null;
+        }
+
+        if (isset($dados['dados_mapeados']) && is_array($dados['dados_mapeados']) && $this->pareceOrdemServico($dados['dados_mapeados'])) {
+            return array_is_list($dados['dados_mapeados']) ? $dados['dados_mapeados'] : [$dados['dados_mapeados']];
+        }
+
+        if (isset($dados['output']) && is_array($dados['output']) && $this->pareceOrdemServico($dados['output'])) {
+            return array_is_list($dados['output']) ? $dados['output'] : [$dados['output']];
+        }
+
+        if (isset($dados['dados']) && is_array($dados['dados']) && $this->pareceOrdemServico($dados['dados'])) {
+            return array_is_list($dados['dados']) ? $dados['dados'] : [$dados['dados']];
+        }
+
+        if (array_is_list($dados) && $this->pareceOrdemServico($dados)) {
+            return $dados;
+        }
+
+        if (array_is_list($dados)) {
+            foreach ($dados as $item) {
+                if (isset($item['output']) && is_array($item['output']) && $this->pareceOrdemServico($item['output'])) {
+                    return array_is_list($item['output']) ? $item['output'] : [$item['output']];
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private function montarPayloadClientes(array $lista): array
+    {
+        return [
+            'sucesso'        => true,
+            'tipo'           => 'importar_clientes',
+            'acao_sugerida'  => 'importar_clientes',
+            'dados_mapeados' => $lista,
+            'colunas'        => $this->montarColunasClientes($lista),
+            'metadata'       => ['fonte' => 'n8n'],
+        ];
+    }
+
+    private function montarPayloadOrdensServico(array $lista): array
+    {
+        $dados = [];
+        foreach ($lista as $os) {
+            if (!is_array($os)) continue;
+
+            $empresa      = $this->buscarValorFlexivel($os, 'empresa', 'cliente', 'razao_social', 'nome');
+            $titulos      = $os['titulos'] ?? [];
+            $totalGeral   = $os['total_geral'] ?? null;
+            $primeiraData = $titulos[0]['data_cobranca'] ?? ($os['data_cobranca'] ?? null);
+            $qtdTitulos   = is_array($titulos) ? count($titulos) : 0;
+            $qtdVidas     = $os['numero_de_funcionarios'] ?? null;
+
+            $dados[] = [
+                'empresa'         => $empresa,
+                'data_cobranca'   => $primeiraData,
+                'total_geral'     => $totalGeral,
+                'qtd_titulos'     => $qtdTitulos,
+                'qtd_vidas'       => $qtdVidas,
+                'titulos_resumo'  => $this->montarResumoTitulos($titulos),
+                'titulos'         => $titulos,
+                'raw'             => $os,
+            ];
+        }
+
+        return [
+            'sucesso'        => true,
+            'tipo'           => 'gerar_os',
+            'acao_sugerida'  => 'gerar_os',
+            'dados_mapeados' => $dados,
+            'colunas'        => $this->montarColunasOrdensServico($dados),
+            'metadata'       => ['fonte' => 'n8n'],
+        ];
+    }
+
+    private function completarMetadadosClientes(array $dadosEstruturados): array
+    {
+        $lista = $dadosEstruturados['dados_mapeados'] ?? [];
+
+        $dadosEstruturados['sucesso']       = $dadosEstruturados['sucesso'] ?? true;
+        $dadosEstruturados['tipo']          = $dadosEstruturados['tipo'] ?? 'importar_clientes';
+        $dadosEstruturados['acao_sugerida'] = $dadosEstruturados['acao_sugerida'] ?? 'importar_clientes';
+        $dadosEstruturados['colunas']       = $dadosEstruturados['colunas'] ?? $this->montarColunasClientes($lista);
+        $dadosEstruturados['metadata']      = $dadosEstruturados['metadata'] ?? ['fonte' => 'n8n'];
+
+        return $dadosEstruturados;
+    }
+
+    private function completarMetadadosOrdensServico(array $dadosEstruturados): array
+    {
+        $lista = $dadosEstruturados['dados_mapeados'] ?? [];
+
+        $dadosEstruturados['sucesso']       = $dadosEstruturados['sucesso'] ?? true;
+        $dadosEstruturados['tipo']          = $dadosEstruturados['tipo'] ?? 'gerar_os';
+        $dadosEstruturados['acao_sugerida'] = $dadosEstruturados['acao_sugerida'] ?? 'gerar_os';
+        $dadosEstruturados['colunas']       = $dadosEstruturados['colunas'] ?? $this->montarColunasOrdensServico($lista);
+        $dadosEstruturados['metadata']      = $dadosEstruturados['metadata'] ?? ['fonte' => 'n8n'];
+
+        return $dadosEstruturados;
+    }
+
+    private function montarColunasOrdensServico(array $lista): array
+    {
+        // Define colunas amigáveis para não exibir arrays complexos
+        return [
+            ['key' => 'empresa',        'label' => 'Empresa'],
+            ['key' => 'data_cobranca',  'label' => 'Data Cobrança'],
+            ['key' => 'qtd_titulos',    'label' => 'Qtd Títulos'],
+            ['key' => 'qtd_vidas',      'label' => 'Qtd Vidas'],
+            ['key' => 'total_geral',    'label' => 'Total Geral'],
+            ['key' => 'titulos_resumo', 'label' => 'Resumo Títulos'],
+        ];
+    }
+
+    private function montarColunasClientes(array $lista): array
+    {
+        $primeiraLinha = $lista[0] ?? [];
+        if (!is_array($primeiraLinha)) return [];
+
+        $colunas = [];
+        foreach (array_keys($primeiraLinha) as $key) {
+            $colunas[] = [
+                'key'   => $key,
+                'label' => ucfirst(str_replace('_', ' ', $key)),
+            ];
+        }
+
+        return $colunas;
+    }
+
+    /**
+     * Verifica rapidamente se um array parece conter clientes (campos de CNPJ, razão social, etc).
+     */
+    private function pareceListaClientes($dados): bool
+    {
+        if (!is_array($dados) || !array_is_list($dados) || empty($dados) || !is_array($dados[0])) {
+            return false;
+        }
+
+        $primeiraLinha = array_change_key_case($dados[0], CASE_LOWER);
+        $marcadores = [
+            'razao_social', 'nome', 'empresa', 'cliente',
+            'cnpj', 'cpf', 'nome_fantasia', 'email',
+            'telefone', 'celular', 'cep', 'logradouro',
+            'numero', 'bairro', 'cidade', 'uf'
+        ];
+
+        foreach ($marcadores as $campo) {
+            if (array_key_exists($campo, $primeiraLinha)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Verifica se um array parece representar uma ordem de serviço (dados de faturamento SOC).
+     */
+    private function pareceOrdemServico($dados): bool
+    {
+        if (!is_array($dados)) return false;
+
+        $arr = $dados;
+        if (array_is_list($dados)) {
+            $arr = $dados[0] ?? [];
+        }
+
+        if (!is_array($arr)) return false;
+
+        $keys = array_change_key_case(array_keys($arr));
+
+        return in_array('titulos', $keys, true) || in_array('empresa', $keys, true);
+    }
+
+    private function montarResumoTitulos($titulos): string
+    {
+        if (!is_array($titulos) || empty($titulos)) return '';
+
+        $nomes = [];
+        foreach (array_slice($titulos, 0, 3) as $t) {
+            $nomes[] = $t['produto_servico'] ?? ($t['descricao'] ?? 'Serviço');
+        }
+
+        $sufixo = count($titulos) > 3 ? ' + ' . (count($titulos) - 3) . ' outros' : '';
+
+        return implode(', ', $nomes) . $sufixo;
+    }
+
+    /**
+     * Extrai texto principal de respostas simples do N8N (ex: [{output: "Olá..."}]).
+     */
+    private function extrairMensagemTexto($body): string
+    {
+        if (is_string($body)) {
+            return $body;
+        }
+
+        if (is_array($body)) {
+            if (isset($body['mensagem']) && is_string($body['mensagem'])) {
+                return $body['mensagem'];
+            }
+            if (isset($body['output']) && is_string($body['output'])) {
+                return $body['output'];
+            }
+
+            // Caso venha como lista com um item { output: "..." }
+            if (array_is_list($body) && count($body) === 1 && isset($body[0]['output']) && is_string($body[0]['output'])) {
+                return $body[0]['output'];
+            }
+        }
+
+        return is_array($body) ? json_encode($body) : (string) $body;
+    }
+
+    /**
+     * Responde consultas simples com dados locais (clientes, faturas, ordens de serviço)
+     * sem precisar ir ao N8N.
+     */
+    private function responderLocalmente(string $mensagem): ?string
+    {
+        $texto = mb_strtolower($mensagem);
+
+        // Quantidade de clientes
+        if (str_contains($texto, 'quantos') && str_contains($texto, 'cliente')) {
+            $ativos = Cliente::where('status', 'ativo')->count();
+            $inativos = Cliente::where('status', 'inativo')->count();
+            $total = $ativos + $inativos;
+            return "Temos {$total} clientes cadastrados ({$ativos} ativos, {$inativos} inativos).";
+        }
+
+        // Quantidade de faturas
+        if (str_contains($texto, 'quantas') && str_contains($texto, 'fatura')) {
+            $pendentes = Fatura::where('status', 'pendente')->count();
+            $abertas = Fatura::where('status', 'aberta')->count();
+            $total = Fatura::count();
+            return "Faturas: {$total} no total, {$pendentes} pendentes, {$abertas} abertas.";
+        }
+
+        // Quantidade de ordens de serviço
+        if ((str_contains($texto, 'quantas') || str_contains($texto, 'quantos'))
+            && (str_contains($texto, 'ordem') || str_contains($texto, 'os'))
+        ) {
+            $pendentes = OrdemServico::where('status', 'pendente')->count();
+            $aprovadas = OrdemServico::where('status', 'aprovada')->count();
+            $total = OrdemServico::count();
+            return "Ordens de serviço: {$total} no total, {$pendentes} pendentes, {$aprovadas} aprovadas.";
+        }
+
+        // Listar clientes que têm OS geradas
+        if (str_contains($texto, 'cliente') && (str_contains($texto, 'ordem') || str_contains($texto, 'os'))) {
+            $clientes = OrdemServico::with('cliente')
+                ->select('cliente_id')
+                ->whereNotNull('cliente_id')
+                ->groupBy('cliente_id')
+                ->limit(5)
+                ->get()
+                ->map(fn($os) => optional($os->cliente)->razao_social)
+                ->filter()
+                ->values();
+
+            if ($clientes->isNotEmpty()) {
+                $lista = $clientes->implode(', ');
+                $mais = OrdemServico::distinct('cliente_id')->count() > $clientes->count() ? ' ...' : '';
+                return "Clientes com OS geradas: {$lista}{$mais}.";
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Verifica se um array associativo possui alguma chave de container de clientes (empresas, clientes, registros).
+     */
+    private function contemListaClientes(array $dados): bool
+    {
+        $possiveis = ['empresas', 'clientes', 'registros', 'data', 'dados'];
+        foreach ($possiveis as $chave) {
+            if (isset($dados[$chave]) && is_array($dados[$chave]) && $this->pareceListaClientes($dados[$chave])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Extrai a lista de clientes de um container com chaves como empresas/clientes.
+     */
+    private function pegarListaClientesDeContainer(array $dados): array
+    {
+        $possiveis = ['empresas', 'clientes', 'registros', 'data', 'dados'];
+        foreach ($possiveis as $chave) {
+            if (isset($dados[$chave]) && is_array($dados[$chave]) && $this->pareceListaClientes($dados[$chave])) {
+                return $dados[$chave];
+            }
+        }
+        return [];
     }
 }

@@ -33,4 +33,9 @@ class OrdemServico extends Model
     {
         return $this->belongsTo(Fatura::class, 'fatura_gerada_id');
     }
+
+    public function rateios()
+    {
+        return $this->hasMany(OrdemServicoRateio::class, 'ordem_servico_id');
+    }
 }

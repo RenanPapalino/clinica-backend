@@ -87,7 +87,16 @@ class OrdemServicoController extends Controller
     public function faturar(Request $request, $id, FaturamentoService $faturamentoService)
     {
         try {
-            $fatura = $faturamentoService->gerarFaturaDeOS($id);
+            $osId = $id ?? $request->route('id') ?? $request->input('id');
+
+            if (empty($osId) || !is_numeric($osId)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'ID da OS inválido para faturar.'
+                ], 400);
+            }
+
+            $fatura = $faturamentoService->gerarFaturaDeOS((int) $osId);
 
             return response()->json([
                 'success' => true,
@@ -202,5 +211,77 @@ class OrdemServicoController extends Controller
                 'data' => $os->load('itens')
             ]);
         });
+    }
+
+    public function update(Request $request, $id)
+    {
+        $request->validate([
+            'cliente_id' => 'sometimes|exists:clientes,id',
+            'competencia' => 'sometimes|string|size:7',
+            'data_emissao' => 'sometimes|date',
+            'status' => 'sometimes|in:pendente,aprovada,faturada,cancelada',
+            'observacoes' => 'nullable|string',
+            'itens' => 'nullable|array|min:1',
+            'itens.*.descricao' => 'required_with:itens|string',
+            'itens.*.valor' => 'required_with:itens|numeric|min:0',
+            'itens.*.quantidade' => 'required_with:itens|integer|min:1'
+        ]);
+
+        return DB::transaction(function () use ($request, $id) {
+            $os = OrdemServico::with('itens')->findOrFail($id);
+
+            if ($request->filled('cliente_id')) {
+                $os->cliente_id = $request->cliente_id;
+            }
+            if ($request->filled('competencia')) {
+                $os->competencia = $request->competencia;
+            }
+            if ($request->filled('data_emissao')) {
+                $os->data_emissao = $request->data_emissao;
+            }
+            if ($request->filled('status')) {
+                $os->status = $request->status;
+            }
+            if ($request->has('observacoes')) {
+                $os->observacoes = $request->observacoes;
+            }
+
+            // Se vierem itens, substitui todos e recalcula total
+            if ($request->filled('itens')) {
+                $os->itens()->delete();
+                $valorTotal = 0;
+                foreach ($request->itens as $item) {
+                    $valorTotal += $item['valor'] * $item['quantidade'];
+                    $os->itens()->create([
+                        'descricao' => $item['descricao'],
+                        'quantidade' => $item['quantidade'],
+                        'valor_unitario' => $item['valor'],
+                        'valor_total' => $item['valor'] * $item['quantidade'],
+                        'unidade_soc' => 'Manual',
+                        'centro_custo_cliente' => 'N/A'
+                    ]);
+                }
+                $os->valor_total = $valorTotal;
+            }
+
+            $os->save();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'OS atualizada com sucesso!',
+                'data' => $os->load('itens')
+            ]);
+        });
+    }
+
+    public function destroy($id)
+    {
+        $os = OrdemServico::findOrFail($id);
+        $os->delete();
+
+        return response()->json([
+            'success' => true,
+            'message' => 'OS excluída com sucesso.'
+        ]);
     }
 }

@@ -233,17 +233,6 @@ class Titulo extends Model
         // Aceita diferença de 1 centavo
         return abs($totalRateado - $this->valor_original) <= 0.01;
     }
-    // Relacionamento com Fornecedor
-    public function fornecedor()
-    {
-        return $this->belongsTo(Fornecedor::class);
-    }
-
-    // Relacionamento com Rateios (Um título tem vários rateios)
-    public function rateios()
-    {
-        return $this->hasMany(TituloRateio::class);
-    }
 
     // Relacionamento com Plano de Contas Principal (Cabeçalho)
     public function planoConta()

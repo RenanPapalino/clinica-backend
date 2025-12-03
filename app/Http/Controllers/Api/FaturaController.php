@@ -7,10 +7,12 @@ use App\Models\Fatura;
 use App\Models\FaturaItem;
 use App\Models\Titulo;
 use App\Models\Cliente;
-use App\Services\Integracao\SocImportService;
-use App\Services\Financeiro\TributoService;
+use App\Models\Nfse;
+use App\Services\SocImportService;
+use App\Services\TributoService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Maatwebsite\Excel\Facades\Excel;
 use App\Services\Fiscal\NfseDiretaService;
 
@@ -31,18 +33,27 @@ class FaturaController extends Controller
 
     public function index(Request $request)
     {
-        $query = Fatura::with(['cliente', 'itens']);
-        
-        if ($request->has('status')) {
-            $query->where('status', $request->status);
+        try {
+            $query = Fatura::with(['cliente', 'itens']);
+            
+            if ($request->filled('status')) {
+                $query->where('status', $request->status);
+            }
+    
+            if ($request->filled('cliente_id')) $query->where('cliente_id', $request->cliente_id);
+    
+            $faturas = $query->orderBy('id', 'desc')->get();
+    
+            return response()->json([
+                'success' => true,
+                'data'    => $faturas,
+            ]);
+        } catch (\Throwable $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erro ao listar faturas: ' . $e->getMessage(),
+            ], 500);
         }
-
-        if ($request->filled('cliente_id')) $query->where('cliente_id', $request->cliente_id);
-        if ($request->filled('status')) $query->where('status', $request->status);
-
-        $faturas = $query->orderBy('id', 'desc')->paginate(50);
-
-        return response()->json($faturas);
     }
     
     public function show($id)
@@ -323,7 +334,7 @@ class FaturaController extends Controller
         }
     }
 
-    public function emitirNfse(Request $request, $id, NfseDiretaService $nfseService)
+    public function emitirNfse(Request $request, $id)
     {
         try {
             $fatura = Fatura::with('cliente')->findOrFail($id);
@@ -332,18 +343,32 @@ class FaturaController extends Controller
                 return response()->json(['success' => false, 'message' => 'NFS-e já emitida.'], 400);
             }
 
-            // Chama o serviço fiscal
-            $nfse = $nfseService->emitir($fatura);
+            // Apenas registra localmente (sem envio à prefeitura)
+            $numeroGerado = 'NFSe-' . now()->format('Ymd') . '-' . str_pad($fatura->id, 4, '0', STR_PAD_LEFT);
 
-            // Atualiza status da fatura
+            $nfse = Nfse::create([
+                'fatura_id'      => $fatura->id,
+                'cliente_id'     => $fatura->cliente_id,
+                'numero_nfse'    => $numeroGerado,
+                'data_emissao'   => now(),
+                'data_envio'     => now(),
+                'valor_servicos' => $fatura->valor_servicos ?? $fatura->valor_total ?? 0,
+                'valor_liquido'  => $fatura->valor_total ?? $fatura->valor_servicos ?? 0,
+                'status'         => 'pendente', // pendente de envio real
+                'discriminacao'  => $fatura->observacoes,
+                'pdf_url'        => null,
+            ]);
+
+            // Atualiza status da fatura para refletir NFSe registrada localmente
             $fatura->update([
-                'status' => 'processando_fiscal',
-                'nfse_status' => 'enviado'
+                'status'       => 'nfse_emitida',
+                'nfse_emitida' => true,
+                'nfse_numero'  => $numeroGerado,
             ]);
 
             return response()->json([
                 'success' => true,
-                'message' => 'Lote RPS enviado para prefeitura! Aguardando processamento.',
+                'message' => 'NFSe registrada localmente. Envio à prefeitura não realizado neste ambiente.',
                 'data' => $nfse
             ]);
 
@@ -356,4 +381,3 @@ class FaturaController extends Controller
         }
     }
 }
-

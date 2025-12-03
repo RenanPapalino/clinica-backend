@@ -338,9 +338,8 @@ class TituloController extends Controller
 
         return response()->json(['success' => true, 'data' => $response]);
     }
-}
 
-public function registrarBoleto(Request $request, $id, ItauService $bancoService)
+    public function registrarBoleto(Request $request, $id, ItauService $bancoService)
     {
         try {
             $titulo = Titulo::with('cliente')->findOrFail($id);
@@ -378,3 +377,4 @@ public function registrarBoleto(Request $request, $id, ItauService $bancoService
             ], 500);
         }
     }
+}
