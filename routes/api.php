@@ -133,6 +133,10 @@ Route::middleware('auth:sanctum')->group(function () {
     // ========== NFS-e (Hub Fiscal) ==========
     Route::prefix('nfse')->group(function () {
         Route::get('/', [NfseController::class, 'index']);
+        Route::post('/', [NfseController::class, 'store']);
+        Route::get('/{id}', [NfseController::class, 'show']);
+        Route::put('/{id}', [NfseController::class, 'update']);
+        Route::delete('/{id}', [NfseController::class, 'destroy']);
         Route::post('/emitir-lote', [NfseController::class, 'emitirLote']);
         Route::get('/consultar-protocolo', [NfseController::class, 'consultarProtocolo']);
         Route::get('/{id}/xml', [NfseController::class, 'downloadXml']);

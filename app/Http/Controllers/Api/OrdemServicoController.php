@@ -143,6 +143,7 @@ class OrdemServicoController extends Controller
             // 2. Copia Itens
             foreach ($os->itens as $item) {
                 $fatura->itens()->create([
+                    'servico_id' => $item->servico_id ?? null,
                     'descricao' => $item->descricao,
                     'quantidade' => $item->quantidade,
                     'valor_unitario' => $item->valor_unitario,

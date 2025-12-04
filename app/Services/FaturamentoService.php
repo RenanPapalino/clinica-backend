@@ -76,6 +76,7 @@ class FaturamentoService
             foreach ($os->itens as $item) {
                 FaturaItem::create([
                     'fatura_id' => $fatura->id,
+                    'servico_id' => $item->servico_id ?? null,
                     'descricao' => $item->descricao,
                     'quantidade' => $item->quantidade,
                     'valor_unitario' => $item->valor_unitario,

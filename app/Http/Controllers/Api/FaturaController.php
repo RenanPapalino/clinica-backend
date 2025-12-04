@@ -4,10 +4,10 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Fatura;
-use App\Models\FaturaItem;
 use App\Models\Titulo;
 use App\Models\Cliente;
 use App\Models\Nfse;
+use App\Models\FaturaItem;
 use App\Services\SocImportService;
 use App\Services\TributoService;
 use Illuminate\Http\Request;
@@ -121,6 +121,7 @@ class FaturaController extends Controller
             foreach ($data['itens'] as $idx => $item) {
                 FaturaItem::create([
                     'fatura_id' => $fatura->id,
+                    'servico_id' => $item['servico_id'] ?? null,
                     'item_numero' => $idx + 1,
                     'descricao' => $item['descricao'],
                     'quantidade' => $item['quantidade'],
@@ -207,6 +208,7 @@ class FaturaController extends Controller
                     foreach ($dados['itens'] as $idx => $itemData) {
                         FaturaItem::create([
                             'fatura_id' => $fatura->id,
+                            'servico_id' => $itemData['servico_id'] ?? null,
                             'item_numero' => $idx + 1,
                             'descricao' => $itemData['descricao'],
                             'quantidade' => 1,
@@ -337,11 +339,17 @@ class FaturaController extends Controller
     public function emitirNfse(Request $request, $id)
     {
         try {
-            $fatura = Fatura::with('cliente')->findOrFail($id);
+            $fatura = Fatura::with(['cliente', 'itens'])->findOrFail($id);
 
             if ($fatura->nfse_emitida) {
                 return response()->json(['success' => false, 'message' => 'NFS-e já emitida.'], 400);
             }
+
+            // Calcula valores para registrar na NFSe local (fallback robusto)
+            $valorServicos = $this->calcularValorServicos($fatura);
+            $aliquotaIss = $fatura->cliente->aliquota_iss ?? 0;
+            $valorIss = $aliquotaIss > 0 ? round($valorServicos * ($aliquotaIss / 100), 2) : 0;
+            $valorLiquido = max($valorServicos - $valorIss, 0);
 
             // Apenas registra localmente (sem envio à prefeitura)
             $numeroGerado = 'NFSe-' . now()->format('Ymd') . '-' . str_pad($fatura->id, 4, '0', STR_PAD_LEFT);
@@ -352,8 +360,10 @@ class FaturaController extends Controller
                 'numero_nfse'    => $numeroGerado,
                 'data_emissao'   => now(),
                 'data_envio'     => now(),
-                'valor_servicos' => $fatura->valor_servicos ?? $fatura->valor_total ?? 0,
-                'valor_liquido'  => $fatura->valor_total ?? $fatura->valor_servicos ?? 0,
+                'valor_servicos' => $valorServicos,
+                'valor_iss'      => $valorIss,
+                'aliquota_iss'   => $aliquotaIss,
+                'valor_liquido'  => $valorLiquido,
                 'status'         => 'pendente', // pendente de envio real
                 'discriminacao'  => $fatura->observacoes,
                 'pdf_url'        => null,
@@ -379,5 +389,32 @@ class FaturaController extends Controller
                 'message' => 'Erro na emissão: ' . $e->getMessage()
             ], 500);
         }
+    }
+
+    /**
+     * Obtém o valor de serviços da fatura com múltiplos fallbacks.
+     */
+    private function calcularValorServicos(Fatura $fatura): float
+    {
+        $valor = $fatura->valor_servicos;
+        if ($valor === null || $valor <= 0) {
+            $valor = $fatura->valor_total;
+        }
+
+        if ($valor === null || $valor <= 0) {
+            $valor = $fatura->itens->sum('valor_total');
+        }
+
+        if ($valor === null || $valor <= 0) {
+            $valor = FaturaItem::where('fatura_id', $fatura->id)->sum('valor_total');
+        }
+
+        if ($valor === null || $valor <= 0) {
+            $valor = FaturaItem::where('fatura_id', $fatura->id)
+                ->selectRaw('SUM(COALESCE(valor_unitario * quantidade, 0)) as total')
+                ->value('total');
+        }
+
+        return (float) ($valor ?? 0);
     }
 }

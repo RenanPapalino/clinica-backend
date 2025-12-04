@@ -106,6 +106,7 @@ class N8nController extends Controller
             foreach ($request->itens as $index => $item) {
                 FaturaItem::create([
                     'fatura_id' => $fatura->id,
+                    'servico_id' => $item['servico_id'] ?? null,
                     'item_numero' => $index + 1,
                     'descricao' => $item['descricao'],
                     'quantidade' => $item['quantidade'],
