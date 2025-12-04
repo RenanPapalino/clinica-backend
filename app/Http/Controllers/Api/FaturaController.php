@@ -345,6 +345,9 @@ class FaturaController extends Controller
                 return response()->json(['success' => false, 'message' => 'NFS-e já emitida.'], 400);
             }
 
+            // Garante que a fatura tenha valores calculados antes de criar a NFSe
+            $this->recalcularTotaisFaturaSeNecessario($fatura);
+
             // Calcula valores para registrar na NFSe local (fallback robusto)
             $valorServicos = $this->calcularValorServicos($fatura);
             $aliquotaIss = $fatura->cliente->aliquota_iss ?? 0;
@@ -370,11 +373,18 @@ class FaturaController extends Controller
             ]);
 
             // Atualiza status da fatura para refletir NFSe registrada localmente
-            $fatura->update([
-                'status'       => 'nfse_emitida',
+            $statusEmitida = 'emitida';
+            $dadosAtualizacao = [
                 'nfse_emitida' => true,
                 'nfse_numero'  => $numeroGerado,
-            ]);
+            ];
+
+            // Alguns bancos usam ENUM com valores diferentes; só atualiza se o valor for aceito
+            if ($this->statusAceitaValor($statusEmitida)) {
+                $dadosAtualizacao['status'] = $statusEmitida;
+            }
+
+            $fatura->update($dadosAtualizacao);
 
             return response()->json([
                 'success' => true,
@@ -396,25 +406,120 @@ class FaturaController extends Controller
      */
     private function calcularValorServicos(Fatura $fatura): float
     {
+        // 1) Tenta usar valores já salvos na fatura
         $valor = $fatura->valor_servicos;
-        if ($valor === null || $valor <= 0) {
-            $valor = $fatura->valor_total;
+        if ($valor !== null && $valor > 0) {
+            return (float) $valor;
         }
 
-        if ($valor === null || $valor <= 0) {
-            $valor = $fatura->itens->sum('valor_total');
+        if ($fatura->valor_total !== null && $fatura->valor_total > 0) {
+            return (float) $fatura->valor_total;
         }
 
-        if ($valor === null || $valor <= 0) {
-            $valor = FaturaItem::where('fatura_id', $fatura->id)->sum('valor_total');
+        // 2) Usa os itens já carregados (valor_total ou quantidade x valor_unitario)
+        $valor = $fatura->itens->sum('valor_total');
+        if ($valor <= 0) {
+            $valor = $fatura->itens->sum(function ($item) {
+                $qtd = $item->quantidade ?? 0;
+                $unit = $item->valor_unitario ?? 0;
+                return $qtd * $unit;
+            });
+        }
+        if ($valor > 0) {
+            return (float) $valor;
         }
 
-        if ($valor === null || $valor <= 0) {
+        // 3) Consulta direta ao banco (sem cache), incluindo cálculo por quantidade x unitário
+        $valor = FaturaItem::where('fatura_id', $fatura->id)->sum('valor_total');
+        if ($valor <= 0) {
             $valor = FaturaItem::where('fatura_id', $fatura->id)
                 ->selectRaw('SUM(COALESCE(valor_unitario * quantidade, 0)) as total')
                 ->value('total');
         }
+        if ($valor > 0) {
+            return (float) $valor;
+        }
 
-        return (float) ($valor ?? 0);
+        // 4) Fallback: tenta usar títulos vinculados
+        $valorTitulos = Titulo::where('fatura_id', $fatura->id)->sum('valor_original');
+        if ($valorTitulos > 0) {
+            return (float) $valorTitulos;
+        }
+
+        return 0.0;
+    }
+
+    /**
+     * Recalcula valores da fatura a partir dos itens caso estejam zerados.
+     */
+    private function recalcularTotaisFaturaSeNecessario(Fatura $fatura): void
+    {
+        $itens = $fatura->itens;
+        if ($itens->isEmpty()) {
+            return;
+        }
+
+        // Soma valor_total; se não houver, recalcula a partir de quantidade x valor_unitario
+        $valorItens = $itens->sum('valor_total');
+        if ($valorItens <= 0) {
+            $valorItens = $itens->sum(function ($item) {
+                $qtd = $item->quantidade ?? 0;
+                $unit = $item->valor_unitario ?? 0;
+                return $qtd * $unit;
+            });
+        }
+
+        $dados = [];
+        if ($valorItens > 0) {
+            if ($fatura->valor_servicos <= 0) {
+                $dados['valor_servicos'] = $valorItens;
+            }
+            if ($fatura->valor_total <= 0) {
+                $dados['valor_total'] = $valorItens;
+            }
+        }
+
+        // Se ainda não tem valor_total e há títulos com valor, usa-os como fallback
+        if (($dados['valor_total'] ?? $fatura->valor_total) <= 0) {
+            $valorTitulos = Titulo::where('fatura_id', $fatura->id)->sum('valor_original');
+            if ($valorTitulos > 0) {
+                $dados['valor_total'] = $valorTitulos;
+                if (($dados['valor_servicos'] ?? $fatura->valor_servicos) <= 0) {
+                    $dados['valor_servicos'] = $valorTitulos;
+                }
+            }
+        }
+
+        if ($fatura->valor_iss === null && $fatura->cliente && $fatura->cliente->aliquota_iss) {
+            $aliquotaIss = $fatura->cliente->aliquota_iss;
+            $base = $dados['valor_servicos'] ?? $fatura->valor_servicos ?? $valorItens;
+            $dados['valor_iss'] = round($base * ($aliquotaIss / 100), 2);
+        }
+
+        if (!empty($dados)) {
+            $fatura->update($dados);
+            $fatura->refresh();
+        }
+    }
+
+    /**
+     * Verifica se a coluna status aceita o valor informado (para bancos com ENUM).
+     */
+    private function statusAceitaValor(string $valor): bool
+    {
+        try {
+            $coluna = collect(DB::select("SHOW COLUMNS FROM faturas WHERE Field = 'status'"))->first();
+
+            if ($coluna && isset($coluna->Type) && str_starts_with($coluna->Type, 'enum(')) {
+                preg_match_all("/'([^']+)'/", $coluna->Type, $matches);
+                $permitidos = $matches[1] ?? [];
+
+                return in_array($valor, $permitidos, true);
+            }
+        } catch (\Throwable $e) {
+            // Se não conseguir ler metadata, não bloqueia a atualização
+        }
+
+        return true;
     }
 }
