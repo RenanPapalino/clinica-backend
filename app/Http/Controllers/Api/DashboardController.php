@@ -39,7 +39,7 @@ class DashboardController extends Controller
         $faturasEmitidas = Fatura::whereBetween('created_at', [$inicioMes, $fimMes])->count();
 
         // Clientes Ativos
-        $clientesAtivos = Cliente::where('ativo', true)->count();
+        $clientesAtivos = Cliente::where('status', 'ativo')->count();
 
         // Receita do Mês
         $receitaMes = Titulo::where('tipo', 'receber')

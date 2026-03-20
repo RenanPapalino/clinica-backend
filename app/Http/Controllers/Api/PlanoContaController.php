@@ -59,6 +59,14 @@ class PlanoContaController extends Controller
         }
     }
 
+    public function show($id)
+    {
+        return response()->json([
+            'success' => true,
+            'data' => PlanoConta::findOrFail($id),
+        ]);
+    }
+
     public function update(Request $request, $id)
     {
         $plano = PlanoConta::findOrFail($id);

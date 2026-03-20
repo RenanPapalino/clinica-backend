@@ -137,6 +137,15 @@ class Fatura extends Model
         return "Fatura {$numero} - {$cliente}" . ($data ? " ({$data})" : '');
     }
 
+    public function getIssRetidoAttribute(): bool
+    {
+        if ($this->relationLoaded('cliente') && $this->cliente) {
+            return (bool) ($this->cliente->reter_iss ?? false);
+        }
+
+        return (bool) $this->cliente()->value('reter_iss');
+    }
+
     /*
     |--------------------------------------------------------------------------
     | HELPERS
@@ -173,6 +182,11 @@ class Fatura extends Model
 
         return $this->titulos()->create([
             'cliente_id'      => $this->cliente_id,
+            'descricao'       => 'Fatura #' . ($this->numero_fatura ?? $this->id),
+            'tipo'            => 'receber',
+            'plano_conta_id'  => $this->cliente?->plano_conta_padrao_id,
+            'centro_custo_id' => $this->cliente?->centro_custo_padrao_id,
+            'competencia'     => $this->resolverCompetenciaTitulo(),
             'numero_titulo'   => $this->numero_fatura ?? ('FT-' . $this->id),
             'nosso_numero'    => null,
             'data_emissao'    => $this->data_emissao ?? now()->toDateString(),
@@ -190,5 +204,18 @@ class Fatura extends Model
             'url_boleto'      => null,
             'observacoes'     => 'Título gerado automaticamente a partir da fatura.',
         ]);
+    }
+
+    private function resolverCompetenciaTitulo(): ?string
+    {
+        if (empty($this->periodo_referencia)) {
+            return $this->data_emissao?->toDateString();
+        }
+
+        if (preg_match('/^\d{4}-\d{2}$/', $this->periodo_referencia) === 1) {
+            return $this->periodo_referencia . '-01';
+        }
+
+        return $this->data_emissao?->toDateString();
     }
 }

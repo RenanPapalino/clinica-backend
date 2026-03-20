@@ -63,6 +63,18 @@ class ServicoController extends Controller
         }
     }
 
+    public function show($id)
+    {
+        try {
+            return response()->json([
+                'success' => true,
+                'data' => Servico::findOrFail($id),
+            ]);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'message' => 'Serviço não encontrado'], 404);
+        }
+    }
+
     public function update(Request $request, $id)
     {
         try {

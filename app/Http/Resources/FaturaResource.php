@@ -9,6 +9,10 @@ class FaturaResource extends JsonResource
 {
     public function toArray(Request $request): array
     {
+        $tituloReceber = $this->relationLoaded('titulos')
+            ? $this->titulos->firstWhere('tipo', 'receber')
+            : null;
+
         return [
             'id'                 => $this->id,
             'numero_fatura'      => $this->numero_fatura,
@@ -24,6 +28,11 @@ class FaturaResource extends JsonResource
             'valor_total'        => (float) $this->valor_total,
             'status'             => $this->status,
             'nfse_emitida'       => (bool) $this->nfse_emitida,
+            'nfse_numero'        => $this->nfse_numero,
+            'link_boleto'        => $tituloReceber?->url_boleto,
+            'nosso_numero'       => $tituloReceber?->nosso_numero,
+            'linha_digitavel'    => $tituloReceber?->linha_digitavel,
+            'codigo_barras'      => $tituloReceber?->codigo_barras,
             'observacoes'        => $this->observacoes,
             'itens'              => FaturaItemResource::collection($this->whenLoaded('itens')),
             'titulos'            => TituloResource::collection($this->whenLoaded('titulos')),

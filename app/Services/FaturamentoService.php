@@ -5,8 +5,6 @@ namespace App\Services;
 use App\Models\OrdemServico;
 use App\Models\Fatura;
 use App\Models\FaturaItem;
-use App\Models\Titulo; // Contas a Receber
-use App\Models\Cliente;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Exception;
@@ -30,7 +28,7 @@ class FaturamentoService
             // 2. Definição de Parâmetros Fiscais (Pode vir de config ou tabela parametros)
             // Lógica: Se cliente for de fora do município, retém ISS? Depende da regra da empresa.
             // Aqui aplicamos uma regra padrão, você pode ajustar as alíquotas.
-            $aliquotaIss = $cliente->iss_retido ? 0 : 2.00; // Exemplo: 2% se não retido
+            $aliquotaIss = $cliente->reter_iss ? 0 : 2.00; // Exemplo: 2% se não retido
             $valorIss = ($os->valor_total * $aliquotaIss) / 100;
             
             // Exemplo de retenções federais (se valor > 215, ex: 4.65% PCC)
@@ -41,7 +39,7 @@ class FaturamentoService
 
             $valorLiquido = $os->valor_total - $valorRetencoes; // ISS geralmente não deduz do líquido a receber, salvo se retido.
 
-            $iss = $os->cliente->iss_retido ? 0 : ($os->valor_total * 0.02); // Ex: 2%
+            $iss = $os->cliente->reter_iss ? 0 : ($os->valor_total * 0.02); // Ex: 2%
             $liquido = $os->valor_total;
 
             // 3. Criar a Fatura (Cabeçalho Fiscal) respeitando colunas existentes na tabela
@@ -81,23 +79,12 @@ class FaturamentoService
                     'quantidade' => $item->quantidade,
                     'valor_unitario' => $item->valor_unitario,
                     'valor_total' => $item->valor_total,
-                    // CORREÇÃO: Se for manual e não tiver centro de custo, usa 'Geral'
-                    'centro_custo' => $item->centro_custo ?? 'Geral' 
                 ]);
             }
 
             // 5. Gerar Título Financeiro (Contas a Receber)
-            Titulo::create([
-                'cliente_id'      => $os->cliente_id,
-                'fatura_id'       => $fatura->id,
-                'numero_titulo'   => $fatura->numero_fatura ?? ('FT-' . $fatura->id),
-                'nosso_numero'    => null,
-                'valor_original'  => $liquido,
-                'valor_saldo'     => $liquido,
-                'data_vencimento' => $fatura->data_vencimento,
-                'data_emissao'    => $fatura->data_emissao ?? now(),
-                'status'          => 'aberto'
-            ]);
+            $fatura->loadMissing('cliente');
+            $fatura->gerarTituloPadrao();
 
             // 6. Atualizar Status da OS
             $os->status = 'faturada';

@@ -21,6 +21,8 @@ return Application::configure(basePath: dirname(__DIR__))
 
         $middleware->alias([
             'verified' => \App\Http\Middleware\EnsureEmailIsVerified::class,
+            'agent.runtime' => \App\Http\Middleware\AuthenticateAgentRuntimeRequest::class,
+            'n8n.ingest' => \App\Http\Middleware\AuthenticateN8nIngestionRequest::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions) {

@@ -1,0 +1,664 @@
+{
+  "name": "MedIntelligence_RAG_Ingest_MySQL_Producao",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "authentication": "serviceAccount",
+        "triggerOn": "specificFolder",
+        "folderToWatch": {
+          "__rl": true,
+          "value": "1GJiQDVdOJ8ljF4CS9kH6n7vKLrDzD_oi",
+          "mode": "list",
+          "cachedResultName": "N8N",
+          "cachedResultUrl": "https://drive.google.com/drive/folders/1GJiQDVdOJ8ljF4CS9kH6n7vKLrDzD_oi"
+        },
+        "event": "fileCreated",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDriveTrigger",
+      "typeVersion": 1,
+      "position": [
+        -2360,
+        -320
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0001",
+      "name": "Arquivo Novo",
+      "credentials": {
+        "googleApi": {
+          "id": "yPiipoxtAYdTbSpq",
+          "name": "N8N"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "authentication": "serviceAccount",
+        "triggerOn": "specificFolder",
+        "folderToWatch": {
+          "__rl": true,
+          "value": "1GJiQDVdOJ8ljF4CS9kH6n7vKLrDzD_oi",
+          "mode": "list",
+          "cachedResultName": "N8N",
+          "cachedResultUrl": "https://drive.google.com/drive/folders/1GJiQDVdOJ8ljF4CS9kH6n7vKLrDzD_oi"
+        },
+        "event": "fileUpdated",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDriveTrigger",
+      "typeVersion": 1,
+      "position": [
+        -2360,
+        -144
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0002",
+      "name": "Arquivo Atualizado",
+      "credentials": {
+        "googleApi": {
+          "id": "yPiipoxtAYdTbSpq",
+          "name": "N8N"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "authentication": "serviceAccount",
+        "triggerOn": "specificFolder",
+        "folderToWatch": {
+          "__rl": true,
+          "value": "1GJiQDVdOJ8ljF4CS9kH6n7vKLrDzD_oi",
+          "mode": "list",
+          "cachedResultName": "N8N",
+          "cachedResultUrl": "https://drive.google.com/drive/folders/1GJiQDVdOJ8ljF4CS9kH6n7vKLrDzD_oi"
+        },
+        "event": "fileDeleted",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDriveTrigger",
+      "typeVersion": 1,
+      "position": [
+        -2360,
+        80
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0003",
+      "name": "Arquivo Excluido",
+      "credentials": {
+        "googleApi": {
+          "id": "yPiipoxtAYdTbSpq",
+          "name": "N8N"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "4c8a0d0a-b9e3-4517-b8d8-c0ec31ea0001",
+              "name": "file_id",
+              "value": "={{ $json.id }}",
+              "type": "string"
+            },
+            {
+              "id": "4c8a0d0a-b9e3-4517-b8d8-c0ec31ea0002",
+              "name": "file_name",
+              "value": "={{ $json.name }}",
+              "type": "string"
+            },
+            {
+              "id": "4c8a0d0a-b9e3-4517-b8d8-c0ec31ea0003",
+              "name": "file_type",
+              "value": "={{ $json.mimeType }}",
+              "type": "string"
+            },
+            {
+              "id": "4c8a0d0a-b9e3-4517-b8d8-c0ec31ea0004",
+              "name": "folder_id",
+              "value": "={{ Array.isArray($json.parents) && $json.parents.length ? $json.parents[0] : '' }}",
+              "type": "string"
+            },
+            {
+              "id": "4c8a0d0a-b9e3-4517-b8d8-c0ec31ea0005",
+              "name": "source_system",
+              "value": "google_drive",
+              "type": "string"
+            },
+            {
+              "id": "4c8a0d0a-b9e3-4517-b8d8-c0ec31ea0006",
+              "name": "trigger_event",
+              "value": "drive_file_upsert",
+              "type": "string"
+            },
+            {
+              "id": "4c8a0d0a-b9e3-4517-b8d8-c0ec31ea0007",
+              "name": "external_updated_at",
+              "value": "={{ $json.modifiedTime || $json.createdTime || $now.toISO() }}",
+              "type": "string"
+            },
+            {
+              "id": "4c8a0d0a-b9e3-4517-b8d8-c0ec31ea0008",
+              "name": "checksum",
+              "value": "={{ $json.md5Checksum || $json.sha1Checksum || $json.modifiedTime || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "4c8a0d0a-b9e3-4517-b8d8-c0ec31ea0009",
+              "name": "business_context",
+              "value": "={{ $env.RAG_BUSINESS_CONTEXT || 'geral' }}",
+              "type": "string"
+            },
+            {
+              "id": "4c8a0d0a-b9e3-4517-b8d8-c0ec31ea0010",
+              "name": "context_key",
+              "value": "={{ $env.RAG_CONTEXT_KEY || (Array.isArray($json.parents) && $json.parents.length ? $json.parents[0] : 'drive') }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -2100,
+        -224
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0004",
+      "name": "Normalizar Documento"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "4c8a0d0a-b9e3-4517-b8d8-c0ec31ea0011",
+              "name": "source_system",
+              "value": "google_drive",
+              "type": "string"
+            },
+            {
+              "id": "4c8a0d0a-b9e3-4517-b8d8-c0ec31ea0012",
+              "name": "file_id",
+              "value": "={{ $json.id }}",
+              "type": "string"
+            },
+            {
+              "id": "4c8a0d0a-b9e3-4517-b8d8-c0ec31ea0013",
+              "name": "file_name",
+              "value": "={{ $json.name }}",
+              "type": "string"
+            },
+            {
+              "id": "4c8a0d0a-b9e3-4517-b8d8-c0ec31ea0014",
+              "name": "trigger_event",
+              "value": "drive_file_deleted",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -2100,
+        80
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0005",
+      "name": "Normalizar Exclusao"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.file_id }}",
+          "mode": "id"
+        },
+        "options": {
+          "googleFileConversion": {
+            "conversion": {
+              "docsToFormat": "text/plain",
+              "drawingsToFormat": "application/pdf",
+              "slidesToFormat": "application/pdf"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        -1860,
+        -224
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0006",
+      "name": "Download File",
+      "credentials": {
+        "googleApi": {
+          "id": "yPiipoxtAYdTbSpq",
+          "name": "N8N"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Normalizar Documento').item.json.file_type }}",
+                    "rightValue": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0010"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "xlsx"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Normalizar Documento').item.json.file_type }}",
+                    "rightValue": "application/pdf",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0011"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "pdf"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.3,
+      "position": [
+        -1610,
+        -224
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0007",
+      "name": "Tipo Arquivo"
+    },
+    {
+      "parameters": {
+        "operation": "xlsx",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -1360,
+        -400
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0008",
+      "name": "Extrair XLSX"
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -1360,
+        -224
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0009",
+      "name": "Extrair PDF"
+    },
+    {
+      "parameters": {
+        "operation": "text",
+        "destinationOutputField": "content",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -1360,
+        -48
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0010",
+      "name": "Extrair Texto"
+    },
+    {
+      "parameters": {
+        "fieldsToSummarize": {
+          "values": [
+            {
+              "aggregation": "concatenate",
+              "field": "data"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.summarize",
+      "typeVersion": 1.1,
+      "position": [
+        -1120,
+        -400
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0011",
+      "name": "Consolidar XLSX"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.LARAVEL_BASE_URL + '/api/internal/n8n/rag/upsert' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "X-N8N-Secret",
+              "value": "={{ $env.N8N_INGEST_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ source_system: $('Normalizar Documento').item.json.source_system, external_id: $('Normalizar Documento').item.json.file_id, file_name: $('Normalizar Documento').item.json.file_name, file_type: $('Normalizar Documento').item.json.file_type, business_context: $('Normalizar Documento').item.json.business_context, context_key: $('Normalizar Documento').item.json.context_key, checksum: $('Normalizar Documento').item.json.checksum, external_updated_at: $('Normalizar Documento').item.json.external_updated_at, metadata: { trigger_event: $('Normalizar Documento').item.json.trigger_event, folder_id: $('Normalizar Documento').item.json.folder_id, source: 'google_drive', extractor: 'xlsx' }, chunks: [{ chunk_index: 0, content: $json.data, metadata: { extractor: 'xlsx', source_event: $('Normalizar Documento').item.json.trigger_event } }] }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -880,
+        -400
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0012",
+      "name": "Laravel Upsert XLSX"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.LARAVEL_BASE_URL + '/api/internal/n8n/rag/upsert' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "X-N8N-Secret",
+              "value": "={{ $env.N8N_INGEST_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ source_system: $('Normalizar Documento').item.json.source_system, external_id: $('Normalizar Documento').item.json.file_id, file_name: $('Normalizar Documento').item.json.file_name, file_type: $('Normalizar Documento').item.json.file_type, business_context: $('Normalizar Documento').item.json.business_context, context_key: $('Normalizar Documento').item.json.context_key, checksum: $('Normalizar Documento').item.json.checksum, external_updated_at: $('Normalizar Documento').item.json.external_updated_at, metadata: { trigger_event: $('Normalizar Documento').item.json.trigger_event, folder_id: $('Normalizar Documento').item.json.folder_id, source: 'google_drive', extractor: 'pdf' }, chunks: [{ chunk_index: 0, content: $json.text || $json.content || $json.data || '', metadata: { extractor: 'pdf', source_event: $('Normalizar Documento').item.json.trigger_event } }] }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -880,
+        -224
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0013",
+      "name": "Laravel Upsert PDF"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.LARAVEL_BASE_URL + '/api/internal/n8n/rag/upsert' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "X-N8N-Secret",
+              "value": "={{ $env.N8N_INGEST_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ source_system: $('Normalizar Documento').item.json.source_system, external_id: $('Normalizar Documento').item.json.file_id, file_name: $('Normalizar Documento').item.json.file_name, file_type: $('Normalizar Documento').item.json.file_type, business_context: $('Normalizar Documento').item.json.business_context, context_key: $('Normalizar Documento').item.json.context_key, checksum: $('Normalizar Documento').item.json.checksum, external_updated_at: $('Normalizar Documento').item.json.external_updated_at, metadata: { trigger_event: $('Normalizar Documento').item.json.trigger_event, folder_id: $('Normalizar Documento').item.json.folder_id, source: 'google_drive', extractor: 'text' }, chunks: [{ chunk_index: 0, content: $json.content || $json.text || $json.data || '', metadata: { extractor: 'text', source_event: $('Normalizar Documento').item.json.trigger_event } }] }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -880,
+        -48
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0014",
+      "name": "Laravel Upsert Texto"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.LARAVEL_BASE_URL + '/api/internal/n8n/rag/delete' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "X-N8N-Secret",
+              "value": "={{ $env.N8N_INGEST_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ source_system: $('Normalizar Exclusao').item.json.source_system, external_id: $('Normalizar Exclusao').item.json.file_id }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -1840,
+        80
+      ],
+      "id": "48f7af7e-e84e-4bb9-bb18-4d9269ef0015",
+      "name": "Laravel Delete"
+    }
+  ],
+  "connections": {
+    "Arquivo Novo": {
+      "main": [
+        [
+          {
+            "node": "Normalizar Documento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Arquivo Atualizado": {
+      "main": [
+        [
+          {
+            "node": "Normalizar Documento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Arquivo Excluido": {
+      "main": [
+        [
+          {
+            "node": "Normalizar Exclusao",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalizar Documento": {
+      "main": [
+        [
+          {
+            "node": "Download File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalizar Exclusao": {
+      "main": [
+        [
+          {
+            "node": "Laravel Delete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download File": {
+      "main": [
+        [
+          {
+            "node": "Tipo Arquivo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tipo Arquivo": {
+      "main": [
+        [
+          {
+            "node": "Extrair XLSX",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Extrair PDF",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Extrair Texto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrair XLSX": {
+      "main": [
+        [
+          {
+            "node": "Consolidar XLSX",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrair PDF": {
+      "main": [
+        [
+          {
+            "node": "Laravel Upsert PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrair Texto": {
+      "main": [
+        [
+          {
+            "node": "Laravel Upsert Texto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consolidar XLSX": {
+      "main": [
+        [
+          {
+            "node": "Laravel Upsert XLSX",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": null,
+  "settings": {},
+  "active": false,
+  "versionId": "bb2ea3c0-7a76-4c0f-bf4f-79f1cb2f0f51",
+  "id": "medintelligence-rag-ingest-mysql-producao",
+  "tags": []
+}

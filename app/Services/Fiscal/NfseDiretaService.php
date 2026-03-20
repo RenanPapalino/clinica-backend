@@ -97,7 +97,9 @@ class NfseDiretaService
         // Dados do Serviço (Valores)
         $servico = $dom->createElement('Servico');
         $valores = $dom->createElement('Valores');
-        $valores->appendChild($dom->createElement('ValorServicos', number_format($fatura->valor_total, 2, '.', '')));
+        $valorServicos = $fatura->valor_servicos ?? $fatura->valor_total ?? 0;
+
+        $valores->appendChild($dom->createElement('ValorServicos', number_format($valorServicos, 2, '.', '')));
         $valores->appendChild($dom->createElement('IssRetido', $fatura->iss_retido ? 1 : 2));
         $servico->appendChild($valores);
         

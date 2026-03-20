@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Actions\Financeiro\BaixarTituloAction;
 use App\Http\Controllers\Controller;
 use App\Models\Titulo;
 use App\Models\Cliente;
@@ -9,10 +10,103 @@ use App\Models\Cobranca;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Storage;
 use Carbon\Carbon;
 
 class CobrancaController extends Controller
 {
+    public function __construct(
+        private readonly BaixarTituloAction $baixarTituloAction,
+    ) {
+    }
+
+    /**
+     * Histórico e visão operacional de cobranças enviadas.
+     */
+    public function index(Request $request)
+    {
+        $query = $this->buildHistoricoQuery($request);
+        $limit = max(1, min((int) $request->input('limit', 50), 200));
+
+        $cobrancas = $query
+            ->limit($limit)
+            ->get()
+            ->map(fn (Cobranca $cobranca) => $this->serializeCobranca($cobranca))
+            ->values();
+
+        $statsQuery = $this->buildHistoricoQuery($request);
+        $stats = [
+            'total_registros' => (clone $statsQuery)->count(),
+            'enviadas' => (clone $statsQuery)->where('status', 'enviada')->count(),
+            'pagas' => (clone $statsQuery)->where('status', 'paga')->count(),
+            'falhas' => (clone $statsQuery)->where('status', 'falha')->count(),
+            'valor_cobrado' => (float) ((clone $statsQuery)->sum('valor_cobrado') ?? 0),
+        ];
+
+        return response()->json([
+            'success' => true,
+            'data' => $cobrancas,
+            'stats' => $stats,
+        ]);
+    }
+
+    /**
+     * Exporta relatório simples de cobranças.
+     */
+    public function relatorio(Request $request)
+    {
+        $query = $this->buildHistoricoQuery($request);
+        $cobrancas = $query->get();
+        $format = $request->input('format', 'csv');
+
+        if ($format !== 'csv') {
+            return response()->json([
+                'success' => true,
+                'data' => $cobrancas->map(fn (Cobranca $cobranca) => $this->serializeCobranca($cobranca)),
+            ]);
+        }
+
+        $filename = 'relatorio_cobrancas_' . now()->format('Y-m-d_His') . '.csv';
+
+        return response()->streamDownload(function () use ($cobrancas) {
+            $handle = fopen('php://output', 'w');
+
+            fputcsv($handle, [
+                'id',
+                'cliente',
+                'meio',
+                'canal',
+                'status',
+                'titulo',
+                'fatura',
+                'valor_cobrado',
+                'data_envio',
+                'data_pagamento',
+                'descricao',
+            ], ';');
+
+            foreach ($cobrancas as $cobranca) {
+                fputcsv($handle, [
+                    $cobranca->id,
+                    $cobranca->cliente?->razao_social,
+                    $cobranca->meio,
+                    $cobranca->canal,
+                    $cobranca->status,
+                    $cobranca->titulo?->numero_titulo ?? $cobranca->titulo_id,
+                    $cobranca->fatura?->numero_fatura ?? $cobranca->fatura_id,
+                    number_format((float) ($cobranca->valor_cobrado ?? 0), 2, ',', '.'),
+                    $cobranca->data_envio?->format('d/m/Y H:i'),
+                    $cobranca->data_pagamento?->format('d/m/Y H:i'),
+                    $cobranca->descricao,
+                ], ';');
+            }
+
+            fclose($handle);
+        }, $filename, [
+            'Content-Type' => 'text/csv; charset=utf-8',
+        ]);
+    }
+
     /**
      * Retorna clientes inadimplentes
      */
@@ -88,13 +182,7 @@ class CobrancaController extends Controller
     public function enviarWhatsApp(Request $request, $clienteId)
     {
         $cliente = Cliente::findOrFail($clienteId);
-        
-        // Busca títulos vencidos do cliente
-        $titulos = Titulo::where('cliente_id', $clienteId)
-            ->where('tipo', 'receber')
-            ->where('status', '!=', 'pago')
-            ->where('data_vencimento', '<', Carbon::now())
-            ->get();
+        $titulos = $this->buscarTitulosVencidosDoCliente((int) $clienteId);
 
         if ($titulos->isEmpty()) {
             return response()->json([
@@ -116,7 +204,7 @@ class CobrancaController extends Controller
                 throw new \Exception('Webhook N8N não configurado');
             }
 
-            $response = Http::post($webhookUrl, [
+            $response = Http::timeout(15)->post($webhookUrl, [
                 'cliente_id' => $cliente->id,
                 'telefone' => $cliente->telefone,
                 'mensagem' => $mensagem,
@@ -130,14 +218,11 @@ class CobrancaController extends Controller
                 })
             ]);
 
-            // Registra cobrança
-            Cobranca::create([
-                'cliente_id' => $cliente->id,
-                'tipo' => 'whatsapp',
-                'mensagem' => $mensagem,
-                'status' => 'enviada',
-                'data_envio' => now()
-            ]);
+            if ($response->failed()) {
+                throw new \RuntimeException('Webhook N8N retornou erro para envio WhatsApp.');
+            }
+
+            $this->registrarCobrancasEnviadas($cliente, $titulos, 'whatsapp', $mensagem);
 
             return response()->json([
                 'success' => true,
@@ -160,12 +245,7 @@ class CobrancaController extends Controller
     public function enviarEmail(Request $request, $clienteId)
     {
         $cliente = Cliente::findOrFail($clienteId);
-        
-        $titulos = Titulo::where('cliente_id', $clienteId)
-            ->where('tipo', 'receber')
-            ->where('status', '!=', 'pago')
-            ->where('data_vencimento', '<', Carbon::now())
-            ->get();
+        $titulos = $this->buscarTitulosVencidosDoCliente((int) $clienteId);
 
         if ($titulos->isEmpty()) {
             return response()->json([
@@ -183,7 +263,7 @@ class CobrancaController extends Controller
                 throw new \Exception('Webhook N8N não configurado');
             }
 
-            $response = Http::post($webhookUrl, [
+            $response = Http::timeout(15)->post($webhookUrl, [
                 'cliente_id' => $cliente->id,
                 'email' => $cliente->email,
                 'razao_social' => $cliente->razao_social,
@@ -197,14 +277,11 @@ class CobrancaController extends Controller
                 })
             ]);
 
-            // Registra cobrança
-            Cobranca::create([
-                'cliente_id' => $cliente->id,
-                'tipo' => 'email',
-                'mensagem' => 'E-mail de cobrança automático',
-                'status' => 'enviada',
-                'data_envio' => now()
-            ]);
+            if ($response->failed()) {
+                throw new \RuntimeException('Webhook N8N retornou erro para envio de e-mail.');
+            }
+
+            $this->registrarCobrancasEnviadas($cliente, $titulos, 'email', 'E-mail de cobrança automático');
 
             return response()->json([
                 'success' => true,
@@ -268,14 +345,16 @@ class CobrancaController extends Controller
             try {
                 $fakeRequest = new Request(['mensagem' => null]);
                 
-                if ($tipo === 'whatsapp') {
-                    $this->enviarWhatsApp($fakeRequest, $data['cliente']->id);
+                $response = $tipo === 'whatsapp'
+                    ? $this->enviarWhatsApp($fakeRequest, $data['cliente']->id)
+                    : $this->enviarEmail($fakeRequest, $data['cliente']->id);
+
+                if ($response->getStatusCode() >= 400 || (($response->getData(true)['success'] ?? false) !== true)) {
+                    throw new \RuntimeException($response->getData(true)['message'] ?? 'Falha no envio da cobrança.');
                 } else {
-                    $this->enviarEmail($fakeRequest, $data['cliente']->id);
+                    $enviados++;
                 }
-                
-                $enviados++;
-                
+
                 // Delay para não sobrecarregar
                 usleep(500000); // 0.5 segundo
                 
@@ -301,7 +380,10 @@ class CobrancaController extends Controller
         // Busca títulos em aberto que ainda não têm boleto registrado
         $titulos = Titulo::where('tipo', 'receber')
             ->where('status', '!=', 'pago')
-            ->whereNull('numero_boleto')
+            ->where(function ($query) {
+                $query->whereNull('nosso_numero')
+                    ->orWhere('nosso_numero', '');
+            })
             ->with('cliente')
             ->get();
 
@@ -310,6 +392,12 @@ class CobrancaController extends Controller
                 'success' => false,
                 'message' => 'Nenhum título disponível para remessa'
             ], 400);
+        }
+
+        $dataEnvio = now();
+
+        foreach ($titulos as $titulo) {
+            $this->prepararTituloParaRemessa($titulo);
         }
 
         // Gera arquivo CNAB240 (simplificado)
@@ -338,6 +426,7 @@ class CobrancaController extends Controller
         // Salva arquivo
         $nomeArquivo = 'remessa_' . date('dmY_His') . '.rem';
         Storage::disk('public')->put('remessas/' . $nomeArquivo, $conteudo);
+        $this->registrarCobrancasRemessa($titulos, $nomeArquivo, $dataEnvio);
 
         return response()->download(
             storage_path('app/public/remessas/' . $nomeArquivo),
@@ -352,7 +441,7 @@ class CobrancaController extends Controller
     public function processarRetorno(Request $request)
     {
         $request->validate([
-            'arquivo' => 'required|file|mimes:ret,txt'
+            'arquivo' => 'required|file|mimes:ret,txt,cnab,rem'
         ]);
 
         $file = $request->file('arquivo');
@@ -373,14 +462,23 @@ class CobrancaController extends Controller
                     $dataPagamento = $this->parseDataCNAB(substr($linha, 137, 8));
                     
                     // Busca título pelo nosso número
-                    $titulo = Titulo::where('numero_boleto', $nossoNumero)->first();
+                    $titulo = Titulo::where('nosso_numero', $nossoNumero)->first();
                     
-                    if ($titulo) {
-                        $titulo->update([
-                            'status' => 'pago',
-                            'data_pagamento' => $dataPagamento,
-                            'valor_pago' => $valorPago
-                        ]);
+                    if ($titulo && $titulo->status !== 'pago') {
+                        $titulo = $this->baixarTituloAction->execute(
+                            $titulo->id,
+                            $valorPago,
+                            $titulo->forma_pagamento,
+                            $dataPagamento,
+                        );
+
+                        Cobranca::where('titulo_id', $titulo->id)
+                            ->whereIn('status', ['pendente', 'enviada'])
+                            ->update([
+                                'status' => 'paga',
+                                'data_pagamento' => $titulo->data_pagamento,
+                            ]);
+
                         $processados++;
                     }
                     
@@ -435,7 +533,7 @@ class CobrancaController extends Controller
 
     private function gerarSegmentoP($titulo)
     {
-        $linha = str_pad("P-{$titulo->id}", 240);
+        $linha = str_pad("P-{$titulo->nosso_numero}", 240);
         return $linha;
     }
 
@@ -464,5 +562,128 @@ class CobrancaController extends Controller
         $mes = substr($dataStr, 2, 2);
         $ano = substr($dataStr, 4, 4);
         return "$ano-$mes-$dia";
+    }
+
+    private function buscarTitulosVencidosDoCliente(int $clienteId)
+    {
+        return Titulo::where('cliente_id', $clienteId)
+            ->where('tipo', 'receber')
+            ->where('status', '!=', 'pago')
+            ->where('data_vencimento', '<', Carbon::now())
+            ->get();
+    }
+
+    private function buildHistoricoQuery(Request $request)
+    {
+        $query = Cobranca::query()
+            ->with([
+                'cliente:id,razao_social,email,telefone',
+                'titulo:id,numero_titulo,data_vencimento',
+                'fatura:id,numero_fatura',
+            ])
+            ->orderByDesc('data_envio')
+            ->orderByDesc('id');
+
+        if ($request->filled('meio')) {
+            $query->where('meio', $request->input('meio'));
+        }
+
+        if ($request->filled('status')) {
+            $query->where('status', $request->input('status'));
+        }
+
+        if ($request->filled('cliente_id')) {
+            $query->where('cliente_id', $request->input('cliente_id'));
+        }
+
+        $query->periodoEnvio(
+            $request->input('inicio'),
+            $request->input('fim')
+        );
+
+        return $query;
+    }
+
+    private function serializeCobranca(Cobranca $cobranca): array
+    {
+        return [
+            'id' => $cobranca->id,
+            'cliente_id' => $cobranca->cliente_id,
+            'cliente_nome' => $cobranca->cliente?->razao_social,
+            'meio' => $cobranca->meio,
+            'canal' => $cobranca->canal,
+            'status' => $cobranca->status,
+            'descricao' => $cobranca->descricao,
+            'valor_cobrado' => (float) ($cobranca->valor_cobrado ?? 0),
+            'data_envio' => $cobranca->data_envio?->toIso8601String(),
+            'data_pagamento' => $cobranca->data_pagamento?->toIso8601String(),
+            'titulo_id' => $cobranca->titulo_id,
+            'titulo_numero' => $cobranca->titulo?->numero_titulo ?? $cobranca->titulo_id,
+            'titulo_vencimento' => $cobranca->titulo?->data_vencimento?->toDateString(),
+            'fatura_id' => $cobranca->fatura_id,
+            'fatura_numero' => $cobranca->fatura?->numero_fatura ?? $cobranca->fatura_id,
+        ];
+    }
+
+    private function prepararTituloParaRemessa(Titulo $titulo): void
+    {
+        if (!empty($titulo->nosso_numero)) {
+            return;
+        }
+
+        $titulo->update([
+            'nosso_numero' => $this->gerarNossoNumeroRemessa($titulo),
+            'forma_pagamento' => $titulo->forma_pagamento ?? 'boleto',
+            'status' => $titulo->status === 'pago' ? 'pago' : 'aberto',
+        ]);
+    }
+
+    private function gerarNossoNumeroRemessa(Titulo $titulo): string
+    {
+        return sprintf(
+            'RM%s%s',
+            now()->format('ymd'),
+            str_pad((string) $titulo->id, 10, '0', STR_PAD_LEFT)
+        );
+    }
+
+    private function registrarCobrancasRemessa($titulos, string $nomeArquivo, Carbon $dataEnvio): void
+    {
+        foreach ($titulos as $titulo) {
+            Cobranca::updateOrCreate(
+                [
+                    'titulo_id' => $titulo->id,
+                    'meio' => 'boleto',
+                    'canal' => 'remessa_cnab',
+                    'status' => 'pendente',
+                ],
+                [
+                    'cliente_id' => $titulo->cliente_id,
+                    'fatura_id' => $titulo->fatura_id,
+                    'descricao' => 'Remessa bancária gerada: ' . $nomeArquivo,
+                    'data_envio' => $dataEnvio,
+                    'valor_cobrado' => (float) ($titulo->valor_saldo ?? $titulo->valor_original),
+                ]
+            );
+        }
+    }
+
+    private function registrarCobrancasEnviadas(Cliente $cliente, $titulos, string $meio, string $descricao): void
+    {
+        $dataEnvio = now();
+
+        foreach ($titulos as $titulo) {
+            Cobranca::create([
+                'cliente_id' => $cliente->id,
+                'fatura_id' => $titulo->fatura_id,
+                'titulo_id' => $titulo->id,
+                'meio' => $meio,
+                'canal' => 'n8n',
+                'descricao' => $descricao,
+                'status' => 'enviada',
+                'data_envio' => $dataEnvio,
+                'valor_cobrado' => (float) ($titulo->valor_saldo ?? $titulo->valor_original),
+            ]);
+        }
     }
 }

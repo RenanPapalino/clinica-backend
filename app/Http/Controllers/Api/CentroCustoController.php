@@ -54,6 +54,14 @@ class CentroCustoController extends Controller
         }
     }
 
+    public function show($id)
+    {
+        return response()->json([
+            'success' => true,
+            'data' => CentroCusto::findOrFail($id),
+        ]);
+    }
+
     public function update(Request $request, $id)
     {
         try {

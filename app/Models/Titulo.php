@@ -15,7 +15,13 @@ class Titulo extends Model
 
     protected $fillable = [
         'cliente_id',
+        'fornecedor_id',
         'fatura_id',
+        'descricao',
+        'tipo',
+        'plano_conta_id',
+        'centro_custo_id',
+        'competencia',
 
         'numero_titulo',
         'nosso_numero',
@@ -45,6 +51,7 @@ class Titulo extends Model
         'data_emissao'    => 'date',
         'data_vencimento' => 'date',
         'data_pagamento'  => 'date',
+        'competencia'     => 'date',
 
         'valor_original'  => 'decimal:2',
         'valor_juros'     => 'decimal:2',
@@ -137,6 +144,10 @@ class Titulo extends Model
 
     public function getResumoAttribute()
     {
+        if (!empty($this->descricao)) {
+            return $this->descricao;
+        }
+
         $numero = $this->numero_titulo ?? $this->id;
         $data = $this->data_vencimento?->format('d/m/Y');
 

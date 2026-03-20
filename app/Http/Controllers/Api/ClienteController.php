@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Actions\Cadastros\CriarClienteAction;
 use App\Http\Controllers\Controller;
 use App\Models\Cliente;
 use Illuminate\Http\Request;
@@ -31,7 +32,7 @@ class ClienteController extends Controller
         ]);
     }
 
-    public function store(Request $request)
+    public function store(Request $request, CriarClienteAction $criarClienteAction)
     {
         try {
             $data = $request->validate([
@@ -46,11 +47,7 @@ class ClienteController extends Controller
                 'status' => 'nullable|in:ativo,inativo',
             ]);
 
-            // Limpa CNPJ
-            $data['cnpj'] = preg_replace('/\D/', '', $data['cnpj']);
-            $data['status'] = $data['status'] ?? 'ativo';
-
-            $cliente = Cliente::create($data);
+            $cliente = $criarClienteAction->execute($data);
 
             return response()->json([
                 'success' => true,

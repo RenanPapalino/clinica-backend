@@ -2,7 +2,9 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Actions\Financeiro\CriarFaturaManualAction;
 use App\Http\Controllers\Controller;
+use App\Http\Resources\FaturaResource;
 use App\Models\Fatura;
 use App\Models\Titulo;
 use App\Models\Cliente;
@@ -20,13 +22,16 @@ class FaturaController extends Controller
 {
     protected $socImportService;
     protected $tributoService;
+    protected $criarFaturaManualAction;
 
     public function __construct(
         SocImportService $socImportService,
-        TributoService $tributoService
+        TributoService $tributoService,
+        CriarFaturaManualAction $criarFaturaManualAction,
     ) {
         $this->socImportService = $socImportService;
         $this->tributoService = $tributoService;
+        $this->criarFaturaManualAction = $criarFaturaManualAction;
     }
 
     // ... (index, show, destroy mantidos iguais, focarei nas mudanças) ...
@@ -34,7 +39,7 @@ class FaturaController extends Controller
     public function index(Request $request)
     {
         try {
-            $query = Fatura::with(['cliente', 'itens']);
+            $query = Fatura::with(['cliente', 'itens', 'titulos']);
             
             if ($request->filled('status')) {
                 $query->where('status', $request->status);
@@ -46,7 +51,7 @@ class FaturaController extends Controller
     
             return response()->json([
                 'success' => true,
-                'data'    => $faturas,
+                'data'    => FaturaResource::collection($faturas),
             ]);
         } catch (\Throwable $e) {
             return response()->json([
@@ -59,9 +64,54 @@ class FaturaController extends Controller
     public function show($id)
     {
         try {
-            return response()->json(['success' => true, 'data' => Fatura::with(['cliente', 'itens'])->findOrFail($id)]);
+            return response()->json([
+                'success' => true,
+                'data' => new FaturaResource(Fatura::with(['cliente', 'itens', 'titulos'])->findOrFail($id)),
+            ]);
         } catch (\Exception $e) {
             return response()->json(['success' => false, 'message' => 'Fatura não encontrada'], 404);
+        }
+    }
+
+    public function update(Request $request, $id)
+    {
+        try {
+            $fatura = Fatura::with(['cliente', 'itens', 'titulos'])->findOrFail($id);
+
+            $data = $request->validate([
+                'data_emissao' => 'sometimes|date',
+                'data_vencimento' => 'sometimes|date',
+                'periodo_referencia' => 'sometimes|string|max:50',
+                'valor_servicos' => 'sometimes|numeric|min:0',
+                'valor_descontos' => 'sometimes|numeric|min:0',
+                'valor_acrescimos' => 'sometimes|numeric|min:0',
+                'valor_iss' => 'sometimes|numeric|min:0',
+                'valor_total' => 'sometimes|numeric|min:0',
+                'status' => 'sometimes|string|max:20',
+                'observacoes' => 'nullable|string',
+            ]);
+
+            $statusAnterior = $fatura->status;
+            $fatura->fill($data);
+            $fatura->save();
+
+            if (
+                array_key_exists('status', $data)
+                && $data['status'] === 'emitida'
+                && $statusAnterior !== 'emitida'
+            ) {
+                $fatura->gerarTituloPadrao();
+            }
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Fatura atualizada com sucesso.',
+                'data' => new FaturaResource($fatura->fresh(['cliente', 'itens', 'titulos'])),
+            ]);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            return response()->json(['success' => false, 'errors' => $e->errors()], 422);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'message' => 'Erro ao atualizar fatura: ' . $e->getMessage()], 500);
         }
     }
 
@@ -89,67 +139,21 @@ class FaturaController extends Controller
             'data_vencimento' => 'required|date',
             'periodo_referencia' => 'required|string',
             'itens'           => 'required|array|min:1',
+            'itens.*.servico_id' => 'nullable|exists:servicos,id',
             'itens.*.descricao' => 'required|string',
             'itens.*.valor_unitario' => 'required|numeric',
             'itens.*.quantidade' => 'required|numeric',
         ]);
 
         try {
-            DB::beginTransaction();
+            $fatura = $this->criarFaturaManualAction->execute($data);
 
-            // Calcula total bruto
-            $valorBruto = collect($data['itens'])->sum(fn($i) => $i['quantidade'] * $i['valor_unitario']);
-            
-            // Busca cliente para cálculo fiscal
-            $cliente = Cliente::findOrFail($data['cliente_id']);
-            
-            // Calcula impostos automaticamente
-            $impostos = $this->tributoService->calcularRetencoes($valorBruto, $cliente);
-
-            $fatura = Fatura::create([
-                'cliente_id' => $cliente->id,
-                'numero_fatura' => 'FAT-' . date('Ym') . '-' . str_pad(rand(1, 9999), 4, '0', STR_PAD_LEFT),
-                'data_emissao' => $data['data_emissao'],
-                'data_vencimento' => $data['data_vencimento'],
-                'periodo_referencia' => $data['periodo_referencia'],
-                'valor_servicos' => $valorBruto,
-                'valor_total' => $impostos['valor_liquido'], // Valor líquido real
-                'iss_retido' => $impostos['iss'],
-                'status' => 'pendente', // Padrão correto
-            ]);
-
-            foreach ($data['itens'] as $idx => $item) {
-                FaturaItem::create([
-                    'fatura_id' => $fatura->id,
-                    'servico_id' => $item['servico_id'] ?? null,
-                    'item_numero' => $idx + 1,
-                    'descricao' => $item['descricao'],
-                    'quantidade' => $item['quantidade'],
-                    'valor_unitario' => $item['valor_unitario'],
-                    'valor_total' => $item['quantidade'] * $item['valor_unitario'],
-                ]);
-            }
-
-            // Gera Título Financeiro Automaticamente
-            Titulo::create([
-                'cliente_id' => $cliente->id,
-                'fatura_id' => $fatura->id,
-                'descricao' => "Fatura #{$fatura->numero_fatura}",
-                'numero_titulo' => $fatura->numero_fatura,
-                'valor_original' => $fatura->valor_total,
-                'valor_saldo' => $fatura->valor_total,
-                'data_emissao' => $fatura->data_emissao,
-                'data_vencimento' => $fatura->data_vencimento,
-                'status' => 'aberto',
-                'tipo' => 'receber',
-                'plano_conta_id' => $cliente->plano_conta_padrao_id ?? 1 // Pega do cadastro ou padrão
-            ]);
-
-            DB::commit();
-            return response()->json(['success' => true, 'data' => $fatura], 201);
+            return response()->json([
+                'success' => true,
+                'data' => new FaturaResource($fatura),
+            ], 201);
 
         } catch (\Exception $e) {
-            DB::rollBack();
             return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
         }
     }
@@ -199,7 +203,7 @@ class FaturaController extends Controller
                     'data_vencimento' => now()->addDays($cliente->prazo_pagamento ?? 15),
                     'valor_servicos' => $valorBruto,
                     'valor_total' => $impostos['valor_liquido'],
-                    'iss_retido' => $impostos['iss'],
+                    'valor_iss' => $impostos['iss'],
                     'status' => 'pendente',
                     'observacoes' => "Importado via SOC (Lote)"
                 ]);
@@ -218,20 +222,8 @@ class FaturaController extends Controller
                     }
                 }
 
-                // Título Financeiro
-                Titulo::create([
-                    'cliente_id' => $cliente->id,
-                    'fatura_id' => $fatura->id,
-                    'descricao' => "Fatura #{$fatura->numero_fatura}",
-                    'numero_titulo' => $fatura->numero_fatura,
-                    'valor_original' => $fatura->valor_total,
-                    'valor_saldo' => $fatura->valor_total,
-                    'data_emissao' => $fatura->data_emissao,
-                    'data_vencimento' => $fatura->data_vencimento,
-                    'status' => 'aberto',
-                    'tipo' => 'receber',
-                    'plano_conta_id' => $cliente->plano_conta_padrao_id ?? 1
-                ]);
+                $fatura->loadMissing('cliente');
+                $fatura->gerarTituloPadrao();
 
                 $geradas++;
             }
@@ -275,7 +267,7 @@ class FaturaController extends Controller
             $fatura->update([
                 'valor_servicos' => $novoBruto,
                 'valor_total' => $impostos['valor_liquido'],
-                'iss_retido' => $impostos['iss']
+                'valor_iss' => $impostos['iss']
             ]);
 
             // Atualiza título se existir
@@ -284,7 +276,10 @@ class FaturaController extends Controller
                 'valor_saldo' => $fatura->valor_total // Assume que não foi pago ainda
             ]);
 
-            return response()->json(['success' => true, 'data' => $fatura->fresh()]);
+            return response()->json([
+                'success' => true,
+                'data' => new FaturaResource($fatura->fresh(['cliente', 'itens', 'titulos'])),
+            ]);
 
         } catch (\Exception $e) {
             return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
@@ -339,7 +334,7 @@ class FaturaController extends Controller
     public function emitirNfse(Request $request, $id)
     {
         try {
-            $fatura = Fatura::with(['cliente', 'itens'])->findOrFail($id);
+            $fatura = Fatura::with(['cliente', 'itens', 'titulos'])->findOrFail($id);
 
             if ($fatura->nfse_emitida) {
                 return response()->json(['success' => false, 'message' => 'NFS-e já emitida.'], 400);
@@ -389,7 +384,10 @@ class FaturaController extends Controller
             return response()->json([
                 'success' => true,
                 'message' => 'NFSe registrada localmente. Envio à prefeitura não realizado neste ambiente.',
-                'data' => $nfse
+                'data' => [
+                    'nfse' => $nfse,
+                    'fatura' => new FaturaResource($fatura->fresh(['cliente', 'itens', 'titulos'])),
+                ],
             ]);
 
         } catch (\Exception $e) {

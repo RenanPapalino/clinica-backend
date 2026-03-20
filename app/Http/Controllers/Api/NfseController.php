@@ -15,6 +15,70 @@ use Illuminate\Support\Str;
 class NfseController extends Controller
 {
     /**
+     * Apura guias fiscais a partir das NFS-e emitidas na competência.
+     * GET /nfse/guias?competencia=YYYY-MM
+     */
+    public function guias(Request $request)
+    {
+        $data = $request->validate([
+            'competencia' => ['nullable', 'date_format:Y-m'],
+        ]);
+
+        $competencia = $data['competencia'] ?? now()->format('Y-m');
+        $inicio = Carbon::createFromFormat('Y-m', $competencia)->startOfMonth();
+        $fim = $inicio->copy()->endOfMonth();
+
+        $notas = Nfse::query()
+            ->where('status', 'emitida')
+            ->whereBetween('data_emissao', [$inicio, $fim])
+            ->orderBy('data_emissao')
+            ->get();
+
+        $baseCalculo = (float) $notas->sum(fn (Nfse $nfse) => (float) ($nfse->valor_servicos ?? $nfse->valor_liquido ?? 0));
+        $valorIss = (float) $notas->sum(fn (Nfse $nfse) => (float) ($nfse->valor_iss ?? 0));
+        $valorRetencoes = (float) $notas->sum(fn (Nfse $nfse) => (float) ($nfse->valor_deducoes ?? 0));
+        $dataVencimento = $inicio->copy()->addMonthNoOverflow()->day(10)->toDateString();
+
+        $guias = [];
+
+        if ($valorIss > 0) {
+            $guias[] = [
+                'id' => "iss-{$competencia}",
+                'tipo' => 'ISS',
+                'competencia' => $competencia,
+                'base_calculo' => round($baseCalculo, 2),
+                'valor_imposto' => round($valorIss, 2),
+                'data_vencimento' => $dataVencimento,
+                'status' => 'apurado',
+            ];
+        }
+
+        if ($valorRetencoes > 0) {
+            $guias[] = [
+                'id' => "retencoes-{$competencia}",
+                'tipo' => 'Retenções',
+                'competencia' => $competencia,
+                'base_calculo' => round($baseCalculo, 2),
+                'valor_imposto' => round($valorRetencoes, 2),
+                'data_vencimento' => $dataVencimento,
+                'status' => 'apurado',
+            ];
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => $guias,
+            'meta' => [
+                'competencia' => $competencia,
+                'notas_emitidas' => $notas->count(),
+                'total_base_calculo' => round($baseCalculo, 2),
+                'total_iss' => round($valorIss, 2),
+                'total_retencoes' => round($valorRetencoes, 2),
+            ],
+        ]);
+    }
+
+    /**
      * Lista NFSe (com filtros)
      * GET /nfse
      */

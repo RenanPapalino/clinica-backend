@@ -10,9 +10,23 @@ use App\Models\Titulo;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\DB; // <--- Importar DB
+use Illuminate\Support\Facades\Log;
 
 class N8nController extends Controller
 {
+    public function webhook(Request $request)
+    {
+        Log::info('Webhook N8N recebido', [
+            'headers' => $request->headers->all(),
+            'payload' => $request->all(),
+        ]);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Webhook recebido com sucesso.',
+        ], 202);
+    }
+
     /**
      * Buscar cliente por CNPJ
      */

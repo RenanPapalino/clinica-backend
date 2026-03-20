@@ -2,11 +2,13 @@
 
 namespace App\Http\Controllers\Api;
 
+use DomainException;
+use App\Actions\Financeiro\BaixarTituloAction;
+use App\Actions\Financeiro\CriarTituloAction;
 use App\Http\Controllers\Controller;
 use App\Models\Titulo;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
-use Illuminate\Support\Facades\DB;
 use App\Services\Bancos\ItauService;
 
 class TituloController extends Controller
@@ -60,92 +62,49 @@ class TituloController extends Controller
     /**
      * Cria um novo título (Unificado: Simples + Rateio + Transação)
      */
-    public function store(Request $request)
+    public function store(Request $request, CriarTituloAction $criarTituloAction)
     {
-        // 1. Validação Completa (Campos Básicos + Campos de Rateio)
         $data = $request->validate([
-            // Campos Básicos
-            'descricao'       => ['required', 'string', 'max:255'], // Adicionado descricao que é obrigatório
-            'cliente_id'      => ['nullable', 'exists:clientes,id'], // Nullable pois pode ser contas a pagar
-            'fornecedor_id'   => ['nullable', 'exists:fornecedores,id'], // Novo para contas a pagar
+            'descricao'       => ['required', 'string', 'max:255'],
+            'cliente_id'      => ['nullable', 'exists:clientes,id'],
+            'fornecedor_id'   => ['nullable', 'exists:fornecedores,id'],
             'fatura_id'       => ['nullable', 'exists:faturas,id'],
-            'plano_conta_id'  => ['nullable', 'exists:planos_contas,id'], // Classificação principal
-            'centro_custo_id' => ['nullable', 'exists:centros_custo,id'], // Classificação principal
-            
-            'numero_titulo'   => ['nullable', 'string', 'max:50'], // Pode ser gerado auto
+            'plano_conta_id'  => ['nullable', 'exists:planos_contas,id'],
+            'centro_custo_id' => ['nullable', 'exists:centros_custo,id'],
+            'numero_titulo'   => ['nullable', 'string', 'max:50'],
             'nosso_numero'    => ['nullable', 'string', 'max:50'],
             'data_emissao'    => ['required', 'date'],
             'data_vencimento' => ['required', 'date'],
-            'competencia'     => ['nullable', 'date'], // Importante para DRE
-            
+            'competencia'     => ['nullable', 'date'],
             'valor_original'  => ['required', 'numeric', 'min:0.01'],
             'valor_juros'     => ['nullable', 'numeric', 'min:0'],
             'valor_multa'     => ['nullable', 'numeric', 'min:0'],
             'valor_desconto'  => ['nullable', 'numeric', 'min:0'],
-            
             'status'          => ['required', 'string', 'max:20'],
-            'tipo'            => ['required', 'in:pagar,receber'], // Obrigatório saber se entra ou sai
+            'tipo'            => ['required', 'in:pagar,receber'],
             'forma_pagamento' => ['nullable', 'string', 'max:30'],
-            
             'codigo_barras'   => ['nullable', 'string', 'max:255'],
             'linha_digitavel' => ['nullable', 'string', 'max:255'],
             'url_boleto'      => ['nullable', 'string', 'max:255'],
             'observacoes'     => ['nullable', 'string'],
-
-            // Campos de Rateio (Array opcional)
             'rateios'                   => ['nullable', 'array'],
             'rateios.*.plano_conta_id'  => ['required_with:rateios', 'exists:planos_contas,id'],
             'rateios.*.centro_custo_id' => ['nullable', 'exists:centros_custo,id'],
             'rateios.*.valor'           => ['required_with:rateios', 'numeric', 'min:0.01'],
+            'rateios.*.percentual'      => ['nullable', 'numeric', 'min:0'],
+            'rateios.*.historico'       => ['nullable', 'string', 'max:255'],
         ]);
 
-        // Valores padrão para evitar null em cálculos
-        $data['valor_juros']    = $data['valor_juros']    ?? 0;
-        $data['valor_multa']    = $data['valor_multa']    ?? 0;
-        $data['valor_desconto'] = $data['valor_desconto'] ?? 0;
-        $data['valor_pago']     = 0;
-        $data['valor_saldo']    = $data['valor_original']; // Saldo inicial é o total
-        
-        // Se não enviou numero_titulo, gera um provisório
-        if (empty($data['numero_titulo'])) {
-            $data['numero_titulo'] = 'TIT-' . time();
-        }
-
-        // INÍCIO DA TRANSAÇÃO (Garante integridade do Rateio)
-        return DB::transaction(function () use ($data) {
-            
-            // 1. Cria o Título
-            $titulo = Titulo::create($data);
-
-            // 2. Processa os Rateios (se houver)
-            if (!empty($data['rateios'])) {
-                $somaRateio = 0;
-                
-                foreach ($data['rateios'] as $rateio) {
-                    $titulo->rateios()->create([
-                        'plano_conta_id'  => $rateio['plano_conta_id'],
-                        'centro_custo_id' => $rateio['centro_custo_id'] ?? null,
-                        'valor'           => $rateio['valor'],
-                        'percentual'      => ($rateio['valor'] / $data['valor_original']) * 100,
-                        'historico'       => 'Rateio automático na criação'
-                    ]);
-                    $somaRateio += $rateio['valor'];
-                }
-
-                // Validação de Integridade Financeira
-                // Aceita diferença de 1 centavo para arredondamentos
-                if (abs($somaRateio - $data['valor_original']) > 0.01) {
-                    // Opcional: Lançar erro ou criar um rateio de "Diferença"
-                    // throw new \Exception("A soma do rateio (R$ $somaRateio) difere do valor do título (R$ {$data['valor_original']}).");
-                }
-            }
-
+        try {
+            $titulo = $criarTituloAction->execute($data);
             return response()->json([
                 'success' => true,
                 'message' => 'Título criado com sucesso.',
-                'data' => $titulo->fresh(['cliente', 'fornecedor', 'rateios']),
+                'data' => $titulo,
             ], 201);
-        });
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'message' => 'Erro ao criar título: ' . $e->getMessage()], 500);
+        }
     }
 
     /**
@@ -234,7 +193,7 @@ class TituloController extends Controller
     /**
      * Baixar título (registrar pagamento)
      */
-    public function baixar(Request $request, $id)
+    public function baixar(Request $request, $id, BaixarTituloAction $baixarTituloAction)
     {
         $data = $request->validate([
             'valor'           => ['required', 'numeric', 'min:0.01'],
@@ -242,44 +201,24 @@ class TituloController extends Controller
             'data_pagamento'  => ['nullable', 'date'],
         ]);
 
-        return DB::transaction(function () use ($request, $id, $data) {
-            try {
-                $titulo = Titulo::lockForUpdate()->findOrFail($id);
+        try {
+            $titulo = $baixarTituloAction->execute(
+                (int) $id,
+                (float) $data['valor'],
+                $data['forma_pagamento'] ?? null,
+                $data['data_pagamento'] ?? null,
+            );
 
-                if ($titulo->status === 'pago') {
-                    return response()->json(['success' => false, 'message' => 'Título já está pago.'], 400);
-                }
-
-                $valorBaixa = (float) $data['valor'];
-                
-                // Atualiza valores
-                $titulo->valor_pago = ($titulo->valor_pago ?? 0) + $valorBaixa;
-                
-                // Recalcula saldo: (Original + Juros + Multa) - (Desconto + Pago)
-                $totalDevido = ($titulo->valor_original + ($titulo->valor_juros ?? 0) + ($titulo->valor_multa ?? 0)) - ($titulo->valor_desconto ?? 0);
-                $titulo->valor_saldo = max(0, $totalDevido - $titulo->valor_pago);
-
-                // Define status
-                if ($titulo->valor_saldo <= 0.01) { // Margem de segurança para float
-                    $titulo->status = 'pago';
-                    $titulo->valor_saldo = 0;
-                } else {
-                    $titulo->status = 'parcial';
-                }
-
-                $titulo->data_pagamento = $data['data_pagamento'] ?? now();
-                $titulo->save();
-
-                return response()->json([
-                    'success' => true,
-                    'message' => 'Baixa registrada com sucesso.',
-                    'data' => $titulo->fresh(),
-                ]);
-
-            } catch (\Exception $e) {
-                throw $e;
-            }
-        });
+            return response()->json([
+                'success' => true,
+                'message' => 'Baixa registrada com sucesso.',
+                'data' => $titulo,
+            ]);
+        } catch (DomainException $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 400);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'message' => 'Erro ao baixar título: ' . $e->getMessage()], 500);
+        }
     }
 
     /**

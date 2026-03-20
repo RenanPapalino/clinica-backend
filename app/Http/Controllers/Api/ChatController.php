@@ -2,6 +2,9 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Actions\Cadastros\CriarClienteAction;
+use App\Actions\Financeiro\CriarDespesaAction;
+use App\Actions\Financeiro\CriarTituloAction;
 use App\Http\Controllers\Controller;
 use App\Models\ChatMessage;
 use App\Models\Cliente;
@@ -9,8 +12,9 @@ use App\Models\OrdemServico;
 use App\Models\OrdemServicoItem;
 use App\Models\OrdemServicoRateio;
 use App\Models\Fatura;
+use App\Services\Ai\AiChatGatewayService;
+use App\Services\GoogleDriveFileMirrorService;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -24,7 +28,7 @@ class ChatController extends Controller
 
     /**
      * =========================================================================
-     * 1. FLUXO DE CHAT (ENVIO DE MENSAGEM PARA N8N)
+     * 1. FLUXO DE CHAT (ENVIO DE MENSAGEM PARA O RUNTIME DE IA)
      * =========================================================================
      */
     public function enviarMensagem(Request $request)
@@ -39,6 +43,7 @@ class ChatController extends Controller
             $mensagem = trim($request->input('mensagem', ''));
             $tipoProcessamento = $request->input('tipo_processamento', 'auto');
             $arquivoData = null;
+            $arquivoIngestao = null;
 
             // 1.1 Processamento e Validação de Arquivo
             if ($request->hasFile('arquivo') && $request->file('arquivo')->isValid()) {
@@ -55,6 +60,21 @@ class ChatController extends Controller
                     'tamanho'   => $arquivo->getSize(),
                     'base64'    => base64_encode(file_get_contents($arquivo->getRealPath())),
                 ];
+
+                $arquivoIngestao = $this->espelharArquivoNoDriveSeSolicitado(
+                    request: $request,
+                    userId: $user->id,
+                    sessionId: $sessionId,
+                    tipoProcessamento: $tipoProcessamento,
+                );
+
+                if (($arquivoIngestao['required'] ?? false) && !($arquivoIngestao['success'] ?? false)) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => $arquivoIngestao['message'] ?? 'Falha ao enviar arquivo para o Google Drive.',
+                        'arquivo_ingestao' => $arquivoIngestao,
+                    ], 502);
+                }
             }
 
             // Validação: Não pode enviar nada vazio
@@ -70,7 +90,10 @@ class ChatController extends Controller
                 'role'       => 'user',
                 'content'    => $conteudoLog,
                 'session_id' => $sessionId,
-                'metadata'   => $arquivoData ? ['file_name' => $arquivoData['nome']] : null
+                'metadata'   => $arquivoData ? array_filter([
+                    'file_name' => $arquivoData['nome'],
+                    'drive_ingestion' => $arquivoIngestao,
+                ]) : null
             ]);
 
             // Respostas rápidas locais (consultas simples a clientes/faturas/OS)
@@ -92,11 +115,12 @@ class ChatController extends Controller
                     'created_at'         => $chatMessage->created_at->toISOString(),
                     'dados_estruturados' => null,
                     'acao_sugerida'      => null,
+                    'arquivo_ingestao'   => $arquivoIngestao,
                 ]);
             }
 
             // 1.3 Envio para N8N (Core Logic)
-            $respostaIa = $this->conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tipoProcessamento);
+            $respostaIa = $this->conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tipoProcessamento, $arquivoIngestao);
 
             // 1.4 Persistência da Resposta da IA
             $chatMessage = ChatMessage::create([
@@ -115,6 +139,7 @@ class ChatController extends Controller
                 'created_at'         => $chatMessage->created_at->toISOString(),
                 'dados_estruturados' => $respostaIa['dados_estruturados'] ?? null,
                 'acao_sugerida'      => $respostaIa['acao_sugerida'] ?? null,
+                'arquivo_ingestao'   => $arquivoIngestao,
             ]);
 
         } catch (\Throwable $e) {
@@ -123,59 +148,184 @@ class ChatController extends Controller
         }
     }
 
-    /**
-     * Comunicação HTTP com o N8N
-     */
-private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tipoProcessamento): array
+    public function historico(Request $request)
     {
-        // Define Rota: Se tem arquivo, vai para rota de arquivo. Se não, rota de chat.
+        $user = $request->user();
+        if (!$user) {
+            return response()->json(['success' => false, 'message' => 'Usuário não autenticado.'], 401);
+        }
+
+        $limit = max(1, min((int) $request->input('limit', 50), 200));
+        $sessionId = $request->input('session_id');
+
+        $query = ChatMessage::where('user_id', $user->id)
+            ->orderByDesc('created_at');
+
+        if (!empty($sessionId)) {
+            $query->where('session_id', $sessionId);
+        }
+
+        $mensagens = $query->limit($limit)->get()->reverse()->values();
+
+        return response()->json([
+            'success' => true,
+            'data' => $mensagens,
+        ]);
+    }
+
+    public function limparHistorico(Request $request)
+    {
+        $user = $request->user();
+        if (!$user) {
+            return response()->json(['success' => false, 'message' => 'Usuário não autenticado.'], 401);
+        }
+
+        $sessionId = $request->input('session_id');
+
+        $query = ChatMessage::where('user_id', $user->id);
+        if (!empty($sessionId)) {
+            $query->where('session_id', $sessionId);
+        }
+
+        $apagadas = $query->delete();
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Histórico removido com sucesso.',
+            'apagadas' => $apagadas,
+        ]);
+    }
+
+    /**
+     * Comunicação HTTP com o runtime configurado (LangChain ou N8N)
+     */
+private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tipoProcessamento, $arquivoIngestao = null): array
+    {
         $isArquivo = !empty($arquivoData);
-        $webhookUrl = $isArquivo ? env('N8N_WEBHOOK_URL') : env('N8N_WEBHOOK_CHAT_URL');
-        $timeout = $isArquivo ? 600 : 120; // Mais tempo para arquivos
-        $rotaNome = $isArquivo ? "ARQUIVO" : "CHAT";
+        $payload = [
+            'mensagem'           => $mensagem,
+            'user_id'            => $user->id,
+            'user_name'          => $user->name,
+            'user_email'         => $user->email ?? null,
+            'session_id'         => $sessionId,
+            'historico'          => $this->carregarHistoricoContexto($user->id, $sessionId),
+            'tipo_processamento' => $tipoProcessamento,
+            'timestamp'          => now()->toISOString(),
+            'contexto'           => [
+                'origem' => 'laravel_chat_gateway',
+                'timezone' => config('app.timezone'),
+                'acoes_confirmaveis' => [
+                    'criar_cliente',
+                    'criar_despesa',
+                    'criar_conta_pagar',
+                    'criar_conta_receber',
+                    'importar_clientes',
+                    'gerar_os',
+                ],
+                'fontes' => [
+                    'mysql_operacional' => true,
+                    'vector_store_documental' => true,
+                ],
+                'arquivo_ingestao' => $arquivoIngestao,
+            ],
+        ];
 
-        Log::info("📡 Enviando para N8N [{$rotaNome}]", ['url' => $webhookUrl]);
+        if ($isArquivo) {
+            $payload['arquivo'] = $arquivoData;
+        }
 
-        if (!$webhookUrl) {
-            return ['mensagem' => "⚠️ Erro de Configuração: Webhook {$rotaNome} não definido no .env.", 'dados_estruturados' => null];
+        /** @var AiChatGatewayService $gateway */
+        $gateway = app(AiChatGatewayService::class);
+        $resultado = $gateway->processarChat($payload, $isArquivo);
+
+        if (!$resultado['success']) {
+            return [
+                'mensagem' => $resultado['message'] ?? '❌ Falha de conexão com IA.',
+                'dados_estruturados' => null,
+            ];
+        }
+
+        $body = $resultado['body'];
+        $normalizado = $this->normalizarRespostaIa($body);
+
+        return [
+            'mensagem'           => $normalizado['mensagem'] ?? (is_string($body) ? $body : json_encode($body)),
+            'dados_estruturados' => $normalizado['dados_estruturados'] ?? null,
+            'acao_sugerida'      => $normalizado['acao_sugerida'] ?? ($normalizado['dados_estruturados']['acao_sugerida'] ?? null),
+        ];
+    }
+
+    private function carregarHistoricoContexto(int $userId, string $sessionId, int $limit = 12): array
+    {
+        return ChatMessage::query()
+            ->where('user_id', $userId)
+            ->where('session_id', $sessionId)
+            ->orderByDesc('created_at')
+            ->limit($limit)
+            ->get()
+            ->reverse()
+            ->map(function (ChatMessage $message) {
+                return [
+                    'role' => $message->role,
+                    'content' => $message->content,
+                    'created_at' => $message->created_at?->toISOString(),
+                ];
+            })
+            ->values()
+            ->all();
+    }
+
+    private function espelharArquivoNoDriveSeSolicitado(Request $request, int $userId, string $sessionId, string $tipoProcessamento): ?array
+    {
+        $espelhar = $request->has('espelhar_no_drive')
+            ? $request->boolean('espelhar_no_drive')
+            : (bool) config('chatbot.chat_upload.mirror_to_drive');
+
+        if (!$espelhar || !$request->hasFile('arquivo') || !$request->file('arquivo')->isValid()) {
+            return null;
+        }
+
+        $required = $request->has('drive_required')
+            ? $request->boolean('drive_required')
+            : (bool) config('chatbot.chat_upload.mirror_to_drive_required');
+
+        /** @var GoogleDriveFileMirrorService $mirror */
+        $mirror = app(GoogleDriveFileMirrorService::class);
+
+        if (!$mirror->isConfigured()) {
+            return [
+                'success' => false,
+                'attempted' => true,
+                'required' => $required,
+                'provider' => 'google_drive',
+                'message' => 'Integração com Google Drive não configurada.',
+            ];
         }
 
         try {
-            $payload = [
-                'mensagem'           => $mensagem,
-                'user_id'            => $user->id,
-                'user_name'          => $user->name,
-                'user_email'         => $user->email ?? null,
-                'session_id'         => $sessionId,
+            return $mirror->mirrorChatUpload($request->file('arquivo'), [
+                'user_id' => $userId,
+                'session_id' => $sessionId,
                 'tipo_processamento' => $tipoProcessamento,
-                'timestamp'          => now()->toISOString(),
+            ]) + [
+                'attempted' => true,
+                'required' => $required,
             ];
-
-            if ($isArquivo) {
-                $payload['arquivo'] = $arquivoData;
-            }
-
-            $response = Http::timeout($timeout)->post($webhookUrl, $payload);
-
-            if (!$response->successful()) {
-                Log::error("❌ Erro N8N {$rotaNome}: " . $response->body());
-                return ['mensagem' => "❌ Erro ao processar (HTTP {$response->status()}).", 'dados_estruturados' => null];
-            }
-
-            // Processa o retorno JSON
-            $body = $response->json() ?? json_decode($response->body(), true);
-
-            $normalizado = $this->normalizarRespostaN8n($body);
+        } catch (\Throwable $e) {
+            Log::warning('Falha ao espelhar arquivo do chat no Google Drive', [
+                'user_id' => $userId,
+                'session_id' => $sessionId,
+                'tipo_processamento' => $tipoProcessamento,
+                'error' => $e->getMessage(),
+            ]);
 
             return [
-                'mensagem'           => $normalizado['mensagem'] ?? json_encode($body),
-                'dados_estruturados' => $normalizado['dados_estruturados'] ?? null,
-                'acao_sugerida'      => $normalizado['acao_sugerida'] ?? ($normalizado['dados_estruturados']['acao_sugerida'] ?? null)
+                'success' => false,
+                'attempted' => true,
+                'required' => $required,
+                'provider' => 'google_drive',
+                'message' => $e->getMessage(),
             ];
-
-        } catch (\Exception $e) {
-            Log::error('Exceção N8N: ' . $e->getMessage());
-            return ['mensagem' => '❌ Falha de conexão com IA.', 'dados_estruturados' => null];
         }
     }
 
@@ -189,6 +339,10 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
     $inputDados = $request->input('dados', []);
     $acao = $request->input('acao') ?? $request->input('tipo');
     $metadata = $request->input('metadata', []);
+
+    if ($this->deveDelegarConfirmacaoAoRuntime($acao, $metadata)) {
+        return $this->confirmarAcaoNoRuntime($request, $acao, $metadata);
+    }
 
     // 2.1 PASSO CRÍTICO: Extrair a lista real de dentro do JSON complexo
     $dadosParaProcessar = $this->extrairDadosParaProcessamento($inputDados);
@@ -225,12 +379,21 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
             'importar_clientes', 'clientes', 'cadastro_cliente'
                 => $this->processarImportacaoClientes($dadosParaProcessar),
 
+            'criar_cliente', 'cliente'
+                => $this->processarCriacaoClientes($dadosParaProcessar),
+
             // Ordens de serviço
             'gerar_os', 'ordem_servico'
                 => $this->processarImportacaoOrdensServico($dadosParaProcessar),
 
+            'criar_despesa', 'despesa', 'criar_conta_pagar', 'conta_pagar'
+                => $this->processarCriacaoDespesas($dadosParaProcessar, $request->user()?->id),
+
+            'criar_conta_receber', 'titulo_receber', 'criar_titulo_receber'
+                => $this->processarCriacaoTitulos($dadosParaProcessar, 'receber'),
+
             default
-                => $this->processarImportacaoClientes($dadosParaProcessar), // fallback seguro
+                => throw new \InvalidArgumentException("Ação não suportada: {$acao}"),
         };
 
         DB::commit();
@@ -260,6 +423,72 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
         ], 500);
     }
 }
+
+    private function deveDelegarConfirmacaoAoRuntime(?string $acao, array $metadata): bool
+    {
+        if (strtolower((string) config('chatbot.runtime.driver')) !== 'langchain') {
+            return false;
+        }
+
+        if (!is_string($acao) || !in_array($acao, [
+            'criar_cliente',
+            'cliente',
+            'criar_despesa',
+            'despesa',
+            'criar_conta_pagar',
+            'conta_pagar',
+            'criar_conta_receber',
+            'titulo_receber',
+            'criar_titulo_receber',
+        ], true)) {
+            return false;
+        }
+
+        return !empty($metadata['runtime_pending_action_id'])
+            || (($metadata['fonte'] ?? null) === 'langchain-runtime');
+    }
+
+    private function confirmarAcaoNoRuntime(Request $request, ?string $acao, array $metadata)
+    {
+        $user = $request->user();
+        if (!$user) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Usuário não autenticado.',
+            ], 401);
+        }
+
+        /** @var AiChatGatewayService $gateway */
+        $gateway = app(AiChatGatewayService::class);
+        $resultado = $gateway->confirmarAcao([
+            'acao' => $acao,
+            'dados' => $request->input('dados', []),
+            'metadata' => $metadata,
+            'decision' => 'approve',
+            'session_id' => $request->input('session_id', 'session_' . $user->id),
+            'user_id' => $user->id,
+            'user_name' => $user->name,
+            'user_email' => $user->email,
+            'timestamp' => now()->toISOString(),
+        ]);
+
+        if (!$resultado['success']) {
+            return response()->json([
+                'success' => false,
+                'message' => $resultado['message'] ?? 'Falha ao confirmar ação no runtime.',
+                'detalhes' => $resultado['body'] ?? null,
+            ], 502);
+        }
+
+        $body = is_array($resultado['body']) ? $resultado['body'] : [];
+        $status = !empty($body['success']) ? 200 : 422;
+
+        return response()->json([
+            'success' => (bool) ($body['success'] ?? false),
+            'message' => $body['message'] ?? 'Ação processada pelo runtime.',
+            'detalhes' => $body['detalhes'] ?? null,
+        ], $status);
+    }
 
     /**
      * =========================================================================
@@ -567,6 +796,164 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
         ];
     }
 
+    private function processarCriacaoClientes(array $registros): array
+    {
+        /** @var CriarClienteAction $action */
+        $action = app(CriarClienteAction::class);
+
+        $stats = ['criados' => 0, 'erros' => 0];
+        $criados = [];
+        $erros = [];
+
+        foreach ($registros as $index => $row) {
+            if (!is_array($row)) {
+                $stats['erros']++;
+                $erros[] = 'Linha ' . ($index + 1) . ': registro inválido.';
+                continue;
+            }
+
+            try {
+                $payload = $this->normalizarPayloadCliente($row);
+                if (empty($payload['razao_social'])) {
+                    throw new \Exception('Razão social obrigatória.');
+                }
+                if (empty($payload['cnpj'])) {
+                    throw new \Exception('CNPJ obrigatório para criar cliente.');
+                }
+
+                $existente = Cliente::withTrashed()
+                    ->where('cnpj', $payload['cnpj'])
+                    ->first();
+
+                if ($existente) {
+                    if ($existente->trashed()) {
+                        $existente->restore();
+                        $existente->update($payload);
+                        $criados[] = $existente->fresh()->toArray();
+                        $stats['criados']++;
+                        continue;
+                    }
+
+                    throw new \Exception('Cliente já existe para o CNPJ informado.');
+                }
+
+                $cliente = $action->execute($payload);
+
+                $criados[] = $cliente->toArray();
+                $stats['criados']++;
+            } catch (\Exception $e) {
+                $stats['erros']++;
+                $erros[] = 'Linha ' . ($index + 1) . ': ' . $e->getMessage();
+            }
+        }
+
+        return $this->montarRespostaCriacao('cliente(s)', $stats, $criados, $erros);
+    }
+
+    private function processarCriacaoDespesas(array $registros, ?int $userId = null): array
+    {
+        /** @var CriarDespesaAction $action */
+        $action = app(CriarDespesaAction::class);
+
+        $stats = ['criados' => 0, 'erros' => 0];
+        $criados = [];
+        $erros = [];
+
+        foreach ($registros as $index => $row) {
+            if (!is_array($row)) {
+                $stats['erros']++;
+                $erros[] = 'Linha ' . ($index + 1) . ': registro inválido.';
+                continue;
+            }
+
+            try {
+                $payload = $this->normalizarPayloadDespesa($row);
+                if (empty($payload['descricao'])) {
+                    throw new \Exception('Descrição obrigatória para criar despesa.');
+                }
+                if (empty($payload['data_vencimento'])) {
+                    throw new \Exception('Data de vencimento obrigatória.');
+                }
+                if (($payload['valor_original'] ?? 0) <= 0) {
+                    throw new \Exception('Valor da despesa deve ser maior que zero.');
+                }
+
+                $despesa = $action->execute($payload, $userId);
+
+                $criados[] = $despesa->toArray();
+                $stats['criados']++;
+            } catch (\Exception $e) {
+                $stats['erros']++;
+                $erros[] = 'Linha ' . ($index + 1) . ': ' . $e->getMessage();
+            }
+        }
+
+        return $this->montarRespostaCriacao('despesa(s)', $stats, $criados, $erros);
+    }
+
+    private function processarCriacaoTitulos(array $registros, string $tipo): array
+    {
+        /** @var CriarTituloAction $action */
+        $action = app(CriarTituloAction::class);
+
+        $stats = ['criados' => 0, 'erros' => 0];
+        $criados = [];
+        $erros = [];
+
+        foreach ($registros as $index => $row) {
+            if (!is_array($row)) {
+                $stats['erros']++;
+                $erros[] = 'Linha ' . ($index + 1) . ': registro inválido.';
+                continue;
+            }
+
+            try {
+                $payload = $this->normalizarPayloadTitulo($row, $tipo);
+                if (empty($payload['descricao'])) {
+                    throw new \Exception('Descrição obrigatória para criar título.');
+                }
+                if (empty($payload['data_vencimento'])) {
+                    throw new \Exception('Data de vencimento obrigatória.');
+                }
+                if (($payload['valor_original'] ?? 0) <= 0) {
+                    throw new \Exception('Valor do título deve ser maior que zero.');
+                }
+                if ($tipo === 'receber' && empty($payload['cliente_id'])) {
+                    throw new \Exception('Cliente obrigatório para conta a receber.');
+                }
+
+                $titulo = $action->execute($payload);
+
+                $criados[] = $titulo->toArray();
+                $stats['criados']++;
+            } catch (\Exception $e) {
+                $stats['erros']++;
+                $erros[] = 'Linha ' . ($index + 1) . ': ' . $e->getMessage();
+            }
+        }
+
+        $label = $tipo === 'receber' ? 'conta(s) a receber' : 'título(s)';
+
+        return $this->montarRespostaCriacao($label, $stats, $criados, $erros);
+    }
+
+    private function montarRespostaCriacao(string $label, array $stats, array $criados, array $erros): array
+    {
+        $mensagem = "✅ {$stats['criados']} {$label} criada(s).";
+        if (($stats['erros'] ?? 0) > 0) {
+            $mensagem .= " ({$stats['erros']} erro(s)).";
+        }
+
+        return [
+            'message' => $mensagem,
+            'detalhes' => [
+                'resumo' => $stats,
+                'registros' => array_slice($criados, 0, 10),
+                'erros_lista' => array_slice($erros, 0, 5),
+            ],
+        ];
+    }
+
     private function formatarErroBd(\Exception $e): string
     {
         if ($e instanceof QueryException) {
@@ -649,6 +1036,10 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
             if (isset($dados[$chave]) && is_array($dados[$chave])) {
                 return $dados[$chave];
             }
+        }
+
+        if (is_array($dados) && !array_is_list($dados) && !empty($dados)) {
+            return [$dados];
         }
 
         // Se for um único objeto de OS, envelopa em array
@@ -765,6 +1156,193 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
         }
     }
 
+    private function normalizarPayloadCliente(array $row): array
+    {
+        return array_filter([
+            'cnpj' => preg_replace('/\D/', '', (string) ($this->buscarValorFlexivel($row, 'cnpj', 'cliente_cnpj', 'documento') ?? '')),
+            'razao_social' => $this->buscarValorFlexivel($row, 'razao_social', 'cliente', 'empresa', 'nome'),
+            'nome_fantasia' => $this->buscarValorFlexivel($row, 'nome_fantasia', 'fantasia'),
+            'email' => $this->buscarValorFlexivel($row, 'email', 'e-mail'),
+            'telefone' => $this->buscarValorFlexivel($row, 'telefone', 'tel', 'fixo'),
+            'celular' => $this->buscarValorFlexivel($row, 'celular', 'cel', 'whatsapp'),
+            'cep' => preg_replace('/\D/', '', (string) ($this->buscarValorFlexivel($row, 'cep') ?? '')),
+            'logradouro' => $this->buscarValorFlexivel($row, 'logradouro', 'endereco', 'rua'),
+            'numero' => $this->buscarValorFlexivel($row, 'numero', 'num'),
+            'bairro' => $this->buscarValorFlexivel($row, 'bairro'),
+            'cidade' => $this->buscarValorFlexivel($row, 'cidade', 'municipio'),
+            'uf' => strtoupper((string) ($this->buscarValorFlexivel($row, 'uf', 'estado') ?? '')),
+            'status' => $this->buscarValorFlexivel($row, 'status') ?? 'ativo',
+            'observacoes' => $this->buscarValorFlexivel($row, 'observacoes', 'obs'),
+        ], fn ($value) => $value !== null && $value !== '');
+    }
+
+    private function normalizarPayloadDespesa(array $row): array
+    {
+        $valorOriginal = $this->parseMoneyString(
+            $this->buscarValorFlexivel($row, 'valor_original', 'valor', 'valor_total')
+        );
+
+        return array_filter([
+            'fornecedor_id' => $this->resolverFornecedorId($row),
+            'categoria_id' => $this->buscarValorFlexivel($row, 'categoria_id'),
+            'descricao' => $this->buscarValorFlexivel($row, 'descricao', 'historico', 'nome'),
+            'valor' => $valorOriginal,
+            'valor_original' => $valorOriginal,
+            'data_emissao' => $this->normalizarDataEntrada($this->buscarValorFlexivel($row, 'data_emissao', 'emissao')) ?? now()->toDateString(),
+            'data_vencimento' => $this->normalizarDataEntrada($this->buscarValorFlexivel($row, 'data_vencimento', 'vencimento')),
+            'documento_url' => $this->buscarValorFlexivel($row, 'documento_url', 'url_documento'),
+            'observacoes' => $this->buscarValorFlexivel($row, 'observacoes', 'obs'),
+            'codigo_barras' => $this->buscarValorFlexivel($row, 'codigo_barras', 'linha_digitavel'),
+            'status' => $this->buscarValorFlexivel($row, 'status') ?? 'pendente',
+            'plano_conta_id' => $this->buscarValorFlexivel($row, 'plano_conta_id'),
+        ], fn ($value) => $value !== null && $value !== '');
+    }
+
+    private function normalizarPayloadTitulo(array $row, string $tipo): array
+    {
+        $valorOriginal = $this->parseMoneyString(
+            $this->buscarValorFlexivel($row, 'valor_original', 'valor', 'valor_total')
+        );
+
+        return array_filter([
+            'cliente_id' => $tipo === 'receber' ? $this->resolverClienteId($row) : null,
+            'fornecedor_id' => $tipo === 'pagar' ? $this->resolverFornecedorId($row) : null,
+            'fatura_id' => $this->buscarValorFlexivel($row, 'fatura_id'),
+            'descricao' => $this->buscarValorFlexivel($row, 'descricao', 'historico', 'nome'),
+            'tipo' => $tipo,
+            'plano_conta_id' => $this->buscarValorFlexivel($row, 'plano_conta_id'),
+            'centro_custo_id' => $this->buscarValorFlexivel($row, 'centro_custo_id'),
+            'competencia' => $this->normalizarCompetencia($this->buscarValorFlexivel($row, 'competencia', 'periodo')),
+            'numero_titulo' => $this->buscarValorFlexivel($row, 'numero_titulo', 'numero'),
+            'nosso_numero' => $this->buscarValorFlexivel($row, 'nosso_numero'),
+            'data_emissao' => $this->normalizarDataEntrada($this->buscarValorFlexivel($row, 'data_emissao', 'emissao')) ?? now()->toDateString(),
+            'data_vencimento' => $this->normalizarDataEntrada($this->buscarValorFlexivel($row, 'data_vencimento', 'vencimento')),
+            'valor_original' => $valorOriginal,
+            'valor_juros' => $this->parseMoneyString($this->buscarValorFlexivel($row, 'valor_juros', 'juros')),
+            'valor_multa' => $this->parseMoneyString($this->buscarValorFlexivel($row, 'valor_multa', 'multa')),
+            'valor_desconto' => $this->parseMoneyString($this->buscarValorFlexivel($row, 'valor_desconto', 'desconto')),
+            'status' => $this->buscarValorFlexivel($row, 'status') ?? 'aberto',
+            'forma_pagamento' => $this->buscarValorFlexivel($row, 'forma_pagamento', 'forma'),
+            'codigo_barras' => $this->buscarValorFlexivel($row, 'codigo_barras'),
+            'linha_digitavel' => $this->buscarValorFlexivel($row, 'linha_digitavel'),
+            'url_boleto' => $this->buscarValorFlexivel($row, 'url_boleto'),
+            'observacoes' => $this->buscarValorFlexivel($row, 'observacoes', 'obs'),
+        ], fn ($value) => $value !== null && $value !== '');
+    }
+
+    private function resolverClienteId(array $row): ?int
+    {
+        $clienteId = $this->buscarValorFlexivel($row, 'cliente_id');
+        if ($clienteId) {
+            return (int) $clienteId;
+        }
+
+        $cnpj = preg_replace('/\D/', '', (string) ($this->buscarValorFlexivel($row, 'cliente_cnpj', 'cnpj_cliente') ?? ''));
+        if ($cnpj !== '') {
+            $cliente = Cliente::where('cnpj', $cnpj)->first();
+            if ($cliente) {
+                return $cliente->id;
+            }
+        }
+
+        $nome = $this->buscarValorFlexivel($row, 'cliente', 'cliente_nome', 'razao_social', 'empresa', 'nome_fantasia');
+        if (!$nome) {
+            return null;
+        }
+
+        $nome = mb_strtoupper(trim((string) $nome));
+
+        $cliente = Cliente::query()
+            ->whereRaw('upper(razao_social) = ?', [$nome])
+            ->orWhereRaw('upper(nome_fantasia) = ?', [$nome])
+            ->first();
+
+        return $cliente?->id;
+    }
+
+    private function resolverFornecedorId(array $row): ?int
+    {
+        $fornecedorId = $this->buscarValorFlexivel($row, 'fornecedor_id');
+        if ($fornecedorId) {
+            return (int) $fornecedorId;
+        }
+
+        $cnpj = preg_replace('/\D/', '', (string) ($this->buscarValorFlexivel($row, 'fornecedor_cnpj', 'cnpj_fornecedor', 'cnpj') ?? ''));
+        if ($cnpj !== '') {
+            $fornecedor = Fornecedor::query()
+                ->where('cnpj', $cnpj)
+                ->orWhere('cpf', $cnpj)
+                ->first();
+            if ($fornecedor) {
+                return $fornecedor->id;
+            }
+        }
+
+        $nome = $this->buscarValorFlexivel($row, 'fornecedor', 'fornecedor_nome', 'nome_fornecedor', 'razao_social_fornecedor');
+        if (!$nome) {
+            return null;
+        }
+
+        $nome = mb_strtoupper(trim((string) $nome));
+
+        $fornecedor = Fornecedor::query()
+            ->whereRaw('upper(razao_social) = ?', [$nome])
+            ->orWhereRaw('upper(nome_fantasia) = ?', [$nome])
+            ->first();
+
+        return $fornecedor?->id;
+    }
+
+    private function normalizarDataEntrada($data): ?string
+    {
+        if (empty($data)) {
+            return null;
+        }
+
+        if ($data instanceof Carbon) {
+            return $data->toDateString();
+        }
+
+        $valor = trim((string) $data);
+        if ($valor === '') {
+            return null;
+        }
+
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $valor)) {
+            return $valor;
+        }
+
+        if (preg_match('/^\d{2}\/\d{2}\/\d{4}$/', $valor)) {
+            return $this->parseDataBr($valor)?->toDateString();
+        }
+
+        try {
+            return Carbon::parse($valor)->toDateString();
+        } catch (\Exception $e) {
+            return null;
+        }
+    }
+
+    private function normalizarCompetencia($competencia): ?string
+    {
+        if (empty($competencia)) {
+            return null;
+        }
+
+        $valor = trim((string) $competencia);
+
+        if (preg_match('/^\d{2}\/\d{4}$/', $valor)) {
+            return Carbon::createFromFormat('m/Y', $valor)->startOfMonth()->toDateString();
+        }
+
+        if (preg_match('/^\d{4}-\d{2}$/', $valor)) {
+            return Carbon::createFromFormat('Y-m', $valor)->startOfMonth()->toDateString();
+        }
+
+        $data = $this->normalizarDataEntrada($valor);
+        return $data ? Carbon::parse($data)->startOfMonth()->toDateString() : null;
+    }
+
     /**
      * Gera um CNPJ placeholder (14 dígitos) para permitir criação de cliente quando a planilha não traz documento.
      */
@@ -790,6 +1368,8 @@ private function detectarAcaoPelosDados(array $dados): string
         // Regras de detecção
         if (str_contains($keys, 'titulos') || (str_contains($keys, 'servico') && str_contains($keys, 'total'))) return 'gerar_os';
         if (str_contains($keys, 'cnpj') && !str_contains($keys, 'servico')) return 'importar_clientes';
+        if (str_contains($keys, 'data_vencimento') && (str_contains($keys, 'fornecedor') || str_contains($keys, 'codigo_barras'))) return 'criar_despesa';
+        if (str_contains($keys, 'data_vencimento') && (str_contains($keys, 'cliente') || str_contains($keys, 'valor_original') || str_contains($keys, 'valor'))) return 'criar_conta_receber';
         if (str_contains($keys, 'servico') || str_contains($keys, 'valor')) return 'gerar_os';
 
         return 'importar_clientes'; // Default mais seguro para seu caso de uso
@@ -809,14 +1389,17 @@ private function detectarAcaoPelosDados(array $dados): string
         if (in_array($acao, ['gerar_os', 'ordem_servico'])) {
             return (int)($stats['criados'] ?? 0) > 0;
         }
+        if (in_array($acao, ['criar_cliente', 'cliente', 'criar_despesa', 'despesa', 'criar_conta_pagar', 'conta_pagar', 'criar_conta_receber', 'titulo_receber', 'criar_titulo_receber'])) {
+            return (int)($stats['criados'] ?? 0) > 0;
+        }
 
         $importados = (int)($stats['novos'] ?? 0) + (int)($stats['atualizados'] ?? 0);
         return $importados > 0;
     }
 
     /**
-     * Normaliza o retorno do N8N para garantir que o front receba dados estruturados
-     * compatíveis com o botão de importação.
+     * Normaliza o retorno do provider de IA para garantir que o front receba
+     * dados estruturados compatíveis com os fluxos de confirmação.
      */
     private function normalizarRespostaN8n($body): array
     {
@@ -872,6 +1455,44 @@ private function detectarAcaoPelosDados(array $dados): string
             'dados_estruturados' => $dadosEstruturados,
             'acao_sugerida' => $acaoSugerida,
         ];
+    }
+
+    private function normalizarRespostaIa($body): array
+    {
+        $normalizado = $this->normalizarRespostaN8n($body);
+
+        if (!empty($normalizado['dados_estruturados'])) {
+            return $normalizado;
+        }
+
+        if (!is_array($body)) {
+            return $normalizado;
+        }
+
+        $acao = $normalizado['acao_sugerida'] ?? ($body['acao_sugerida'] ?? null);
+        if (!is_string($acao) || !in_array($acao, [
+            'criar_cliente',
+            'criar_despesa',
+            'criar_conta_pagar',
+            'criar_conta_receber',
+            'criar_titulo_receber',
+        ], true)) {
+            return $normalizado;
+        }
+
+        $registros = $this->extrairDadosParaProcessamento(
+            $body['dados_estruturados'] ?? ($body['dados'] ?? $body)
+        );
+
+        if (empty($registros)) {
+            return $normalizado;
+        }
+
+        $normalizado['dados_estruturados'] = $this->montarPayloadAcaoDireta($acao, $registros, $body);
+        $normalizado['acao_sugerida'] = $acao;
+        $normalizado['mensagem'] ??= "📥 Preparei " . count($registros) . " registro(s) para confirmação.";
+
+        return $normalizado;
     }
 
     /**
@@ -964,6 +1585,46 @@ private function detectarAcaoPelosDados(array $dados): string
         }
 
         return null;
+    }
+
+    private function montarPayloadAcaoDireta(string $acao, array $registros, array $body = []): array
+    {
+        $tipo = match ($acao) {
+            'criar_cliente' => 'cliente',
+            'criar_despesa', 'criar_conta_pagar' => 'despesa',
+            'criar_conta_receber', 'criar_titulo_receber' => 'titulo_receber',
+            default => 'dados',
+        };
+
+        return [
+            'sucesso' => true,
+            'tipo' => $tipo,
+            'acao_sugerida' => $acao,
+            'dados_mapeados' => array_values($registros),
+            'colunas' => $this->montarColunasPreview($registros),
+            'total_registros' => count($registros),
+            'confianca' => is_numeric($body['confianca'] ?? null) ? (float) $body['confianca'] : null,
+            'metadata' => [
+                'fonte' => 'langchain',
+                'acao' => $acao,
+            ],
+            'raw_output' => $body,
+        ];
+    }
+
+    private function montarColunasPreview(array $registros): array
+    {
+        $primeiro = $registros[0] ?? [];
+        if (!is_array($primeiro)) {
+            return [];
+        }
+
+        return array_map(function ($key) {
+            return [
+                'key' => $key,
+                'label' => ucwords(str_replace('_', ' ', $key)),
+            ];
+        }, array_keys($primeiro));
     }
 
     private function montarPayloadClientes(array $lista): array

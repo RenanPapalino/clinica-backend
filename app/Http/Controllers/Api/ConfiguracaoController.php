@@ -5,9 +5,13 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Configuracao;
 use App\Models\User;
+use App\Notifications\SendGeneratedCredentialsNotification;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Password;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 
 class ConfiguracaoController extends Controller
@@ -113,9 +117,11 @@ class ConfiguracaoController extends Controller
      */
     public function getUsuarios()
     {
-        $usuarios = User::select('id', 'name', 'email', 'role', 'ativo', 'created_at')
+        $usuarios = User::select('id', 'name', 'email', 'role', 'ativo', 'created_at', 'updated_at')
             ->orderBy('created_at', 'desc')
-            ->get();
+            ->get()
+            ->map(fn (User $usuario) => $this->serializeUser($usuario))
+            ->values();
 
         return response()->json($usuarios);
     }
@@ -128,20 +134,46 @@ class ConfiguracaoController extends Controller
         $data = $request->validate([
             'name' => 'required|string|max:255',
             'email' => 'required|email|unique:users,email',
-            'password' => 'required|string|min:6',
+            'password' => 'nullable|string|min:6',
             'role' => 'required|in:admin,user,viewer',
-            'ativo' => 'boolean'
+            'ativo' => 'nullable|boolean',
+            'send_credentials_email' => 'nullable|boolean',
         ]);
 
-        $data['password'] = Hash::make($data['password']);
+        $plainPassword = $data['password'] ?: Str::password(12);
+        $sendCredentialsEmail = $data['send_credentials_email'] ?? true;
+
+        unset($data['send_credentials_email']);
+
+        $data['password'] = Hash::make($plainPassword);
         $data['ativo'] = $data['ativo'] ?? true;
 
         $usuario = User::create($data);
+        $emailSent = false;
+
+        if ($sendCredentialsEmail) {
+            try {
+                $usuario->notify(new SendGeneratedCredentialsNotification(
+                    login: $usuario->email,
+                    generatedPassword: $plainPassword,
+                ));
+                $emailSent = true;
+            } catch (\Throwable $e) {
+                Log::error('CONFIGURACOES: Falha ao enviar credenciais do usuário', [
+                    'user_id' => $usuario->id,
+                    'email' => $usuario->email,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
 
         return response()->json([
             'success' => true,
-            'message' => 'Usuário criado com sucesso',
-            'data' => $usuario
+            'message' => $emailSent
+                ? 'Usuário criado e credenciais enviadas por e-mail.'
+                : 'Usuário criado com sucesso.',
+            'email_sent' => $emailSent,
+            'data' => $this->serializeUser($usuario->fresh()),
         ]);
     }
 
@@ -169,7 +201,34 @@ class ConfiguracaoController extends Controller
         return response()->json([
             'success' => true,
             'message' => 'Usuário atualizado com sucesso',
-            'data' => $usuario
+            'data' => $this->serializeUser($usuario->fresh()),
+        ]);
+    }
+
+    public function reenviarAcessoUsuario($id)
+    {
+        $usuario = User::findOrFail($id);
+
+        $status = Password::sendResetLink([
+            'email' => mb_strtolower(trim($usuario->email)),
+        ]);
+
+        if ($status !== Password::RESET_LINK_SENT) {
+            Log::warning('CONFIGURACOES: Falha ao reenviar acesso', [
+                'user_id' => $usuario->id,
+                'email' => $usuario->email,
+                'status' => $status,
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Não foi possível reenviar o acesso para este usuário.',
+            ], 422);
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Link de redefinição enviado com sucesso para o usuário.',
         ]);
     }
 
@@ -193,6 +252,19 @@ class ConfiguracaoController extends Controller
             'success' => true,
             'message' => 'Usuário excluído com sucesso'
         ]);
+    }
+
+    private function serializeUser(User $usuario): array
+    {
+        return [
+            'id' => $usuario->id,
+            'name' => $usuario->name,
+            'email' => $usuario->email,
+            'role' => $usuario->role,
+            'ativo' => (bool) $usuario->ativo,
+            'created_at' => $usuario->created_at?->toIso8601String(),
+            'updated_at' => $usuario->updated_at?->toIso8601String(),
+        ];
     }
 
     /**

@@ -132,8 +132,10 @@ class Cobranca extends Model
         }
 
         if (is_string($value)) {
-            $value = str_replace('.', '', $value);
-            $value = str_replace(',', '.', $value);
+            if (str_contains($value, ',')) {
+                $value = str_replace('.', '', $value);
+                $value = str_replace(',', '.', $value);
+            }
         }
 
         $this->attributes['valor_cobrado'] = (float) $value;

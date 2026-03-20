@@ -3,6 +3,7 @@
 namespace App\Models;
 
 // IMPORTANTE: Esta linha é obrigatória
+use App\Notifications\ResetAccountPasswordNotification;
 use Laravel\Sanctum\HasApiTokens; 
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
@@ -17,6 +18,13 @@ class User extends Authenticatable
         'name',
         'email',
         'password',
+        'role',
+        'ativo',
+    ];
+
+    protected $attributes = [
+        'role' => 'user',
+        'ativo' => true,
     ];
 
     protected $hidden = [
@@ -27,5 +35,21 @@ class User extends Authenticatable
     protected $casts = [
         'email_verified_at' => 'datetime',
         'password' => 'hashed',
+        'ativo' => 'boolean',
     ];
+
+    public function scopeAtivos($query)
+    {
+        return $query->where('ativo', true);
+    }
+
+    public function isAtivo(): bool
+    {
+        return (bool) $this->ativo;
+    }
+
+    public function sendPasswordResetNotification($token): void
+    {
+        $this->notify(new ResetAccountPasswordNotification($token));
+    }
 }

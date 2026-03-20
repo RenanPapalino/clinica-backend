@@ -2,14 +2,12 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Actions\Financeiro\CriarDespesaAction;
 use App\Http\Controllers\Controller;
-use App\Models\CategoriaDespesa;
 use App\Models\Despesa;
 use App\Models\Fornecedor;
-use App\Models\LancamentoContabil;
+use App\Services\Ai\DocumentReaderService;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Storage;
 
 class DespesaController extends Controller
 {
@@ -39,7 +37,7 @@ class DespesaController extends Controller
         ]);
     }
 
-    public function store(Request $request)
+    public function store(Request $request, CriarDespesaAction $criarDespesaAction)
     {
         $data = $request->validate([
             'descricao'        => 'required|string',
@@ -52,7 +50,7 @@ class DespesaController extends Controller
             'documento_url'    => 'nullable|string',
             'observacoes'      => 'nullable|string',
             'codigo_barras'    => 'nullable|string',
-            'status'           => 'nullable|string',
+            'status'           => 'nullable|in:pendente,pago,atrasado,cancelado',
             'plano_conta_id'   => 'nullable|exists:planos_contas,id',
 
             // rateios vindos do front (RateioForm)
@@ -63,52 +61,7 @@ class DespesaController extends Controller
             'rateios.*.valor'              => 'required_with:rateios|numeric',
         ]);
 
-        $valorOriginal = $data['valor_original'] ?? $data['valor'] ?? 0;
-        $data['valor_original'] = $valorOriginal;
-        $data['valor']          = $valorOriginal;
-
-        $data['data_emissao'] = $data['data_emissao'] ?? now();
-        $data['status']       = $data['status'] ?? 'aberto';
-
-        $despesa = Despesa::create($data);
-
-        $rateios = $request->input('rateios', []);
-
-        $contaFornecedorPadrao = config('contabilidade.conta_fornecedores_padrao');
-        if (!$contaFornecedorPadrao && !empty($data['plano_conta_id'])) {
-            // fallback simples: usa a mesma conta no crédito só para não quebrar
-            $contaFornecedorPadrao = $data['plano_conta_id'];
-        }
-
-        if (!empty($rateios)) {
-            foreach ($rateios as $rateio) {
-                LancamentoContabil::create([
-                    'data'             => $despesa->data_emissao ?? $despesa->data_vencimento,
-                    'historico'        => $despesa->descricao,
-                    'valor'            => $rateio['valor'],
-                    'conta_debito_id'  => $rateio['plano_conta_id'],
-                    'conta_credito_id' => $contaFornecedorPadrao,
-                    'centro_custo_id'  => $rateio['centro_custo_id'] ?? null,
-                    'despesa_id'       => $despesa->id,
-                    'origem'           => 'contas_pagar',
-                    'status_ia'        => 'sugerido',
-                    'usuario_id'       => $request->user()->id ?? null,
-                ]);
-            }
-        } elseif (!empty($data['plano_conta_id']) && $valorOriginal > 0) {
-            LancamentoContabil::create([
-                'data'             => $despesa->data_emissao ?? $despesa->data_vencimento,
-                'historico'        => $despesa->descricao,
-                'valor'            => $valorOriginal,
-                'conta_debito_id'  => $data['plano_conta_id'],
-                'conta_credito_id' => $contaFornecedorPadrao,
-                'centro_custo_id'  => null,
-                'despesa_id'       => $despesa->id,
-                'origem'           => 'contas_pagar',
-                'status_ia'        => 'sugerido',
-                'usuario_id'       => $request->user()->id ?? null,
-            ]);
-        }
+        $despesa = $criarDespesaAction->execute($data, $request->user()->id ?? null);
 
         return response()->json([
             'success' => true,
@@ -177,9 +130,9 @@ public function analisarDocumento(Request $request, DocumentReaderService $ocrSe
         }
 
         $despesa->update([
-            'status'        => 'pago',
-            'data_pagamento'=> $request->input('data_pagamento', now()),
-            'valor_pago'    => $valorBaixa,
+            'status'         => 'pago',
+            'data_pagamento' => $request->input('data_pagamento', now()),
+            'valor_pago'     => $valorBaixa,
         ]);
 
         // (Opcional) aqui futuramente você pode gerar o lançamento de baixa:

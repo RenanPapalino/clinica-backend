@@ -72,4 +72,20 @@ class LancamentoContabilController extends Controller
             'data'    => $lancamento,
         ], 201);
     }
+
+    public function show($id)
+    {
+        $lancamento = LancamentoContabil::with([
+            'contaDebito',
+            'contaCredito',
+            'centroCusto',
+            'despesa',
+            'titulo',
+        ])->findOrFail($id);
+
+        return response()->json([
+            'success' => true,
+            'data' => $lancamento,
+        ]);
+    }
 }
