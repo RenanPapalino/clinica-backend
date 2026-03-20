@@ -5,6 +5,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Support\Facades\Schema;
 
 class Fatura extends Model
 {
@@ -180,7 +181,7 @@ class Fatura extends Model
             return null;
         }
 
-        return $this->titulos()->create([
+        $tituloData = [
             'cliente_id'      => $this->cliente_id,
             'descricao'       => 'Fatura #' . ($this->numero_fatura ?? $this->id),
             'tipo'            => 'receber',
@@ -203,7 +204,11 @@ class Fatura extends Model
             'linha_digitavel' => null,
             'url_boleto'      => null,
             'observacoes'     => 'Título gerado automaticamente a partir da fatura.',
-        ]);
+        ];
+
+        $tituloData = array_intersect_key($tituloData, array_flip(Schema::getColumnListing('titulos')));
+
+        return $this->titulos()->create($tituloData);
     }
 
     private function resolverCompetenciaTitulo(): ?string

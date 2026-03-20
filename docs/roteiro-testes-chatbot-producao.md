@@ -75,7 +75,7 @@ php artisan route:list --path=chat
 
 1. Importar [n8n-medintelligence-rag-ingest-mysql-producao.json](/Users/papalino/workspace/medintelligence/clinica-backend/docs/n8n-medintelligence-rag-ingest-mysql-producao.json)
 2. Confirmar que os 4 nos do Google Drive estao usando a credencial `N8N`
-3. Confirmar que a pasta monitorada e `1GJiQDVdOJ8ljF4CS9kH6n7vKLrDzD_oi`
+3. Confirmar que a pasta monitorada e `1gdNPlghZaOsXMRjJ39Ssp_AFgiIgb-_a`
 4. Ativar o workflow
 
 ## Teste 1: Novo arquivo no RAG

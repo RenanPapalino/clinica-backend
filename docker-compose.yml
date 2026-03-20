@@ -1,43 +1,71 @@
+name: medintelligence
+
 services:
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: clinica-api
+    image: medintelligence-api:latest
     restart: unless-stopped
-    ports:
-      - "8000:8000"
+    env_file:
+      - .env
     environment:
-      - APP_ENV=production
-      - APP_DEBUG=false
+      APP_ENV: ${APP_ENV:-production}
+      APP_DEBUG: ${APP_DEBUG:-false}
+      APP_URL: ${APP_URL:-https://api.papalino.com.br}
+      CHATBOT_RUNTIME_URL: ${CHATBOT_RUNTIME_URL:-http://langchain-runtime:8787}
+      CACHE_LARAVEL_CONFIG: ${CACHE_LARAVEL_CONFIG:-true}
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-false}
+    ports:
+      - "${API_PORT:-8000}:80"
     volumes:
-      - ./storage:/var/www/storage
+      - storage_data:/var/www/html/storage
+      - cache_data:/var/www/html/bootstrap/cache
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/up"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
     networks:
-      - clinica-network
+      - medintelligence-network
 
   langchain-runtime:
     build:
       context: ./agent-runtime
       dockerfile: Dockerfile
-    container_name: medintelligence-langchain-runtime
+    image: medintelligence-langchain-runtime:latest
     restart: unless-stopped
-    ports:
-      - "8787:8787"
     environment:
       APP_PORT: 8787
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      OPENAI_VISION_MODEL: ${OPENAI_VISION_MODEL:-gpt-4.1-mini}
+      OPENAI_TRANSCRIPTION_MODEL: ${OPENAI_TRANSCRIPTION_MODEL:-whisper-1}
       RUNTIME_SERVICE_TOKEN: ${CHATBOT_RUNTIME_SECRET}
       LARAVEL_BASE_URL: http://api
       LARAVEL_AGENT_SECRET: ${CHATBOT_RUNTIME_SECRET}
-      REQUEST_TIMEOUT_SECONDS: 20
-      MAX_RESULT_ROWS: 10
-      DEFAULT_HISTORY_LIMIT: 20
+      REQUEST_TIMEOUT_SECONDS: ${CHATBOT_REQUEST_TIMEOUT_SECONDS:-30}
+      MAX_RESULT_ROWS: ${CHATBOT_MAX_RESULT_ROWS:-10}
+      DEFAULT_HISTORY_LIMIT: ${CHATBOT_RUNTIME_HISTORY_LIMIT:-20}
+    ports:
+      - "${RUNTIME_PORT:-8787}:8787"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
     networks:
-      - clinica-network
+      - medintelligence-network
+
+volumes:
+  storage_data:
+  cache_data:
 
 networks:
-  clinica-network:
+  medintelligence-network:
     driver: bridge

@@ -1,0 +1,18 @@
+services:
+  api:
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_URL: https://api.papalino.com.br
+      FRONTEND_URL: https://app.papalino.com.br
+      CHATBOT_RUNTIME_URL: http://langchain-runtime:8787
+      CACHE_LARAVEL_CONFIG: "true"
+    ports:
+      - "${API_PORT:-8000}:80"
+
+  langchain-runtime:
+    environment:
+      APP_PORT: 8787
+      LARAVEL_BASE_URL: http://api
+    ports:
+      - "${RUNTIME_PORT:-8787}:8787"

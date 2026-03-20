@@ -5,6 +5,9 @@ namespace App\Http\Controllers\Api;
 use App\Actions\Cadastros\CriarClienteAction;
 use App\Http\Controllers\Controller;
 use App\Models\Cliente;
+use App\Services\CpfCnpjService;
+use App\Services\CnpjaService;
+use App\Services\ViaCepService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -39,12 +42,21 @@ class ClienteController extends Controller
                 'cnpj' => 'required|string',
                 'razao_social' => 'required|string|max:200',
                 'nome_fantasia' => 'nullable|string|max:200',
+                'inscricao_municipal' => 'nullable|string|max:50',
+                'inscricao_estadual' => 'nullable|string|max:50',
                 'email' => 'nullable|email|max:100',
                 'telefone' => 'nullable|string|max:20',
                 'celular' => 'nullable|string|max:20',
+                'site' => 'nullable|string|max:255',
+                'cep' => 'nullable|string|max:10',
+                'logradouro' => 'nullable|string|max:255',
+                'numero' => 'nullable|string|max:20',
+                'complemento' => 'nullable|string|max:255',
+                'bairro' => 'nullable|string|max:100',
                 'cidade' => 'nullable|string|max:100',
                 'uf' => 'nullable|string|max:2',
                 'status' => 'nullable|in:ativo,inativo',
+                'observacoes' => 'nullable|string|max:1000',
             ]);
 
             $cliente = $criarClienteAction->execute($data);
@@ -70,10 +82,156 @@ class ClienteController extends Controller
     {
         try {
             $cliente = Cliente::findOrFail($id);
-            $cliente->update($request->all());
-            return response()->json(['success' => true, 'message' => 'Atualizado com sucesso']);
+            $data = $request->validate([
+                'cnpj' => 'sometimes|required|string',
+                'razao_social' => 'sometimes|required|string|max:200',
+                'nome_fantasia' => 'nullable|string|max:200',
+                'inscricao_municipal' => 'nullable|string|max:50',
+                'inscricao_estadual' => 'nullable|string|max:50',
+                'email' => 'nullable|email|max:100',
+                'telefone' => 'nullable|string|max:20',
+                'celular' => 'nullable|string|max:20',
+                'site' => 'nullable|string|max:255',
+                'cep' => 'nullable|string|max:10',
+                'logradouro' => 'nullable|string|max:255',
+                'numero' => 'nullable|string|max:20',
+                'complemento' => 'nullable|string|max:255',
+                'bairro' => 'nullable|string|max:100',
+                'cidade' => 'nullable|string|max:100',
+                'uf' => 'nullable|string|max:2',
+                'status' => 'nullable|in:ativo,inativo',
+                'observacoes' => 'nullable|string|max:1000',
+            ]);
+
+            $cliente->update($data);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Atualizado com sucesso',
+                'data' => $cliente->fresh(),
+            ]);
         } catch (\Exception $e) {
             return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+        }
+    }
+
+    public function consultarCnpj(Request $request, CnpjaService $cnpjaService)
+    {
+        $validated = $request->validate([
+            'cnpj' => 'required|string',
+        ]);
+
+        $cnpj = preg_replace('/\D/', '', (string) $validated['cnpj']);
+
+        if (strlen($cnpj) !== 14 || !Cliente::isValidCnpj($cnpj)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Informe um CNPJ válido para consulta.',
+            ], 422);
+        }
+
+        try {
+            $result = $cnpjaService->consultarCnpj($cnpj);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Consulta CNPJ realizada com sucesso.',
+                'data' => $result['mapped'],
+                'provider' => $result['provider'],
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('Falha ao consultar CNPJá', [
+                'cnpj' => $cnpj,
+                'message' => $e->getMessage(),
+            ]);
+
+            $message = $e->getMessage();
+            $status = str_contains(mb_strtolower($message), 'não foi possível') ? 502 : 422;
+
+            return response()->json([
+                'success' => false,
+                'message' => $message,
+            ], $status);
+        }
+    }
+
+    public function consultarCpf(Request $request, CpfCnpjService $cpfCnpjService)
+    {
+        $validated = $request->validate([
+            'cpf' => 'required|string',
+        ]);
+
+        $cpf = preg_replace('/\D/', '', (string) $validated['cpf']);
+
+        if (strlen($cpf) !== 11 || !Cliente::isValidCpf($cpf)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Informe um CPF válido para consulta.',
+            ], 422);
+        }
+
+        try {
+            $result = $cpfCnpjService->consultarCpf($cpf);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Consulta CPF realizada com sucesso.',
+                'data' => $result['mapped'],
+                'provider' => $result['provider'],
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('Falha ao consultar CPF', [
+                'cpf' => $cpf,
+                'message' => $e->getMessage(),
+            ]);
+
+            $message = $e->getMessage();
+            $status = str_contains(mb_strtolower($message), 'não foi possível') ? 502 : 422;
+
+            return response()->json([
+                'success' => false,
+                'message' => $message,
+            ], $status);
+        }
+    }
+
+    public function consultarCep(Request $request, ViaCepService $viaCepService)
+    {
+        $validated = $request->validate([
+            'cep' => 'required|string',
+        ]);
+
+        $cep = preg_replace('/\D/', '', (string) $validated['cep']);
+
+        if (strlen($cep) !== 8) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Informe um CEP válido para consulta.',
+            ], 422);
+        }
+
+        try {
+            $result = $viaCepService->consultarCep($cep);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Consulta CEP realizada com sucesso.',
+                'data' => $result['mapped'],
+                'provider' => $result['provider'],
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('Falha ao consultar ViaCEP', [
+                'cep' => $cep,
+                'message' => $e->getMessage(),
+            ]);
+
+            $message = $e->getMessage();
+            $status = str_contains(mb_strtolower($message), 'não foi possível') ? 502 : 422;
+
+            return response()->json([
+                'success' => false,
+                'message' => $message,
+            ], $status);
         }
     }
 

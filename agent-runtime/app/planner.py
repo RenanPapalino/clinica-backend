@@ -14,8 +14,16 @@ class ActionPlan(BaseModel):
     acao_sugerida: Literal[
         "nenhuma",
         "criar_cliente",
+        "sincronizar_clientes",
         "criar_conta_pagar",
         "criar_conta_receber",
+        "gerar_fatura",
+        "inativar_cliente",
+        "reativar_cliente",
+        "baixar_titulo",
+        "baixar_despesa",
+        "renegociar_titulo",
+        "emitir_nfse",
     ] = "nenhuma"
     confianca: float | None = None
     dados_mapeados: list[dict[str, Any]] = Field(default_factory=list)
@@ -27,7 +35,7 @@ class ActionPlanner:
         self._model = model
 
     async def plan(self, *, payload: ChatPayload, session_context: dict, current_message: str) -> ActionPlan:
-        structured_model = self._model.with_structured_output(ActionPlan, method="json_schema")
+        structured_model = self._model.with_structured_output(ActionPlan, method="function_calling")
 
         history = build_history_text(session_context)
         content = "\n\n".join(

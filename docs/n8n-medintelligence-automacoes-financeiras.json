@@ -1,0 +1,966 @@
+{
+  "name": "MedIntelligence_Automacoes_Financeiras",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -2540,
+        -920
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a001",
+      "name": "Manual Cobranca Assistida"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * 1-5"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -2540,
+        -760
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a002",
+      "name": "Agendar Cobranca Assistida"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.papalino.com.br/api/internal/agent/cobrancas/inadimplentes",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Agent-Secret",
+              "value": "COLE_CHATBOT_RUNTIME_SECRET_AQUI"
+            },
+            {
+              "name": "X-Agent-User-Id",
+              "value": "1"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ min_dias_atraso: 3, valor_minimo: 100, limit: 50 }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -2280,
+        -840
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a003",
+      "name": "Buscar Inadimplentes"
+    },
+    {
+      "parameters": {
+        "jsCode": "const entrada = $input.first()?.json || {}; const payload = entrada.data || {}; const clientes = Array.isArray(payload.clientes) ? payload.clientes : []; if (!clientes.length) { return []; } return clientes.map((cliente) => ({ json: { ...cliente, data_referencia: payload.data_referencia || new Date().toISOString().slice(0, 10), session_id: `n8n-cobranca-${cliente.cliente_id}-${new Date().toISOString().slice(0, 10)}`, resumo_titulos: (cliente.titulos || []).map((titulo) => `${titulo.numero_titulo || titulo.titulo_id || 'titulo'} | ${titulo.descricao || 'Sem descricao'} | venc. ${titulo.data_vencimento || '-'} | R$ ${Number(titulo.valor_saldo || 0).toFixed(2)}`).join('\\n') } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2020,
+        -840
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a004",
+      "name": "Explodir Clientes Inadimplentes"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://SEU_RUNTIME_URL_AQUI/chat",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Agent-Secret",
+              "value": "COLE_CHATBOT_RUNTIME_SECRET_AQUI"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ mensagem: `Voce e o copiloto financeiro do MedIntelligence. Gere apenas a mensagem final de cobranca, pronta para envio, em portugues do Brasil, profissional, objetiva e cordial. Nao use markdown. Nao invente valores. Cliente: ${$json.razao_social}. CNPJ: ${$json.cnpj || '-'} . Total em aberto: R$ ${Number($json.total_em_aberto || 0).toFixed(2)}. Dias maximos de atraso: ${$json.dias_atraso || 0}. Prioridade: ${$json.prioridade || 'baixa'}. Titulos vencidos:\\n${$json.resumo_titulos || 'Sem titulos detalhados'}. Oriente pagamento e disponibilize abertura para negociacao.`, user_id: 1, user_name: 'Automacao n8n', user_email: 'automacao@medintelligence.local', session_id: $json.session_id, tipo_processamento: 'financeiro', timestamp: $now.toISO() }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -1760,
+        -840
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a005",
+      "name": "Gerar Mensagem IA Cobranca"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "name": "cliente_id",
+              "value": "={{ $('Explodir Clientes Inadimplentes').item.json.cliente_id }}",
+              "type": "number"
+            },
+            {
+              "name": "razao_social",
+              "value": "={{ $('Explodir Clientes Inadimplentes').item.json.razao_social }}",
+              "type": "string"
+            },
+            {
+              "name": "nome_fantasia",
+              "value": "={{ $('Explodir Clientes Inadimplentes').item.json.nome_fantasia || '' }}",
+              "type": "string"
+            },
+            {
+              "name": "cnpj",
+              "value": "={{ $('Explodir Clientes Inadimplentes').item.json.cnpj || '' }}",
+              "type": "string"
+            },
+            {
+              "name": "email",
+              "value": "={{ $('Explodir Clientes Inadimplentes').item.json.email || '' }}",
+              "type": "string"
+            },
+            {
+              "name": "telefone",
+              "value": "={{ $('Explodir Clientes Inadimplentes').item.json.telefone || '' }}",
+              "type": "string"
+            },
+            {
+              "name": "celular",
+              "value": "={{ $('Explodir Clientes Inadimplentes').item.json.celular || '' }}",
+              "type": "string"
+            },
+            {
+              "name": "canal_sugerido",
+              "value": "={{ $('Explodir Clientes Inadimplentes').item.json.canal_sugerido || 'manual' }}",
+              "type": "string"
+            },
+            {
+              "name": "prioridade",
+              "value": "={{ $('Explodir Clientes Inadimplentes').item.json.prioridade || 'baixa' }}",
+              "type": "string"
+            },
+            {
+              "name": "total_em_aberto",
+              "value": "={{ $('Explodir Clientes Inadimplentes').item.json.total_em_aberto || 0 }}",
+              "type": "number"
+            },
+            {
+              "name": "dias_atraso",
+              "value": "={{ $('Explodir Clientes Inadimplentes').item.json.dias_atraso || 0 }}",
+              "type": "number"
+            },
+            {
+              "name": "titulos_vencidos",
+              "value": "={{ $('Explodir Clientes Inadimplentes').item.json.titulos_vencidos || 0 }}",
+              "type": "number"
+            },
+            {
+              "name": "titulos",
+              "value": "={{ $('Explodir Clientes Inadimplentes').item.json.titulos || [] }}",
+              "type": "array"
+            },
+            {
+              "name": "session_id",
+              "value": "={{ $('Explodir Clientes Inadimplentes').item.json.session_id }}",
+              "type": "string"
+            },
+            {
+              "name": "mensagem_cobranca",
+              "value": "={{ $json.mensagem || 'Mensagem de cobrança não gerada pela IA.' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1500,
+        -840
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a006",
+      "name": "Preparar Payload Cobranca"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://SEU_WEBHOOK_COBRANCA_ASSISTIDA_AQUI",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ tipo: 'cobranca_assistida', cliente_id: $json.cliente_id, razao_social: $json.razao_social, cnpj: $json.cnpj, canal_sugerido: $json.canal_sugerido, prioridade: $json.prioridade, email: $json.email, telefone: $json.telefone, celular: $json.celular, valor_total: $json.total_em_aberto, dias_atraso: $json.dias_atraso, titulos_vencidos: $json.titulos_vencidos, mensagem: $json.mensagem_cobranca, titulos: $json.titulos || [] }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -1240,
+        -840
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a007",
+      "name": "Enviar Cobranca Assistida"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "name": "cliente_id",
+              "value": "={{ $('Preparar Payload Cobranca').item.json.cliente_id }}",
+              "type": "number"
+            },
+            {
+              "name": "titulo_id",
+              "value": "={{ (($('Preparar Payload Cobranca').item.json.titulos || [])[0] || {}).titulo_id || '' }}",
+              "type": "string"
+            },
+            {
+              "name": "fatura_id",
+              "value": "={{ (($('Preparar Payload Cobranca').item.json.titulos || [])[0] || {}).fatura_id || '' }}",
+              "type": "string"
+            },
+            {
+              "name": "meio",
+              "value": "={{ $('Preparar Payload Cobranca').item.json.canal_sugerido || 'manual' }}",
+              "type": "string"
+            },
+            {
+              "name": "status",
+              "value": "enviada",
+              "type": "string"
+            },
+            {
+              "name": "canal",
+              "value": "n8n",
+              "type": "string"
+            },
+            {
+              "name": "descricao",
+              "value": "={{ ($('Preparar Payload Cobranca').item.json.mensagem_cobranca || '').slice(0, 900) }}",
+              "type": "string"
+            },
+            {
+              "name": "valor_cobrado",
+              "value": "={{ $('Preparar Payload Cobranca').item.json.total_em_aberto || 0 }}",
+              "type": "number"
+            },
+            {
+              "name": "data_envio",
+              "value": "={{ $now.toISO() }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -980,
+        -840
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a008",
+      "name": "Registrar Resultado Cobranca"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.papalino.com.br/api/internal/agent/cobrancas/registrar",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Agent-Secret",
+              "value": "COLE_CHATBOT_RUNTIME_SECRET_AQUI"
+            },
+            {
+              "name": "X-Agent-User-Id",
+              "value": "1"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -720,
+        -840
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a009",
+      "name": "Registrar Cobranca no Laravel"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -2540,
+        -200
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a010",
+      "name": "Manual Fechamento Diario"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 18 * * 1-5"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -2540,
+        -40
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a011",
+      "name": "Agendar Fechamento Diario"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.papalino.com.br/api/internal/agent/fechamento/diario",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Agent-Secret",
+              "value": "COLE_CHATBOT_RUNTIME_SECRET_AQUI"
+            },
+            {
+              "name": "X-Agent-User-Id",
+              "value": "1"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({}) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -2280,
+        -120
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a012",
+      "name": "Buscar Fechamento Diario"
+    },
+    {
+      "parameters": {
+        "jsCode": "const entrada = $input.first()?.json || {}; const data = entrada.data || {}; return [{ json: { data_fechamento: data.data || new Date().toISOString().slice(0, 10), bruto: data, prompt_fechamento: `Voce e o copiloto financeiro do MedIntelligence. Gere um resumo executivo curto do fechamento diario, em portugues do Brasil, destacando recebimentos previstos, pagamentos previstos, recebimentos realizados, pagamentos realizados, saldo realizado, titulos vencidos, despesas vencidas, faturas pendentes e NFS-e pendentes/com erro. Finalize com 2 ou 3 proximas acoes objetivas. Dados brutos: ${JSON.stringify(data)}` } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2020,
+        -120
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a013",
+      "name": "Preparar Prompt Fechamento"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://SEU_RUNTIME_URL_AQUI/chat",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Agent-Secret",
+              "value": "COLE_CHATBOT_RUNTIME_SECRET_AQUI"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ mensagem: $json.prompt_fechamento, user_id: 1, user_name: 'Automacao n8n', user_email: 'automacao@medintelligence.local', session_id: `n8n-fechamento-${$json.data_fechamento}`, tipo_processamento: 'financeiro', timestamp: $now.toISO() }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -1760,
+        -120
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a014",
+      "name": "Gerar Resumo IA Fechamento"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "name": "tipo",
+              "value": "fechamento_diario",
+              "type": "string"
+            },
+            {
+              "name": "data_referencia",
+              "value": "={{ $('Preparar Prompt Fechamento').item.json.data_fechamento }}",
+              "type": "string"
+            },
+            {
+              "name": "resumo_ia",
+              "value": "={{ $json.mensagem || 'Resumo do fechamento nao gerado.' }}",
+              "type": "string"
+            },
+            {
+              "name": "dados_brutos",
+              "value": "={{ $('Preparar Prompt Fechamento').item.json.bruto }}",
+              "type": "object"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1500,
+        -120
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a015",
+      "name": "Preparar Notificacao Fechamento"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://SEU_WEBHOOK_ALERTA_FINANCEIRO_AQUI",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -1240,
+        -120
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a016",
+      "name": "Notificar Fechamento Financeiro"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -2540,
+        560
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a017",
+      "name": "Manual Alerta NFSe"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 * * * 1-5"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -2540,
+        720
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a018",
+      "name": "Agendar Alertas NFSe"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.papalino.com.br/api/internal/agent/nfse/search",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Agent-Secret",
+              "value": "COLE_CHATBOT_RUNTIME_SECRET_AQUI"
+            },
+            {
+              "name": "X-Agent-User-Id",
+              "value": "1"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ status: 'pendente', limit: 100 }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -2280,
+        640
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a019",
+      "name": "Buscar NFSe Pendentes"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.papalino.com.br/api/internal/agent/nfse/search",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Agent-Secret",
+              "value": "COLE_CHATBOT_RUNTIME_SECRET_AQUI"
+            },
+            {
+              "name": "X-Agent-User-Id",
+              "value": "1"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ status: 'erro', limit: 100 }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -2280,
+        800
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a020",
+      "name": "Buscar NFSe Com Erro"
+    },
+    {
+      "parameters": {
+        "jsCode": "const pendentesNode = $items('Buscar NFSe Pendentes', 0, 0)[0]?.json || {}; const errosNode = $input.first()?.json || {}; const pendentes = Array.isArray(pendentesNode.data) ? pendentesNode.data : []; const erros = Array.isArray(errosNode.data) ? errosNode.data : []; if (!pendentes.length && !erros.length) { return []; } return [{ json: { pendentes, erros, total_pendentes: pendentes.length, total_erros: erros.length, prompt_nfse: `Voce e o copiloto fiscal do MedIntelligence. Gere um alerta executivo, curto e objetivo, em portugues do Brasil, informando quantas NFS-e estao pendentes e quantas estao com erro, destacando os casos mais criticos pelo cliente, protocolo e valor liquido quando disponivel. Feche com ate 3 acoes recomendadas. Pendentes: ${JSON.stringify(pendentes.slice(0, 10))}. Erros: ${JSON.stringify(erros.slice(0, 10))}.` } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2020,
+        800
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a021",
+      "name": "Consolidar Alertas NFSe"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://SEU_RUNTIME_URL_AQUI/chat",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Agent-Secret",
+              "value": "COLE_CHATBOT_RUNTIME_SECRET_AQUI"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ mensagem: $json.prompt_nfse, user_id: 1, user_name: 'Automacao n8n', user_email: 'automacao@medintelligence.local', session_id: `n8n-nfse-${$now.toFormat('yyyyLLddHH')}`, tipo_processamento: 'fiscal', timestamp: $now.toISO() }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -1760,
+        800
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a022",
+      "name": "Gerar Resumo IA NFSe"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "name": "tipo",
+              "value": "alerta_nfse",
+              "type": "string"
+            },
+            {
+              "name": "resumo_ia",
+              "value": "={{ $json.mensagem || 'Resumo fiscal nao gerado.' }}",
+              "type": "string"
+            },
+            {
+              "name": "total_pendentes",
+              "value": "={{ $('Consolidar Alertas NFSe').item.json.total_pendentes || 0 }}",
+              "type": "number"
+            },
+            {
+              "name": "total_erros",
+              "value": "={{ $('Consolidar Alertas NFSe').item.json.total_erros || 0 }}",
+              "type": "number"
+            },
+            {
+              "name": "pendentes",
+              "value": "={{ $('Consolidar Alertas NFSe').item.json.pendentes || [] }}",
+              "type": "array"
+            },
+            {
+              "name": "erros",
+              "value": "={{ $('Consolidar Alertas NFSe').item.json.erros || [] }}",
+              "type": "array"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1500,
+        800
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a023",
+      "name": "Preparar Notificacao NFSe"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://SEU_WEBHOOK_ALERTA_FISCAL_AQUI",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -1240,
+        800
+      ],
+      "id": "0f24419b-8f38-4f5a-a38d-1d3747a5a024",
+      "name": "Notificar Alertas NFSe"
+    }
+  ],
+  "connections": {
+    "Manual Cobranca Assistida": {
+      "main": [
+        [
+          {
+            "node": "Buscar Inadimplentes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agendar Cobranca Assistida": {
+      "main": [
+        [
+          {
+            "node": "Buscar Inadimplentes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar Inadimplentes": {
+      "main": [
+        [
+          {
+            "node": "Explodir Clientes Inadimplentes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Explodir Clientes Inadimplentes": {
+      "main": [
+        [
+          {
+            "node": "Gerar Mensagem IA Cobranca",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gerar Mensagem IA Cobranca": {
+      "main": [
+        [
+          {
+            "node": "Preparar Payload Cobranca",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Payload Cobranca": {
+      "main": [
+        [
+          {
+            "node": "Enviar Cobranca Assistida",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enviar Cobranca Assistida": {
+      "main": [
+        [
+          {
+            "node": "Registrar Resultado Cobranca",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Registrar Resultado Cobranca": {
+      "main": [
+        [
+          {
+            "node": "Registrar Cobranca no Laravel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Fechamento Diario": {
+      "main": [
+        [
+          {
+            "node": "Buscar Fechamento Diario",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agendar Fechamento Diario": {
+      "main": [
+        [
+          {
+            "node": "Buscar Fechamento Diario",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar Fechamento Diario": {
+      "main": [
+        [
+          {
+            "node": "Preparar Prompt Fechamento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Prompt Fechamento": {
+      "main": [
+        [
+          {
+            "node": "Gerar Resumo IA Fechamento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gerar Resumo IA Fechamento": {
+      "main": [
+        [
+          {
+            "node": "Preparar Notificacao Fechamento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Notificacao Fechamento": {
+      "main": [
+        [
+          {
+            "node": "Notificar Fechamento Financeiro",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Alerta NFSe": {
+      "main": [
+        [
+          {
+            "node": "Buscar NFSe Pendentes",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Buscar NFSe Com Erro",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agendar Alertas NFSe": {
+      "main": [
+        [
+          {
+            "node": "Buscar NFSe Pendentes",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Buscar NFSe Com Erro",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar NFSe Com Erro": {
+      "main": [
+        [
+          {
+            "node": "Consolidar Alertas NFSe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consolidar Alertas NFSe": {
+      "main": [
+        [
+          {
+            "node": "Gerar Resumo IA NFSe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gerar Resumo IA NFSe": {
+      "main": [
+        [
+          {
+            "node": "Preparar Notificacao NFSe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Notificacao NFSe": {
+      "main": [
+        [
+          {
+            "node": "Notificar Alertas NFSe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "0f24419b-8f38-4f5a-a38d-workflow001",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "id": "0f24419b-8f38-4f5a-a38d-workflow001",
+  "tags": []
+}

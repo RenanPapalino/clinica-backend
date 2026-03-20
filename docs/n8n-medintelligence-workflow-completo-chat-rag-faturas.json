@@ -1,0 +1,1771 @@
+{
+  "name": "MedIntelligence_Chatbot_IA_RAG_Faturas_Completo",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "medintelligence_chatbot_ia",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -4020,
+        -1660
+      ],
+      "id": "aec70565-fc05-42a6-bddf-74db63a317dd",
+      "name": "Webhook Chatbot IA",
+      "webhookId": "f2b8a4b2-a4f8-4ab6-8442-d111e414bf7d"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.headers['x-workflow-secret'] || $json.headers['X-Workflow-Secret'] || '' }}",
+                    "rightValue": "COLE_WORKFLOW_SECRET_AQUI",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "7c81d1e7-ceea-4410-bce0-60dbaec187c0"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "autorizado"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.3,
+      "position": [
+        -3780,
+        -1660
+      ],
+      "id": "e628ba05-b172-4d58-bec2-2dd92cf89157",
+      "name": "Autenticar Chatbot"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "58f79a0c-97e4-494c-96ec-b959fabd6921",
+              "name": "success",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "61704d38-52f2-4ff4-a98e-ae3b1c9cd678",
+              "name": "message",
+              "value": "Webhook do chatbot nao autorizado.",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -3540,
+        -1780
+      ],
+      "id": "72eee94b-f2fc-4ce0-99c7-5ce7d29764d2",
+      "name": "Chatbot Nao Autorizado"
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -3300,
+        -1780
+      ],
+      "id": "5bb126a2-40d2-4db0-869e-90c91e836e2b",
+      "name": "Responder Chatbot Nao Autorizado"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "7e006f1a-f376-4982-88fa-f9a3a96a45d8",
+              "name": "mensagem",
+              "value": "={{ $json.body.mensagem || $json.body.message || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "8adb426b-da81-45de-be50-4d2e45506e76",
+              "name": "session_id",
+              "value": "={{ $json.body.session_id || $json.body.conversation_id || ('sessao_' + ($json.body.user_id || 'anon')) }}",
+              "type": "string"
+            },
+            {
+              "id": "3f8ea8e3-5dc1-4f39-b2db-b08450e74760",
+              "name": "tipo_processamento",
+              "value": "={{ $json.body.tipo_processamento || 'auto' }}",
+              "type": "string"
+            },
+            {
+              "id": "fb6d2b07-32c8-49d2-b277-f79270aad9c5",
+              "name": "auth_token",
+              "value": "={{ $json.body.user_token || $json.body.auth_token || $json.headers.authorization || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "eb9e9795-442f-48db-b78e-5a3def4a2319",
+              "name": "tem_arquivo",
+              "value": "={{ (($json.body.arquivo || {}).base64) ? 'sim' : 'nao' }}",
+              "type": "string"
+            },
+            {
+              "id": "95bc5ea5-f0db-44d0-888e-465306b72ffb",
+              "name": "arquivo_base64",
+              "value": "={{ (($json.body.arquivo || {}).base64) || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "efced322-71dc-40b1-a667-db67dc87bb49",
+              "name": "arquivo_nome",
+              "value": "={{ (($json.body.arquivo || {}).nome) || 'arquivo-chat' }}",
+              "type": "string"
+            },
+            {
+              "id": "56ec1ba7-0db7-4db9-b1e1-35ce480138ab",
+              "name": "arquivo_mime",
+              "value": "={{ (($json.body.arquivo || {}).mime_type) || 'application/octet-stream' }}",
+              "type": "string"
+            },
+            {
+              "id": "795c00e1-64d3-4879-86c9-c94567d6b1e2",
+              "name": "modo_operacao",
+              "value": "={{ ($json.body.confirmar || $json.body.operacao === 'confirmar' || ($json.body.acao && $json.body.dados)) ? 'confirmar' : 'enviar' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -3540,
+        -1540
+      ],
+      "id": "dd85d0b9-e0ec-4854-a3df-1e75e34f84eb",
+      "name": "Normalizar Chatbot"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.tem_arquivo }}",
+                    "rightValue": "sim",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "d1e3f191-4b39-4614-b872-e0a013215b0a"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "com_arquivo"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.3,
+      "position": [
+        -3300,
+        -1540
+      ],
+      "id": "a2dcb2f2-06bc-4997-8804-021f6eefdbfb",
+      "name": "Tem Arquivo no Chat"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.papalino.com.br/api/chat/enviar",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "={{ $json.auth_token ? ($json.auth_token.startsWith('Bearer ') ? $json.auth_token : ('Bearer ' + $json.auth_token)) : '' }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ mensagem: $json.mensagem, session_id: $json.session_id, tipo_processamento: $json.tipo_processamento, espelhar_no_drive: true, drive_required: false }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -3040,
+        -1660
+      ],
+      "id": "5fd6b09e-b3cc-4895-a67b-749c6f34e2e7",
+      "name": "Laravel Chat Texto"
+    },
+    {
+      "parameters": {
+        "operation": "toBinary",
+        "sourceProperty": "arquivo_base64",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        -3040,
+        -1420
+      ],
+      "id": "dbc38ea0-555c-4e1a-a04a-b95cd650f6e9",
+      "name": "Converter Arquivo do Chat"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.papalino.com.br/api/chat/enviar",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "={{ $('Normalizar Chatbot').item.json.auth_token ? ($('Normalizar Chatbot').item.json.auth_token.startsWith('Bearer ') ? $('Normalizar Chatbot').item.json.auth_token : ('Bearer ' + $('Normalizar Chatbot').item.json.auth_token)) : '' }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "mensagem",
+              "value": "={{ $('Normalizar Chatbot').item.json.mensagem }}"
+            },
+            {
+              "name": "session_id",
+              "value": "={{ $('Normalizar Chatbot').item.json.session_id }}"
+            },
+            {
+              "name": "tipo_processamento",
+              "value": "={{ $('Normalizar Chatbot').item.json.tipo_processamento }}"
+            },
+            {
+              "name": "espelhar_no_drive",
+              "value": "1"
+            },
+            {
+              "name": "drive_required",
+              "value": "0"
+            },
+            {
+              "parameterType": "formBinaryData",
+              "name": "arquivo",
+              "inputDataFieldName": "data"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -2800,
+        -1420
+      ],
+      "id": "de5c8ee2-d8ee-4e2b-bf59-da7cbbdb389e",
+      "name": "Laravel Chat Arquivo"
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -2560,
+        -1540
+      ],
+      "id": "254b75dc-dd22-457a-95d3-f1b3273d54ce",
+      "name": "Responder Chatbot IA"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "medintelligence_parser_fatura",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -4020,
+        -700
+      ],
+      "id": "3dc2656d-99c8-4e3c-9ea3-67cf2dd8176c",
+      "name": "Webhook Parser de Fatura",
+      "webhookId": "f4f4f1df-885b-432b-9e35-1b837e1a1b8f"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.headers['x-workflow-secret'] || $json.headers['X-Workflow-Secret'] || '' }}",
+                    "rightValue": "COLE_WORKFLOW_SECRET_AQUI",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "11b25e53-8f7e-48f9-9802-36e7b4f0eed8"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "autorizado"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.3,
+      "position": [
+        -3780,
+        -700
+      ],
+      "id": "6e162298-b2af-4315-9653-81664a9c3ed2",
+      "name": "Autenticar Parser"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "7c211f25-c1f4-4d13-b076-114eebb6377a",
+              "name": "success",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "61f40463-b158-4a13-b12b-7980ab1b6909",
+              "name": "message",
+              "value": "Webhook do parser nao autorizado.",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -3540,
+        -820
+      ],
+      "id": "dc7c1201-ccc3-4a59-8772-f21b0541c7a0",
+      "name": "Parser Nao Autorizado"
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -3300,
+        -820
+      ],
+      "id": "e077b8e5-3685-4a34-8c93-0ed6c6e7d76b",
+      "name": "Responder Parser Nao Autorizado"
+    },
+    {
+      "parameters": {
+        "operation": "toBinary",
+        "sourceProperty": "body.arquivo.base64",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        -3540,
+        -700
+      ],
+      "id": "aac6c1c5-f3eb-441c-b7bd-539f30643ff2",
+      "name": "Converter Arquivo Parser"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.cloud.llamaindex.ai/api/v1/parsing/upload",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer COLE_LLAMA_PARSE_API_KEY_AQUI"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "data"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -3300,
+        -700
+      ],
+      "id": "b247ae7f-00c7-49cb-9a5b-4fda1a1834e7",
+      "name": "Enviar Parser Avancado"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -3060,
+        -700
+      ],
+      "id": "7d1b0f62-4453-4957-9d5b-bbd8d2d3f506",
+      "name": "Aguardar Parser",
+      "webhookId": "366e9229-e2ba-4f86-92d9-318acf8e7097"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.cloud.llamaindex.ai/api/v1/parsing/job/{{ $json.id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer COLE_LLAMA_PARSE_API_KEY_AQUI"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -2880,
+        -700
+      ],
+      "id": "0cf78244-0238-4e3b-94f1-b8b8b8e460ba",
+      "name": "Consultar Status Parser"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "SUCCESS",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "e72659d9-1b43-4d8f-be08-ca4d881cf3ad"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "sucesso"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "PENDING",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "ea648cb5-c202-430c-a5e1-52becd332230"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "pendente"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.3,
+      "position": [
+        -2680,
+        -700
+      ],
+      "id": "272b83af-d738-4fa8-af5d-cd021105bec7",
+      "name": "Status Parser"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.cloud.llamaindex.ai/api/v1/parsing/job/{{ $json.id }}/result/markdown",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "Bearer COLE_LLAMA_PARSE_API_KEY_AQUI"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -2440,
+        -820
+      ],
+      "id": "20e49f37-c91e-44f1-83f5-3eaefae63c4c",
+      "name": "Buscar Markdown Parser"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Voce deve extrair um preview estruturado para o chatbot financeiro do MedIntelligence. Leia o markdown abaixo e retorne EXATAMENTE o schema definido no Output Parser. Quando o documento representar cobranca, planilha de faturamento, relatorio SOC, pedido de cobranca ou servicos faturaveis, retorne acao_sugerida='gerar_fatura'. Nao invente cliente_id nem servico_id. Quando nao souber o cliente interno, use cliente e cliente_cnpj. Se houver varias linhas do mesmo cliente no mesmo periodo, consolide em uma unica fatura com varios itens. Preencha data_emissao com a data do documento quando existir; caso contrario use string vazia. \n\nMARKDOWN:\n{{ $json.markdown }}",
+        "hasOutputParser": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3,
+      "position": [
+        -2220,
+        -820
+      ],
+      "id": "a163a20a-fce9-4e0c-82f6-8ca38bd79dd9",
+      "name": "AI Parser Fatura"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gpt-4.1-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -2220,
+        -600
+      ],
+      "id": "7c2bb354-ab45-4764-9c8a-5f199ca5b84a",
+      "name": "OpenAI Chat Model Parser",
+      "credentials": {
+        "openAiApi": {
+          "id": "3r6tA0jHhUnPeGbC",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"mensagem\": \"\",\n  \"acao_sugerida\": \"gerar_fatura\",\n  \"dados_estruturados\": {\n    \"sucesso\": true,\n    \"tipo\": \"fatura\",\n    \"acao_sugerida\": \"gerar_fatura\",\n    \"dados_mapeados\": [\n      {\n        \"cliente_id\": null,\n        \"cliente\": \"\",\n        \"cliente_cnpj\": \"\",\n        \"periodo_referencia\": \"\",\n        \"data_emissao\": \"\",\n        \"data_vencimento\": \"\",\n        \"status\": \"rascunho\",\n        \"observacoes\": \"\",\n        \"gerar_titulo\": true,\n        \"itens\": [\n          {\n            \"servico_id\": null,\n            \"descricao\": \"\",\n            \"quantidade\": 1,\n            \"valor_unitario\": 0\n          }\n        ]\n      }\n    ],\n    \"colunas\": [],\n    \"total_registros\": 1,\n    \"confianca\": 0.0,\n    \"metadata\": {\n      \"fonte\": \"n8n-parser-avancado\",\n      \"precisa_confirmacao\": true\n    }\n  }\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        -2040,
+        -600
+      ],
+      "id": "b56c47ad-9bad-4423-9c02-d23bf5a8235f",
+      "name": "Structured Output Parser Fatura"
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -1980,
+        -820
+      ],
+      "id": "437e3fc8-881b-44cf-a696-b0c219d4f90a",
+      "name": "Responder Parser Estruturado"
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "authentication": "serviceAccount",
+        "triggerOn": "specificFolder",
+        "folderToWatch": {
+          "__rl": true,
+          "value": "1gdNPlghZaOsXMRjJ39Ssp_AFgiIgb-_a",
+          "mode": "list",
+          "cachedResultName": "N8N",
+          "cachedResultUrl": "https://drive.google.com/drive/folders/1gdNPlghZaOsXMRjJ39Ssp_AFgiIgb-_a"
+        },
+        "event": "fileCreated",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDriveTrigger",
+      "typeVersion": 1,
+      "position": [
+        -4020,
+        180
+      ],
+      "id": "947bb54a-a39a-4811-aab7-3e8356b46468",
+      "name": "Arquivo Novo",
+      "credentials": {
+        "googleApi": {
+          "id": "yPiipoxtAYdTbSpq",
+          "name": "N8N"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "authentication": "serviceAccount",
+        "triggerOn": "specificFolder",
+        "folderToWatch": {
+          "__rl": true,
+          "value": "1gdNPlghZaOsXMRjJ39Ssp_AFgiIgb-_a",
+          "mode": "list",
+          "cachedResultName": "N8N",
+          "cachedResultUrl": "https://drive.google.com/drive/folders/1gdNPlghZaOsXMRjJ39Ssp_AFgiIgb-_a"
+        },
+        "event": "fileUpdated",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDriveTrigger",
+      "typeVersion": 1,
+      "position": [
+        -4020,
+        360
+      ],
+      "id": "5f538ba6-ce54-484d-bc71-f62a47124fae",
+      "name": "Arquivo Atualizado",
+      "credentials": {
+        "googleApi": {
+          "id": "yPiipoxtAYdTbSpq",
+          "name": "N8N"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "authentication": "serviceAccount",
+        "triggerOn": "specificFolder",
+        "folderToWatch": {
+          "__rl": true,
+          "value": "1gdNPlghZaOsXMRjJ39Ssp_AFgiIgb-_a",
+          "mode": "list",
+          "cachedResultName": "N8N",
+          "cachedResultUrl": "https://drive.google.com/drive/folders/1gdNPlghZaOsXMRjJ39Ssp_AFgiIgb-_a"
+        },
+        "event": "fileDeleted",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDriveTrigger",
+      "typeVersion": 1,
+      "position": [
+        -4020,
+        620
+      ],
+      "id": "ef5155a0-ea6e-4ba6-8f1d-be4cd208ad1c",
+      "name": "Arquivo Excluido",
+      "credentials": {
+        "googleApi": {
+          "id": "yPiipoxtAYdTbSpq",
+          "name": "N8N"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "de236e0a-44b4-4050-ba98-800c73d50da8",
+              "name": "file_id",
+              "value": "={{ $json.id }}",
+              "type": "string"
+            },
+            {
+              "id": "bcfa8268-c893-45e4-9512-087afee2ca5d",
+              "name": "file_name",
+              "value": "={{ $json.name }}",
+              "type": "string"
+            },
+            {
+              "id": "ef4f7f30-208f-450e-9974-e9a1cd37395c",
+              "name": "file_type",
+              "value": "={{ $json.mimeType }}",
+              "type": "string"
+            },
+            {
+              "id": "d9e28a6a-6725-477d-885a-72b88c00b26c",
+              "name": "folder_id",
+              "value": "={{ Array.isArray($json.parents) && $json.parents.length ? $json.parents[0] : '' }}",
+              "type": "string"
+            },
+            {
+              "id": "458d2e3f-e2b0-42f6-a385-57b06b83b246",
+              "name": "source_system",
+              "value": "google_drive",
+              "type": "string"
+            },
+            {
+              "id": "5295fa65-8dda-4792-99e2-a08091306a7b",
+              "name": "trigger_event",
+              "value": "drive_file_upsert",
+              "type": "string"
+            },
+            {
+              "id": "d97a96d2-6f69-4be6-9ae6-bf68f165dcbe",
+              "name": "external_updated_at",
+              "value": "={{ $json.modifiedTime || $json.createdTime || $now.toISO() }}",
+              "type": "string"
+            },
+            {
+              "id": "8b6e2d4d-030f-45b5-aaf9-23f0f8613b45",
+              "name": "checksum",
+              "value": "={{ $json.md5Checksum || $json.sha1Checksum || $json.modifiedTime || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "43d8eccc-820d-4576-8eb0-556ce6d446d2",
+              "name": "business_context",
+              "value": "={{ (($json.appProperties || {}).tipo_processamento) || 'geral' }}",
+              "type": "string"
+            },
+            {
+              "id": "f206032a-b88e-47c8-88e0-410bc27e8fbb",
+              "name": "context_key",
+              "value": "={{ (($json.appProperties || {}).session_id) || (Array.isArray($json.parents) && $json.parents.length ? $json.parents[0] : 'drive') }}",
+              "type": "string"
+            },
+            {
+              "id": "376f5383-2607-41b9-b56e-d07743463a37",
+              "name": "chat_user_id",
+              "value": "={{ (($json.appProperties || {}).user_id) || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "3f26c81d-896b-41d7-9d48-9a000b74d23b",
+              "name": "upload_source",
+              "value": "={{ (($json.appProperties || {}).source) || 'google_drive' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -3780,
+        260
+      ],
+      "id": "2246c2b7-3ced-42b9-ab0b-3349ad0754b3",
+      "name": "Normalizar Documento"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "63faa13f-2285-434e-b789-e0ad99ce9764",
+              "name": "source_system",
+              "value": "google_drive",
+              "type": "string"
+            },
+            {
+              "id": "7d2d3beb-d8a4-45ac-b5c3-fe142675edd0",
+              "name": "file_id",
+              "value": "={{ $json.id }}",
+              "type": "string"
+            },
+            {
+              "id": "9972d3ba-d444-47bc-9ab8-e3007cf91b9a",
+              "name": "file_name",
+              "value": "={{ $json.name }}",
+              "type": "string"
+            },
+            {
+              "id": "7c3b05d2-5aa4-4e7c-a1df-6ecc92184cf4",
+              "name": "trigger_event",
+              "value": "drive_file_deleted",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -3780,
+        620
+      ],
+      "id": "4d9ca554-f575-4ffc-8e72-60f53ddd8a56",
+      "name": "Normalizar Exclusao"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.file_id }}",
+          "mode": "id"
+        },
+        "options": {
+          "googleFileConversion": {
+            "conversion": {
+              "docsToFormat": "text/plain",
+              "drawingsToFormat": "application/pdf",
+              "slidesToFormat": "application/pdf"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        -3540,
+        260
+      ],
+      "id": "2a49500e-3aaf-4775-ab89-067b0a76d07d",
+      "name": "Download File",
+      "credentials": {
+        "googleApi": {
+          "id": "yPiipoxtAYdTbSpq",
+          "name": "N8N"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Normalizar Documento').item.json.file_type }}",
+                    "rightValue": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "3f94b773-ce01-402c-a006-b568df25723e"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "xlsx"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Normalizar Documento').item.json.file_type }}",
+                    "rightValue": "application/pdf",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "6f13761f-8116-484b-8196-f5a899f298d6"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "pdf"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.3,
+      "position": [
+        -3300,
+        260
+      ],
+      "id": "cff6e780-0b9d-46be-82ea-1227d8f1c1d9",
+      "name": "Tipo Arquivo RAG"
+    },
+    {
+      "parameters": {
+        "operation": "xlsx",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -3060,
+        100
+      ],
+      "id": "82f7b2b8-2153-4e69-a3df-ab9242d1e981",
+      "name": "Extrair XLSX RAG"
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -3060,
+        260
+      ],
+      "id": "b5def663-5bd0-49b3-a581-7a712ed19b0c",
+      "name": "Extrair PDF RAG"
+    },
+    {
+      "parameters": {
+        "operation": "text",
+        "destinationOutputField": "content",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -3060,
+        420
+      ],
+      "id": "a560528a-8fa3-45e4-b7ed-c6e71ad1ff54",
+      "name": "Extrair Texto RAG"
+    },
+    {
+      "parameters": {
+        "fieldsToSummarize": {
+          "values": [
+            {
+              "aggregation": "concatenate",
+              "field": "data"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.summarize",
+      "typeVersion": 1.1,
+      "position": [
+        -2820,
+        100
+      ],
+      "id": "9745dd0d-8d10-4044-8f1e-ea5af233ec28",
+      "name": "Consolidar XLSX RAG"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.papalino.com.br/api/internal/n8n/rag/upsert",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "X-N8N-Secret",
+              "value": "COLE_N8N_INGEST_SECRET_AQUI"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ source_system: $('Normalizar Documento').item.json.source_system, external_id: $('Normalizar Documento').item.json.file_id, file_name: $('Normalizar Documento').item.json.file_name, file_type: $('Normalizar Documento').item.json.file_type, business_context: $('Normalizar Documento').item.json.business_context, context_key: $('Normalizar Documento').item.json.context_key, checksum: $('Normalizar Documento').item.json.checksum, external_updated_at: $('Normalizar Documento').item.json.external_updated_at, metadata: { trigger_event: $('Normalizar Documento').item.json.trigger_event, folder_id: $('Normalizar Documento').item.json.folder_id, source: $('Normalizar Documento').item.json.upload_source, chat_user_id: $('Normalizar Documento').item.json.chat_user_id, context_key: $('Normalizar Documento').item.json.context_key, extractor: 'xlsx' }, chunks: [{ chunk_index: 0, content: $json.data || '', metadata: { extractor: 'xlsx', source_event: $('Normalizar Documento').item.json.trigger_event, context_key: $('Normalizar Documento').item.json.context_key } }] }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -2580,
+        100
+      ],
+      "id": "dad66761-68b7-4975-be26-28456d3880eb",
+      "name": "Laravel Upsert XLSX"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.papalino.com.br/api/internal/n8n/rag/upsert",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "X-N8N-Secret",
+              "value": "COLE_N8N_INGEST_SECRET_AQUI"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ source_system: $('Normalizar Documento').item.json.source_system, external_id: $('Normalizar Documento').item.json.file_id, file_name: $('Normalizar Documento').item.json.file_name, file_type: $('Normalizar Documento').item.json.file_type, business_context: $('Normalizar Documento').item.json.business_context, context_key: $('Normalizar Documento').item.json.context_key, checksum: $('Normalizar Documento').item.json.checksum, external_updated_at: $('Normalizar Documento').item.json.external_updated_at, metadata: { trigger_event: $('Normalizar Documento').item.json.trigger_event, folder_id: $('Normalizar Documento').item.json.folder_id, source: $('Normalizar Documento').item.json.upload_source, chat_user_id: $('Normalizar Documento').item.json.chat_user_id, context_key: $('Normalizar Documento').item.json.context_key, extractor: 'pdf' }, chunks: [{ chunk_index: 0, content: $json.text || $json.content || $json.data || '', metadata: { extractor: 'pdf', source_event: $('Normalizar Documento').item.json.trigger_event, context_key: $('Normalizar Documento').item.json.context_key } }] }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -2580,
+        260
+      ],
+      "id": "8bed0004-94df-4ddf-b0a9-967d9227a12e",
+      "name": "Laravel Upsert PDF"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.papalino.com.br/api/internal/n8n/rag/upsert",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "X-N8N-Secret",
+              "value": "COLE_N8N_INGEST_SECRET_AQUI"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ source_system: $('Normalizar Documento').item.json.source_system, external_id: $('Normalizar Documento').item.json.file_id, file_name: $('Normalizar Documento').item.json.file_name, file_type: $('Normalizar Documento').item.json.file_type, business_context: $('Normalizar Documento').item.json.business_context, context_key: $('Normalizar Documento').item.json.context_key, checksum: $('Normalizar Documento').item.json.checksum, external_updated_at: $('Normalizar Documento').item.json.external_updated_at, metadata: { trigger_event: $('Normalizar Documento').item.json.trigger_event, folder_id: $('Normalizar Documento').item.json.folder_id, source: $('Normalizar Documento').item.json.upload_source, chat_user_id: $('Normalizar Documento').item.json.chat_user_id, context_key: $('Normalizar Documento').item.json.context_key, extractor: 'text' }, chunks: [{ chunk_index: 0, content: $json.content || $json.text || $json.data || '', metadata: { extractor: 'text', source_event: $('Normalizar Documento').item.json.trigger_event, context_key: $('Normalizar Documento').item.json.context_key } }] }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -2580,
+        420
+      ],
+      "id": "d442e84a-8881-4fe4-bcb9-8c4360886ed7",
+      "name": "Laravel Upsert Texto"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.papalino.com.br/api/internal/n8n/rag/delete",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "X-N8N-Secret",
+              "value": "COLE_N8N_INGEST_SECRET_AQUI"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ source_system: $('Normalizar Exclusao').item.json.source_system, external_id: $('Normalizar Exclusao').item.json.file_id }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -3540,
+        620
+      ],
+      "id": "a7cdeb72-16eb-4400-a424-e68ecda9b4fc",
+      "name": "Laravel Delete RAG"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.modo_operacao }}",
+                    "rightValue": "confirmar",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "b070c256-db18-48a1-9fa3-482111601ae0"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "confirmacao"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.3,
+      "position": [
+        -3300,
+        -1540
+      ],
+      "id": "e42876a0-39fd-480b-acb2-105034818172",
+      "name": "Tipo Operacao Chat"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.papalino.com.br/api/chat/confirmar",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "={{ $('Normalizar Chatbot').item.json.auth_token ? ($('Normalizar Chatbot').item.json.auth_token.startsWith('Bearer ') ? $('Normalizar Chatbot').item.json.auth_token : ('Bearer ' + $('Normalizar Chatbot').item.json.auth_token)) : '' }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ acao: $('Webhook Chatbot IA').item.json.body.acao || '', dados: $('Webhook Chatbot IA').item.json.body.dados || [], metadata: $('Webhook Chatbot IA').item.json.body.metadata || {}, session_id: $('Normalizar Chatbot').item.json.session_id }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -3040,
+        -1420
+      ],
+      "id": "f35f21b6-3fe3-40c0-84a6-ff884e7d3323",
+      "name": "Confirmar Acao Laravel"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d545994c-c3a9-4a49-912d-9ac430d6c404",
+              "name": "success",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "6f1a6a15-5442-4cc8-b164-6dc8f436c0f2",
+              "name": "message",
+              "value": "={{ 'Parser nao finalizou com sucesso. Status atual: ' + ($json.status || 'desconhecido') }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -2200,
+        -520
+      ],
+      "id": "4ee92378-f410-453d-a2d7-628f08075bd7",
+      "name": "Falha Parser"
+    }
+  ],
+  "connections": {
+    "Webhook Chatbot IA": {
+      "main": [
+        [
+          {
+            "node": "Autenticar Chatbot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Autenticar Chatbot": {
+      "main": [
+        [
+          {
+            "node": "Normalizar Chatbot",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Chatbot Nao Autorizado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chatbot Nao Autorizado": {
+      "main": [
+        [
+          {
+            "node": "Responder Chatbot Nao Autorizado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalizar Chatbot": {
+      "main": [
+        [
+          {
+            "node": "Tipo Operacao Chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tem Arquivo no Chat": {
+      "main": [
+        [
+          {
+            "node": "Converter Arquivo do Chat",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Laravel Chat Texto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Converter Arquivo do Chat": {
+      "main": [
+        [
+          {
+            "node": "Laravel Chat Arquivo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Laravel Chat Texto": {
+      "main": [
+        [
+          {
+            "node": "Responder Chatbot IA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Laravel Chat Arquivo": {
+      "main": [
+        [
+          {
+            "node": "Responder Chatbot IA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Parser de Fatura": {
+      "main": [
+        [
+          {
+            "node": "Autenticar Parser",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Autenticar Parser": {
+      "main": [
+        [
+          {
+            "node": "Converter Arquivo Parser",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Parser Nao Autorizado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parser Nao Autorizado": {
+      "main": [
+        [
+          {
+            "node": "Responder Parser Nao Autorizado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Converter Arquivo Parser": {
+      "main": [
+        [
+          {
+            "node": "Enviar Parser Avancado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enviar Parser Avancado": {
+      "main": [
+        [
+          {
+            "node": "Aguardar Parser",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aguardar Parser": {
+      "main": [
+        [
+          {
+            "node": "Consultar Status Parser",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consultar Status Parser": {
+      "main": [
+        [
+          {
+            "node": "Status Parser",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Status Parser": {
+      "main": [
+        [
+          {
+            "node": "Buscar Markdown Parser",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Aguardar Parser",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Falha Parser",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar Markdown Parser": {
+      "main": [
+        [
+          {
+            "node": "AI Parser Fatura",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Parser Fatura": {
+      "main": [
+        [
+          {
+            "node": "Responder Parser Estruturado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model Parser": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Parser Fatura",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser Fatura": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI Parser Fatura",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Arquivo Novo": {
+      "main": [
+        [
+          {
+            "node": "Normalizar Documento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Arquivo Atualizado": {
+      "main": [
+        [
+          {
+            "node": "Normalizar Documento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Arquivo Excluido": {
+      "main": [
+        [
+          {
+            "node": "Normalizar Exclusao",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalizar Documento": {
+      "main": [
+        [
+          {
+            "node": "Download File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalizar Exclusao": {
+      "main": [
+        [
+          {
+            "node": "Laravel Delete RAG",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download File": {
+      "main": [
+        [
+          {
+            "node": "Tipo Arquivo RAG",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tipo Arquivo RAG": {
+      "main": [
+        [
+          {
+            "node": "Extrair XLSX RAG",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Extrair PDF RAG",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Extrair Texto RAG",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrair XLSX RAG": {
+      "main": [
+        [
+          {
+            "node": "Consolidar XLSX RAG",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consolidar XLSX RAG": {
+      "main": [
+        [
+          {
+            "node": "Laravel Upsert XLSX",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrair PDF RAG": {
+      "main": [
+        [
+          {
+            "node": "Laravel Upsert PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrair Texto RAG": {
+      "main": [
+        [
+          {
+            "node": "Laravel Upsert Texto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tipo Operacao Chat": {
+      "main": [
+        [
+          {
+            "node": "Confirmar Acao Laravel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Tem Arquivo no Chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirmar Acao Laravel": {
+      "main": [
+        [
+          {
+            "node": "Responder Chatbot IA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Falha Parser": {
+      "main": [
+        [
+          {
+            "node": "Responder Parser Estruturado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": null,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "versionId": "a87b46c4-ee6e-47c9-aed4-965d49ed56d9",
+  "id": "medintelligence-chatbot-ia-rag-faturas-completo",
+  "tags": []
+}

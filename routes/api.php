@@ -74,13 +74,27 @@ Route::prefix('internal/agent')->middleware('agent.runtime')->group(function () 
     Route::post('/session-context', [AgentToolController::class, 'sessionContext']);
     Route::post('/knowledge/search', [AgentToolController::class, 'searchKnowledge']);
     Route::get('/financial-summary', [AgentToolController::class, 'financialSummary']);
+    Route::post('/faturamento/summary', [AgentToolController::class, 'faturamentoSummary']);
+    Route::post('/caixa/previsao', [AgentToolController::class, 'previsaoCaixa']);
     Route::post('/clientes/search', [AgentToolController::class, 'searchClientes']);
+    Route::post('/clientes/status', [AgentToolController::class, 'updateClienteStatus']);
+    Route::post('/clientes/upsert', [AgentToolController::class, 'upsertCliente']);
+    Route::post('/cobrancas/inadimplentes', [AgentToolController::class, 'searchCobrancasInadimplentes']);
+    Route::post('/cobrancas/registrar', [AgentToolController::class, 'registrarCobrancaAutomacao']);
     Route::post('/fornecedores/search', [AgentToolController::class, 'searchFornecedores']);
     Route::post('/titulos/search', [AgentToolController::class, 'searchTitulos']);
+    Route::post('/titulos/baixar', [AgentToolController::class, 'baixarTitulo']);
+    Route::post('/titulos/renegociar', [AgentToolController::class, 'renegociarTitulo']);
+    Route::post('/faturas/search', [AgentToolController::class, 'searchFaturas']);
+    Route::post('/nfse/search', [AgentToolController::class, 'searchNfse']);
+    Route::post('/nfse/emitir', [AgentToolController::class, 'emitirNfse']);
+    Route::post('/fechamento/diario', [AgentToolController::class, 'fechamentoDiario']);
     Route::post('/despesas/search', [AgentToolController::class, 'searchDespesas']);
+    Route::post('/despesas/baixar', [AgentToolController::class, 'baixarDespesa']);
     Route::post('/clientes', [AgentToolController::class, 'createCliente']);
     Route::post('/contas-receber', [AgentToolController::class, 'createContaReceber']);
     Route::post('/contas-pagar', [AgentToolController::class, 'createContaPagar']);
+    Route::post('/faturas', [AgentToolController::class, 'createFatura']);
 });
 
 // ============================================
@@ -120,6 +134,9 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // ========== CADASTROS GERAIS ==========
     Route::prefix('cadastros')->group(function () {
+        Route::get('clientes/consultar-cpf', [ClienteController::class, 'consultarCpf']);
+        Route::get('clientes/consultar-cnpj', [ClienteController::class, 'consultarCnpj']);
+        Route::get('clientes/consultar-cep', [ClienteController::class, 'consultarCep']);
         Route::apiResource('clientes', ClienteController::class);
         Route::post('clientes/confirmar-importacao', [ClienteController::class, 'confirmarImportacao']);
         
@@ -129,12 +146,16 @@ Route::middleware('auth:sanctum')->group(function () {
     });
 
     // Fornecedores
+    Route::get('fornecedores/consultar-cnpj', [FornecedorController::class, 'consultarCnpj']);
+    Route::get('fornecedores/consultar-cep', [FornecedorController::class, 'consultarCep']);
     Route::apiResource('fornecedores', FornecedorController::class);
 
     // ========== FATURAMENTO INTELIGENTE ==========
     Route::prefix('faturamento')->group(function () {
         Route::get('faturas', [FaturaController::class, 'index']);
         Route::post('faturas', [FaturaController::class, 'store']);
+        Route::post('faturas/processar-lote', [FaturaController::class, 'processarLote']);
+        Route::delete('faturas/excluir-lote', [FaturaController::class, 'destroyLote']);
         Route::get('faturas/{id}', [FaturaController::class, 'show']);
         Route::put('faturas/{id}', [FaturaController::class, 'update']);
         Route::delete('faturas/{id}', [FaturaController::class, 'destroy']);
@@ -184,6 +205,7 @@ Route::middleware('auth:sanctum')->group(function () {
         Route::get('despesas', [DespesaController::class, 'index']);
         Route::post('despesas', [DespesaController::class, 'store']);
         Route::post('despesas/analisar-documento', [DespesaController::class, 'analisarDocumento']);
+        Route::post('despesas/analisar-codigo-barras', [DespesaController::class, 'analisarCodigoBarras']);
         Route::post('despesas/{id}/pagar', [DespesaController::class, 'pagar']);
     });
 

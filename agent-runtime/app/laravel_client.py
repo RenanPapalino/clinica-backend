@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -51,6 +52,46 @@ class LaravelInternalClient:
             user_id=user_id,
         )
 
+    async def faturamento_summary(
+        self,
+        *,
+        user_id: int,
+        periodo_inicio: str,
+        periodo_fim: str,
+        cliente_id: int | None = None,
+        status: str | None = None,
+        nfse_emitida: bool | None = None,
+    ) -> dict[str, Any]:
+        return await self._request(
+            path="/api/internal/agent/faturamento/summary",
+            method="POST",
+            user_id=user_id,
+            body={
+                "periodo_inicio": periodo_inicio,
+                "periodo_fim": periodo_fim,
+                "cliente_id": cliente_id,
+                "status": status,
+                "nfse_emitida": nfse_emitida,
+            },
+        )
+
+    async def previsao_caixa(
+        self,
+        *,
+        user_id: int,
+        periodo_inicio: str,
+        periodo_fim: str,
+    ) -> dict[str, Any]:
+        return await self._request(
+            path="/api/internal/agent/caixa/previsao",
+            method="POST",
+            user_id=user_id,
+            body={
+                "periodo_inicio": periodo_inicio,
+                "periodo_fim": periodo_fim,
+            },
+        )
+
     async def search_clientes(self, *, user_id: int, query: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
         return await self._request(
             path="/api/internal/agent/clientes/search",
@@ -77,6 +118,7 @@ class LaravelInternalClient:
         self,
         *,
         user_id: int,
+        query: str | None = None,
         cliente_id: int | None = None,
         tipo: str | None = None,
         status: str | None = None,
@@ -87,9 +129,64 @@ class LaravelInternalClient:
             method="POST",
             user_id=user_id,
             body={
+                "query": query,
                 "cliente_id": cliente_id,
                 "tipo": tipo,
                 "status": status,
+                "limit": limit,
+            },
+        )
+
+    async def search_faturas(
+        self,
+        *,
+        user_id: int,
+        query: str | None = None,
+        cliente_id: int | None = None,
+        status: str | None = None,
+        periodo_inicio: str | None = None,
+        periodo_fim: str | None = None,
+        nfse_emitida: bool | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        return await self._request(
+            path="/api/internal/agent/faturas/search",
+            method="POST",
+            user_id=user_id,
+            body={
+                "query": query,
+                "cliente_id": cliente_id,
+                "status": status,
+                "periodo_inicio": periodo_inicio,
+                "periodo_fim": periodo_fim,
+                "nfse_emitida": nfse_emitida,
+                "limit": limit,
+            },
+        )
+
+    async def search_nfse(
+        self,
+        *,
+        user_id: int,
+        query: str | None = None,
+        cliente_id: int | None = None,
+        fatura_id: int | None = None,
+        status: str | None = None,
+        periodo_inicio: str | None = None,
+        periodo_fim: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        return await self._request(
+            path="/api/internal/agent/nfse/search",
+            method="POST",
+            user_id=user_id,
+            body={
+                "query": query,
+                "cliente_id": cliente_id,
+                "fatura_id": fatura_id,
+                "status": status,
+                "periodo_inicio": periodo_inicio,
+                "periodo_fim": periodo_fim,
                 "limit": limit,
             },
         )
@@ -123,6 +220,22 @@ class LaravelInternalClient:
             body=payload,
         )
 
+    async def upsert_cliente(self, *, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._request(
+            path="/api/internal/agent/clientes/upsert",
+            method="POST",
+            user_id=user_id,
+            body=payload,
+        )
+
+    async def update_cliente_status(self, *, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._request(
+            path="/api/internal/agent/clientes/status",
+            method="POST",
+            user_id=user_id,
+            body=payload,
+        )
+
     async def create_conta_receber(self, *, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request(
             path="/api/internal/agent/contas-receber",
@@ -137,6 +250,59 @@ class LaravelInternalClient:
             method="POST",
             user_id=user_id,
             body=payload,
+        )
+
+    async def create_fatura(self, *, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._request(
+            path="/api/internal/agent/faturas",
+            method="POST",
+            user_id=user_id,
+            body=payload,
+        )
+
+    async def emitir_nfse(self, *, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._request(
+            path="/api/internal/agent/nfse/emitir",
+            method="POST",
+            user_id=user_id,
+            body=payload,
+        )
+
+    async def baixar_titulo(self, *, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._request(
+            path="/api/internal/agent/titulos/baixar",
+            method="POST",
+            user_id=user_id,
+            body=payload,
+        )
+
+    async def renegociar_titulo(self, *, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._request(
+            path="/api/internal/agent/titulos/renegociar",
+            method="POST",
+            user_id=user_id,
+            body=payload,
+        )
+
+    async def baixar_despesa(self, *, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._request(
+            path="/api/internal/agent/despesas/baixar",
+            method="POST",
+            user_id=user_id,
+            body=payload,
+        )
+
+    async def fechamento_diario(
+        self,
+        *,
+        user_id: int,
+        data: str | None = None,
+    ) -> dict[str, Any]:
+        return await self._request(
+            path="/api/internal/agent/fechamento/diario",
+            method="POST",
+            user_id=user_id,
+            body={"data": data},
         )
 
     async def _request(
@@ -165,10 +331,7 @@ class LaravelInternalClient:
                 headers=headers,
             )
 
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = {"message": response.text}
+        payload = self._decode_payload(response)
 
         if response.status_code >= 400:
             raise LaravelApiError(
@@ -183,3 +346,20 @@ class LaravelInternalClient:
             return payload["data"]
 
         return payload
+
+    def _decode_payload(self, response: httpx.Response) -> dict[str, Any] | list[Any]:
+        try:
+            return response.json()
+        except ValueError:
+            text = response.text or ""
+            start_positions = [index for index in (text.find("{"), text.find("[")) if index >= 0]
+            if start_positions:
+                candidate = text[min(start_positions):].strip()
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, (dict, list)):
+                        return parsed
+                except ValueError:
+                    pass
+
+            return {"message": text}

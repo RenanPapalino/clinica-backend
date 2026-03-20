@@ -15,6 +15,8 @@ class DocumentReaderService
         $prompt = "
             Analise esta imagem de um documento financeiro (Boleto, Nota Fiscal ou Recibo).
             Extraia os seguintes dados em formato JSON estrito:
+            - documento_tipo (boleto, nota_fiscal, recibo ou outro)
+            - numero_documento (se houver)
             - valor_total (float)
             - data_vencimento (YYYY-MM-DD)
             - data_emissao (YYYY-MM-DD)
@@ -22,6 +24,16 @@ class DocumentReaderService
             - codigo_barras (linha digitável se houver)
             - cnpj_fornecedor (apenas números)
             - nome_fornecedor
+            - email_fornecedor
+            - telefone_fornecedor (apenas números)
+            - cep_fornecedor (apenas números)
+            - logradouro_fornecedor
+            - numero_fornecedor
+            - complemento_fornecedor
+            - bairro_fornecedor
+            - cidade_fornecedor
+            - uf_fornecedor
+            - observacoes (detalhes úteis do documento)
             
             Se não encontrar algum campo, retorne null. Não invente dados.
         ";

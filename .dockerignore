@@ -1,9 +1,15 @@
 .git
 .gitignore
 .env
+.env.*
 .env.backup
 node_modules
 vendor
+agent-runtime/.env
+agent-runtime/.venv
+agent-runtime/medintelligence_agent_runtime.egg-info
+tests
+docs
 storage/logs/*.log
 *.sql
 *.zip

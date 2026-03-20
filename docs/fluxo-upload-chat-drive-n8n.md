@@ -18,7 +18,7 @@ flowchart TD
     C --> D[Valida tamanho, nome, MIME e gera base64]
     C --> E{espelhar_no_drive ativo?}
     E -- nao --> F[Laravel envia anexo direto para o runtime LangChain]
-    E -- sim --> G[GoogleDriveFileMirrorService autentica via service account]
+    E -- sim --> G[GoogleDriveFileMirrorService autentica via OAuth ou service account]
     G --> H[Google Drive cria o arquivo na pasta monitorada]
     H --> I[n8n Google Drive Trigger detecta fileCreated]
     I --> J[n8n baixa e extrai o conteudo]
@@ -82,15 +82,17 @@ Arquivo principal:
 
 Responsavel por:
 
-- carregar credenciais da service account
-- gerar JWT assinado
-- trocar JWT por `access_token`
+- autenticar no Google Drive via `OAuth refresh token` ou `service account`
+- trocar credenciais por `access_token`
 - criar o arquivo remoto no Google Drive
 - enviar o conteudo binario do arquivo
 - devolver metadata do arquivo criado
 
 Variaveis usadas:
 
+- `GOOGLE_DRIVE_OAUTH_CLIENT_ID`
+- `GOOGLE_DRIVE_OAUTH_CLIENT_SECRET`
+- `GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN`
 - `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` ou `GOOGLE_DRIVE_SERVICE_ACCOUNT_PATH`
 - `GOOGLE_DRIVE_FOLDER_ID`
 - `GOOGLE_DRIVE_SCOPE`
@@ -106,7 +108,7 @@ Resultado retornado ao chat:
   "provider": "google_drive",
   "file_id": "drive-file-001",
   "file_name": "chat-upload_u10_sessao_1_20260319_103000_clientes.xlsx",
-  "folder_id": "1GJiQDVdOJ8ljF4CS9kH6n7vKLrDzD_oi"
+  "folder_id": "1gdNPlghZaOsXMRjJ39Ssp_AFgiIgb-_a"
 }
 ```
 
@@ -119,7 +121,8 @@ Responsavel por:
 
 Ponto importante:
 
-- a service account precisa ter acesso de escrita na pasta monitorada
+- para `My Drive` pessoal, use `OAuth refresh token`
+- para `Shared Drive`, `service account` continua valida
 
 ### 5. n8n
 
@@ -255,7 +258,7 @@ Sintoma:
 
 Responsavel:
 
-- credencial service account
+- credencial OAuth ou service account
 - pasta sem permissao
 - `GOOGLE_DRIVE_FOLDER_ID` errado
 
@@ -294,8 +297,10 @@ CHATBOT_CHAT_UPLOAD_MIRROR_TO_DRIVE=true
 CHATBOT_CHAT_UPLOAD_MIRROR_TO_DRIVE_REQUIRED=false
 CHATBOT_CHAT_UPLOAD_DRIVE_NAME_PREFIX=chat-upload
 
-GOOGLE_DRIVE_SERVICE_ACCOUNT_PATH=/caminho/credentials.json
-GOOGLE_DRIVE_FOLDER_ID=1GJiQDVdOJ8ljF4CS9kH6n7vKLrDzD_oi
+GOOGLE_DRIVE_OAUTH_CLIENT_ID=seu-client-id.apps.googleusercontent.com
+GOOGLE_DRIVE_OAUTH_CLIENT_SECRET=seu-client-secret
+GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN=seu-refresh-token
+GOOGLE_DRIVE_FOLDER_ID=1gdNPlghZaOsXMRjJ39Ssp_AFgiIgb-_a
 GOOGLE_DRIVE_SCOPE=https://www.googleapis.com/auth/drive
 ```
 
@@ -307,3 +312,21 @@ GOOGLE_DRIVE_SCOPE=https://www.googleapis.com/auth/drive
 4. confirmar no n8n se o trigger rodou
 5. confirmar no MySQL se surgiram registros em `rag_documents` e `rag_chunks`
 6. fazer uma pergunta ao chatbot sobre o documento depois da ingestao
+
+## Como gerar o refresh token do Google
+
+1. ativar a `Google Drive API` no projeto do Google Cloud
+2. criar um `ID do cliente OAuth` do tipo `Aplicativo da Web`
+3. adicionar `https://developers.google.com/oauthplayground` em `Authorized redirect URIs`
+4. abrir `https://developers.google.com/oauthplayground/`
+5. marcar `Use your own OAuth credentials`
+6. informar `client_id` e `client_secret`
+7. autorizar o escopo `https://www.googleapis.com/auth/drive`
+8. trocar o codigo por tokens
+9. copiar o `refresh_token`
+10. preencher o `.env` e rodar `php artisan config:clear`
+
+Observacao:
+
+- em `Testing`, o refresh token pode expirar em 7 dias
+- para uso continuo, publique a app em `In production`

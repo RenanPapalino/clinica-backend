@@ -34,6 +34,7 @@ class FaturaResource extends JsonResource
             'linha_digitavel'    => $tituloReceber?->linha_digitavel,
             'codigo_barras'      => $tituloReceber?->codigo_barras,
             'observacoes'        => $this->observacoes,
+            'metadata'           => $this->metadata,
             'itens'              => FaturaItemResource::collection($this->whenLoaded('itens')),
             'titulos'            => TituloResource::collection($this->whenLoaded('titulos')),
             'created_at'         => optional($this->created_at)->toIso8601String(),

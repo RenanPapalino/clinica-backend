@@ -1,6 +1,7 @@
 from functools import lru_cache
 
 from pydantic import Field
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,6 +12,8 @@ class Settings(BaseSettings):
 
     openai_api_key: str = Field(default="")
     openai_model: str = Field(default="gpt-4.1-mini")
+    openai_vision_model: str = Field(default="gpt-4.1-mini")
+    openai_transcription_model: str = Field(default="whisper-1")
 
     runtime_service_token: str = Field(default="")
     laravel_base_url: str = Field(default="http://localhost:8000")
@@ -26,6 +29,24 @@ class Settings(BaseSettings):
         env_prefix="",
         case_sensitive=False,
     )
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def normalize_debug(cls, value):
+        if isinstance(value, bool):
+            return value
+
+        if value is None:
+            return False
+
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on", "debug", "development"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "release", "prod", "production", ""}:
+                return False
+
+        return bool(value)
 
 
 @lru_cache

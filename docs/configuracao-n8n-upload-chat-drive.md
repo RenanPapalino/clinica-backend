@@ -10,6 +10,19 @@ Importe:
 
 - [n8n-medintelligence-rag-ingest-mysql-producao-sem-env.json](/Users/papalino/workspace/medintelligence/clinica-backend/docs/n8n-medintelligence-rag-ingest-mysql-producao-sem-env.json)
 
+## URLs de teste do workflow completo
+
+Para o workflow unificado do chatbot com IA, parser de fatura e ingestao RAG, as URLs de teste da sua instancia n8n sao:
+
+- `https://n8n-n8n-start.aeuv6j.easypanel.host/webhook-test/medintelligence_chatbot_ia`
+- `https://n8n-n8n-start.aeuv6j.easypanel.host/webhook-test/medintelligence_parser_fatura`
+
+Observacao:
+
+- no JSON do workflow o n8n salva apenas o `path` do webhook
+- como os paths ja sao `medintelligence_chatbot_ia` e `medintelligence_parser_fatura`, nao foi necessario alterar a estrutura do node `Webhook`
+- ao importar esse workflow nessa instancia, essas passam a ser as URLs efetivas de teste
+
 ## Antes de abrir o n8n
 
 No Laravel:
@@ -17,15 +30,22 @@ No Laravel:
 ```env
 CHATBOT_CHAT_UPLOAD_MIRROR_TO_DRIVE=true
 CHATBOT_CHAT_UPLOAD_MIRROR_TO_DRIVE_REQUIRED=false
-GOOGLE_DRIVE_SERVICE_ACCOUNT_PATH=/caminho/credentials.json
-GOOGLE_DRIVE_FOLDER_ID=1GJiQDVdOJ8ljF4CS9kH6n7vKLrDzD_oi
+GOOGLE_DRIVE_OAUTH_CLIENT_ID=seu-client-id.apps.googleusercontent.com
+GOOGLE_DRIVE_OAUTH_CLIENT_SECRET=seu-client-secret
+GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN=seu-refresh-token
+GOOGLE_DRIVE_FOLDER_ID=1gdNPlghZaOsXMRjJ39Ssp_AFgiIgb-_a
 N8N_INGEST_SECRET=SEU_SECRET
 ```
 
 Ponto critico:
 
-- a pasta `1GJiQDVdOJ8ljF4CS9kH6n7vKLrDzD_oi` precisa estar compartilhada com o e-mail da service account usada pelo Laravel
+- o backend vai subir o arquivo em nome da sua conta Google via OAuth 2.0
 - a mesma pasta tambem precisa ser acessivel pela credencial Google `N8N` dentro do n8n
+
+Observacao:
+
+- `service account` continua suportada no codigo, mas para `My Drive` pessoal o caminho recomendado e `OAuth refresh token`
+- `service account` so faz sentido se voce tiver `Shared Drive`
 
 ## Passo 1: credencial Google no n8n
 
@@ -41,7 +61,7 @@ Nos 4 nos abaixo, confirme a credencial `N8N`:
 Nos 3 triggers do Google Drive, confirme:
 
 - `Trigger On`: pasta especifica
-- `Folder`: `1GJiQDVdOJ8ljF4CS9kH6n7vKLrDzD_oi`
+- `Folder`: `1gdNPlghZaOsXMRjJ39Ssp_AFgiIgb-_a`
 - `Watch For`:
   - `Arquivo Novo` -> `File Created`
   - `Arquivo Atualizado` -> `File Updated`
@@ -137,7 +157,7 @@ O retorno imediato do chat agora pode trazer:
     "success": true,
     "provider": "google_drive",
     "file_id": "drive-file-001",
-    "folder_id": "1GJiQDVdOJ8ljF4CS9kH6n7vKLrDzD_oi"
+    "folder_id": "1gdNPlghZaOsXMRjJ39Ssp_AFgiIgb-_a"
   }
 }
 ```
@@ -164,7 +184,60 @@ Causas comuns:
 - pasta errada
 - credencial Google errada
 - arquivo foi enviado para subpasta
-- service account do Laravel subiu em uma pasta diferente da monitorada
+- token OAuth do Laravel aponta para outra conta Google
+
+## Como gerar as credenciais OAuth no Google
+
+### 1. Ativar a Google Drive API
+
+- abra `https://console.cloud.google.com/apis/library/drive.googleapis.com`
+- selecione o projeto usado pelo chatbot
+- clique em `Ativar`
+
+### 2. Criar um client OAuth 2.0
+
+- va em `APIs e servicos` -> `Credenciais`
+- clique em `Criar credenciais` -> `ID do cliente OAuth`
+- se pedir, configure a tela de consentimento
+- escolha `Aplicativo da Web`
+- em `Authorized redirect URIs`, adicione:
+  - `https://developers.google.com/oauthplayground`
+- salve o `client_id` e o `client_secret`
+
+### 3. Gerar o refresh token
+
+- abra `https://developers.google.com/oauthplayground/`
+- clique na engrenagem
+- marque `Use your own OAuth credentials`
+- cole o `client_id` e `client_secret`
+- no passo 1, informe o escopo:
+  - `https://www.googleapis.com/auth/drive`
+- clique em `Authorize APIs`
+- faca login na conta dona da pasta `RAG`
+- clique em `Exchange authorization code for tokens`
+- copie o `refresh_token`
+
+Observacao:
+
+- se a tela de consentimento ficar em `Testing`, o refresh token pode expirar em 7 dias
+- para token de longa duracao, publique a app em `In production`
+
+### 4. Preencher o Laravel
+
+No `.env`:
+
+```env
+GOOGLE_DRIVE_OAUTH_CLIENT_ID=seu-client-id.apps.googleusercontent.com
+GOOGLE_DRIVE_OAUTH_CLIENT_SECRET=seu-client-secret
+GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN=seu-refresh-token
+GOOGLE_DRIVE_FOLDER_ID=1gdNPlghZaOsXMRjJ39Ssp_AFgiIgb-_a
+```
+
+Depois rode:
+
+```bash
+php artisan config:clear
+```
 
 ### HTTP 401 ou 403 no Laravel
 

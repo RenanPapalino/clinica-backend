@@ -12,6 +12,7 @@ use App\Models\Nfse;
 use App\Models\FaturaItem;
 use App\Services\SocImportService;
 use App\Services\TributoService;
+use App\Services\Bancos\ItauService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -126,6 +127,111 @@ class FaturaController extends Controller
         } catch (\Exception $e) {
             return response()->json(['success' => false, 'message' => 'Erro ao excluir'], 500);
         }
+    }
+
+    public function destroyLote(Request $request)
+    {
+        $data = $request->validate([
+            'ids' => 'required|array|min:1',
+            'ids.*' => 'integer|distinct',
+        ]);
+
+        $resultado = [
+            'excluidas' => 0,
+            'erros' => [],
+        ];
+
+        foreach ($data['ids'] as $id) {
+            try {
+                $fatura = Fatura::find($id);
+
+                if (!$fatura) {
+                    $resultado['erros'][] = "Fatura #{$id} não encontrada.";
+                    continue;
+                }
+
+                if ($fatura->nfse_emitida) {
+                    $resultado['erros'][] = "Fatura #{$id} possui NFS-e e não pode ser excluída.";
+                    continue;
+                }
+
+                $fatura->delete();
+                $resultado['excluidas']++;
+            } catch (\Throwable $e) {
+                $resultado['erros'][] = "Fatura #{$id}: {$e->getMessage()}";
+            }
+        }
+
+        return response()->json([
+            'success' => $resultado['excluidas'] > 0,
+            'message' => $resultado['excluidas'] > 0
+                ? "Exclusão em lote concluída. {$resultado['excluidas']} fatura(s) removida(s)."
+                : 'Nenhuma fatura foi excluída.',
+            'data' => $resultado,
+        ], !empty($resultado['erros']) && $resultado['excluidas'] === 0 ? 422 : 200);
+    }
+
+    public function processarLote(Request $request, ItauService $bancoService)
+    {
+        $data = $request->validate([
+            'ids' => 'required|array|min:1',
+            'ids.*' => 'integer|distinct',
+        ]);
+
+        $resultado = [
+            'processadas' => 0,
+            'nfse_emitidas' => 0,
+            'boletos_gerados' => 0,
+            'boletos_existentes' => 0,
+            'itens' => [],
+            'erros' => [],
+        ];
+
+        foreach ($data['ids'] as $id) {
+            try {
+                $fatura = Fatura::with(['cliente', 'itens', 'titulos.cliente'])->find($id);
+
+                if (!$fatura) {
+                    $resultado['erros'][] = "Fatura #{$id} não encontrada.";
+                    continue;
+                }
+
+                $acoes = [];
+
+                if ($this->deveEmitirNfse($fatura)) {
+                    $this->emitirNfseLocal($fatura);
+                    $resultado['nfse_emitidas']++;
+                    $acoes[] = 'nfse_emitida';
+                } elseif ($fatura->nfse_emitida) {
+                    $acoes[] = 'nfse_ja_emitida';
+                }
+
+                $modoBoleto = $this->registrarBoletoFatura($fatura->fresh(['cliente', 'itens', 'titulos.cliente']), $bancoService);
+                if ($modoBoleto === 'existing') {
+                    $resultado['boletos_existentes']++;
+                } else {
+                    $resultado['boletos_gerados']++;
+                }
+                $acoes[] = $modoBoleto === 'existing' ? 'boleto_existente' : "boleto_{$modoBoleto}";
+
+                $resultado['processadas']++;
+                $resultado['itens'][] = [
+                    'id' => $fatura->id,
+                    'numero_fatura' => $fatura->numero_fatura,
+                    'acoes' => $acoes,
+                ];
+            } catch (\Throwable $e) {
+                $resultado['erros'][] = "Fatura #{$id}: {$e->getMessage()}";
+            }
+        }
+
+        return response()->json([
+            'success' => $resultado['processadas'] > 0,
+            'message' => $resultado['processadas'] > 0
+                ? "Processamento em lote concluído. {$resultado['processadas']} fatura(s) tratada(s)."
+                : 'Nenhuma fatura foi processada.',
+            'data' => $resultado,
+        ], !empty($resultado['erros']) && $resultado['processadas'] === 0 ? 422 : 200);
     }
 
     /**
@@ -340,46 +446,7 @@ class FaturaController extends Controller
                 return response()->json(['success' => false, 'message' => 'NFS-e já emitida.'], 400);
             }
 
-            // Garante que a fatura tenha valores calculados antes de criar a NFSe
-            $this->recalcularTotaisFaturaSeNecessario($fatura);
-
-            // Calcula valores para registrar na NFSe local (fallback robusto)
-            $valorServicos = $this->calcularValorServicos($fatura);
-            $aliquotaIss = $fatura->cliente->aliquota_iss ?? 0;
-            $valorIss = $aliquotaIss > 0 ? round($valorServicos * ($aliquotaIss / 100), 2) : 0;
-            $valorLiquido = max($valorServicos - $valorIss, 0);
-
-            // Apenas registra localmente (sem envio à prefeitura)
-            $numeroGerado = 'NFSe-' . now()->format('Ymd') . '-' . str_pad($fatura->id, 4, '0', STR_PAD_LEFT);
-
-            $nfse = Nfse::create([
-                'fatura_id'      => $fatura->id,
-                'cliente_id'     => $fatura->cliente_id,
-                'numero_nfse'    => $numeroGerado,
-                'data_emissao'   => now(),
-                'data_envio'     => now(),
-                'valor_servicos' => $valorServicos,
-                'valor_iss'      => $valorIss,
-                'aliquota_iss'   => $aliquotaIss,
-                'valor_liquido'  => $valorLiquido,
-                'status'         => 'pendente', // pendente de envio real
-                'discriminacao'  => $fatura->observacoes,
-                'pdf_url'        => null,
-            ]);
-
-            // Atualiza status da fatura para refletir NFSe registrada localmente
-            $statusEmitida = 'emitida';
-            $dadosAtualizacao = [
-                'nfse_emitida' => true,
-                'nfse_numero'  => $numeroGerado,
-            ];
-
-            // Alguns bancos usam ENUM com valores diferentes; só atualiza se o valor for aceito
-            if ($this->statusAceitaValor($statusEmitida)) {
-                $dadosAtualizacao['status'] = $statusEmitida;
-            }
-
-            $fatura->update($dadosAtualizacao);
+            $nfse = $this->emitirNfseLocal($fatura);
 
             return response()->json([
                 'success' => true,
@@ -397,6 +464,116 @@ class FaturaController extends Controller
                 'message' => 'Erro na emissão: ' . $e->getMessage()
             ], 500);
         }
+    }
+
+    private function deveEmitirNfse(Fatura $fatura): bool
+    {
+        if ($fatura->nfse_emitida) {
+            return false;
+        }
+
+        return in_array($fatura->status, ['gerada', 'pendente', 'aberta'], true);
+    }
+
+    private function emitirNfseLocal(Fatura $fatura): Nfse
+    {
+        $this->recalcularTotaisFaturaSeNecessario($fatura);
+
+        $valorServicos = $this->calcularValorServicos($fatura);
+        $aliquotaIss = $fatura->cliente->aliquota_iss ?? 0;
+        $valorIss = $aliquotaIss > 0 ? round($valorServicos * ($aliquotaIss / 100), 2) : 0;
+        $valorLiquido = max($valorServicos - $valorIss, 0);
+        $numeroGerado = 'NFSe-' . now()->format('Ymd') . '-' . str_pad($fatura->id, 4, '0', STR_PAD_LEFT);
+
+        $nfse = Nfse::create([
+            'fatura_id'      => $fatura->id,
+            'cliente_id'     => $fatura->cliente_id,
+            'numero_nfse'    => $numeroGerado,
+            'data_emissao'   => now(),
+            'data_envio'     => now(),
+            'valor_servicos' => $valorServicos,
+            'valor_iss'      => $valorIss,
+            'aliquota_iss'   => $aliquotaIss,
+            'valor_liquido'  => $valorLiquido,
+            'status'         => 'pendente',
+            'discriminacao'  => $fatura->observacoes,
+            'pdf_url'        => null,
+        ]);
+
+        $statusEmitida = 'emitida';
+        $dadosAtualizacao = [
+            'nfse_emitida' => true,
+            'nfse_numero'  => $numeroGerado,
+        ];
+
+        if ($this->statusAceitaValor($statusEmitida)) {
+            $dadosAtualizacao['status'] = $statusEmitida;
+        }
+
+        $fatura->update($dadosAtualizacao);
+        $fatura->refresh();
+
+        return $nfse;
+    }
+
+    private function registrarBoletoFatura(Fatura $fatura, ItauService $bancoService): string
+    {
+        /** @var Titulo|null $titulo */
+        $titulo = $fatura->titulos->firstWhere('tipo', 'receber');
+
+        if (!$titulo) {
+            $titulo = $fatura->gerarTituloPadrao();
+
+            if (!$titulo) {
+                throw new \RuntimeException('Não foi possível gerar um título financeiro para esta fatura.');
+            }
+
+            $titulo->load('cliente');
+        } else {
+            $titulo->loadMissing('cliente');
+        }
+
+        if (!$titulo->cliente) {
+            throw new \RuntimeException('O título da fatura não possui cliente vinculado para registrar boleto.');
+        }
+
+        if (!empty($titulo->nosso_numero)) {
+            return 'existing';
+        }
+
+        $mode = 'banco';
+
+        try {
+            $dadosBancarios = $bancoService->registrarBoleto($titulo);
+        } catch (\Throwable $exception) {
+            Log::warning('FATURAMENTO LOTE: falha ao registrar boleto no banco; aplicando fallback local.', [
+                'fatura_id' => $fatura->id,
+                'titulo_id' => $titulo->id,
+                'error' => $exception->getMessage(),
+            ]);
+
+            $mode = 'local';
+            $dadosBancarios = [
+                'nosso_numero' => 'LOCAL' . str_pad((string) $titulo->id, 10, '0', STR_PAD_LEFT),
+                'codigo_barras' => $titulo->codigo_barras,
+                'linha_digitavel' => $titulo->linha_digitavel,
+                'url_boleto' => $titulo->url_boleto,
+            ];
+        }
+
+        $titulo->update([
+            'nosso_numero' => $dadosBancarios['nosso_numero'] ?? $titulo->nosso_numero,
+            'codigo_barras' => $dadosBancarios['codigo_barras'] ?? $titulo->codigo_barras,
+            'linha_digitavel' => $dadosBancarios['linha_digitavel'] ?? $titulo->linha_digitavel,
+            'url_boleto' => $dadosBancarios['url_boleto'] ?? $titulo->url_boleto,
+            'status' => $titulo->status === 'pago' ? 'pago' : 'aberto',
+        ]);
+
+        if (in_array($fatura->status, ['emitida', 'nfse_emitida', 'aguardando_boleto'], true)) {
+            $fatura->update(['status' => 'concluida']);
+        }
+
+        return $mode;
     }
 
     /**

@@ -23,6 +23,7 @@ class Cliente extends Model
         'celular',
         'site',
         'cep',
+        'endereco',
         'logradouro',
         'numero',
         'complemento',
@@ -143,6 +144,11 @@ class Cliente extends Model
         return implode(', ', $partes);
     }
 
+    public function getLogradouroAttribute($value): ?string
+    {
+        return $value ?: ($this->attributes['endereco'] ?? null);
+    }
+
     /*
     |--------------------------------------------------------------------------
     | HELPERS / VALIDAÇÃO DE CNPJ
@@ -201,6 +207,37 @@ class Cliente extends Model
                 return false;
             }
             $t++;
+        }
+
+        return true;
+    }
+
+    public static function isValidCpf(?string $cpf): bool
+    {
+        if (!$cpf) {
+            return false;
+        }
+
+        $cpf = preg_replace('/\D/', '', $cpf);
+
+        if (strlen($cpf) !== 11) {
+            return false;
+        }
+
+        if (preg_match('/^(\d)\1{10}$/', $cpf)) {
+            return false;
+        }
+
+        for ($t = 9; $t < 11; $t++) {
+            $sum = 0;
+            for ($i = 0; $i < $t; $i++) {
+                $sum += $cpf[$i] * (($t + 1) - $i);
+            }
+
+            $digit = ((10 * $sum) % 11) % 10;
+            if ((int) $cpf[$t] !== $digit) {
+                return false;
+            }
         }
 
         return true;

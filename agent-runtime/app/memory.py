@@ -61,6 +61,32 @@ class PendingActionStore:
             self._cleanup_locked()
             return self._items.pop(action_id, None)
 
+    def latest_for_session(
+        self,
+        *,
+        user_id: int,
+        session_id: str,
+        states: set[str] | None = None,
+    ) -> PendingAction | None:
+        with self._lock:
+            self._cleanup_locked()
+
+            matches = [
+                pending
+                for pending in self._items.values()
+                if pending.user_id == user_id
+                and pending.session_id == session_id
+                and (
+                    not states
+                    or str((pending.metadata or {}).get("state") or "").strip() in states
+                )
+            ]
+
+            if not matches:
+                return None
+
+            return max(matches, key=lambda pending: pending.created_at)
+
     def _cleanup_locked(self) -> None:
         expired_before = utcnow() - self._ttl
         expired_ids = [

@@ -1,68 +1,69 @@
-FROM php:8.2-apache
+FROM node:20-alpine AS frontend-builder
 
-# 1. Instalar dependências do sistema
+WORKDIR /app
+
+COPY package.json ./
+COPY vite.config.js ./
+COPY resources ./resources
+COPY public ./public
+
+RUN npm install \
+    && npm run build
+
+
+FROM php:8.2-apache AS production
+
+ENV APACHE_DOCUMENT_ROOT=/var/www/html/public
+ENV COMPOSER_ALLOW_SUPERUSER=1
+
 RUN apt-get update && apt-get install -y \
-    git \
     curl \
-    zip \
+    git \
     unzip \
-    libpng-dev \
+    zip \
+    libfreetype6-dev \
+    libicu-dev \
+    libjpeg62-turbo-dev \
     libonig-dev \
+    libpng-dev \
     libxml2-dev \
     libzip-dev \
-    libicu-dev \
-    libfreetype6-dev \
-    libjpeg62-turbo-dev
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-# 2. Limpar cache do apt
-RUN apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-configure intl \
+    && docker-php-ext-install pdo_mysql mbstring exif pcntl bcmath gd zip intl
 
-# 3. Configurar extensões
-RUN docker-php-ext-configure gd --with-freetype --with-jpeg
-RUN docker-php-ext-configure intl
+RUN a2enmod rewrite headers
 
-# 4. Instalar extensões PHP
-RUN docker-php-ext-install pdo_mysql mbstring exif pcntl bcmath gd zip intl
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
-# 5. Habilitar mod_rewrite
-RUN a2enmod rewrite
-
-# 6. Instalar Composer
-COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
-
-# 7. Definir diretório
 WORKDIR /var/www/html
 
-# 8. Copiar apenas arquivos de dependência
 COPY composer.json composer.lock ./
+RUN composer install \
+    --no-dev \
+    --prefer-dist \
+    --no-interaction \
+    --no-progress \
+    --optimize-autoloader \
+    --no-scripts
 
-# 9. Instalar dependências
-RUN composer install --no-interaction --no-scripts --no-autoloader
-
-# 10. Copiar arquivos do projeto
 COPY . .
+COPY --from=frontend-builder /app/public/build ./public/build
+COPY docker/entrypoint.sh /usr/local/bin/medintelligence-entrypoint
 
-# --- LIMPEZA DE CACHE ANTIGO ---
-RUN rm -f bootstrap/cache/packages.php bootstrap/cache/services.php
-
-# 11. Autoloader otimizado
-RUN composer dump-autoload --optimize --no-dev --no-scripts
-
-# 12. Permissões
-RUN chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache
-
-# 13. Configurar Apache (CORREÇÃO AQUI)
-ENV APACHE_DOCUMENT_ROOT="/var/www/html/public"
-RUN sed -ri -e 's!/var/www/html!${APACHE_DOCUMENT_ROOT}!g' /etc/apache2/sites-available/*.conf
-RUN sed -ri -e 's!/var/www/!${APACHE_DOCUMENT_ROOT}!g' /etc/apache2/apache2.conf
-
-# Forçar AllowOverride All para o .htaccess funcionar
-RUN echo "<Directory /var/www/html/public>\n\
-    Options Indexes FollowSymLinks\n\
-    AllowOverride All\n\
-    Require all granted\n\
-</Directory>" > /etc/apache2/conf-available/laravel.conf \
+RUN chmod +x /usr/local/bin/medintelligence-entrypoint \
+    && mkdir -p storage/framework/cache storage/framework/sessions storage/framework/views storage/logs bootstrap/cache \
+    && rm -f bootstrap/cache/*.php \
+    && chown -R www-data:www-data /var/www/html/storage /var/www/html/bootstrap/cache \
+    && sed -ri -e 's!/var/www/html!${APACHE_DOCUMENT_ROOT}!g' /etc/apache2/sites-available/*.conf \
+    && sed -ri -e 's!/var/www/!${APACHE_DOCUMENT_ROOT}!g' /etc/apache2/apache2.conf \
+    && printf '<Directory /var/www/html/public>\n    Options Indexes FollowSymLinks\n    AllowOverride All\n    Require all granted\n</Directory>\n' > /etc/apache2/conf-available/laravel.conf \
     && a2enconf laravel
 
-# 14. Expor porta 80
 EXPOSE 80
+
+ENTRYPOINT ["medintelligence-entrypoint"]
+CMD ["apache2-foreground"]

@@ -204,8 +204,10 @@ Atualizacao da iteracao de 2026-03-19:
   - busca de despesas;
   - criacao de cliente;
   - criacao de conta a receber;
-  - criacao de conta a pagar.
+  - criacao de conta a pagar;
+  - criacao manual de fatura.
 - o servico Python do runtime LangChain ja foi scaffoldado em `agent-runtime/`, consumindo essas tools e devolvendo preview estruturado para confirmacao.
+- o runtime ja reconhece e confirma `gerar_fatura` a partir de conversa ou anexo textual/xls/xlsx/pdf, mas ainda precisa ganhar mais resolucao automatica de servicos e regras por layout.
 - o proximo passo da fase e colocar esse runtime para rodar no ambiente de homologacao e ampliar o catalogo de tools.
 
 ## Fase 6 - Evolucao Funcional do Assistente
@@ -221,6 +223,13 @@ Entregas sugeridas:
 - copiloto de faturamento mensal;
 - monitor de excecoes de NFSe e boletos;
 - sugestao de proximas acoes para o financeiro.
+
+Entregas ja plugadas nesta iteracao:
+
+- workflow n8n de cobranca assistida com redacao via runtime LangChain;
+- workflow n8n de fechamento diario programado;
+- workflow n8n de alertas de NFS-e pendente e com erro;
+- rotas internas para inadimplencia de cobranca e registro de eventos de automacao.
 
 ## Ordem recomendada para as proximas sessoes
 

@@ -13,6 +13,7 @@ use App\Models\OrdemServicoItem;
 use App\Models\OrdemServicoRateio;
 use App\Models\Fatura;
 use App\Services\Ai\AiChatGatewayService;
+use App\Services\Ai\ChatAttachmentProcessingService;
 use App\Services\GoogleDriveFileMirrorService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -44,6 +45,8 @@ class ChatController extends Controller
             $tipoProcessamento = $request->input('tipo_processamento', 'auto');
             $arquivoData = null;
             $arquivoIngestao = null;
+            $anexoProcessado = null;
+            $tipoAnexo = null;
 
             // 1.1 Processamento e Validação de Arquivo
             if ($request->hasFile('arquivo') && $request->file('arquivo')->isValid()) {
@@ -53,13 +56,38 @@ class ChatController extends Controller
                     return response()->json(['success' => false, 'message' => 'Arquivo muito grande (Máx 10MB).'], 422);
                 }
 
+                $nomeOriginal = $request->input('arquivo_nome', $arquivo->getClientOriginalName());
+                $mimeTypeInformado = $request->input('arquivo_mime_type');
+                $mimeType = $this->resolverMimeTypeArquivo(
+                    $arquivo->getClientMimeType(),
+                    $mimeTypeInformado,
+                    $arquivo->getClientOriginalExtension()
+                );
+                $extensao = $this->resolverExtensaoArquivo(
+                    $arquivo->getClientOriginalExtension(),
+                    $mimeType
+                );
+                $nomeArquivo = $this->normalizarNomeArquivoChat(
+                    $nomeOriginal,
+                    $extensao,
+                    $mimeType
+                );
+
                 $arquivoData = [
-                    'nome'      => $arquivo->getClientOriginalName(),
-                    'extensao'  => strtolower($arquivo->getClientOriginalExtension()),
-                    'mime_type' => $arquivo->getClientMimeType(),
+                    'nome'      => $nomeArquivo,
+                    'extensao'  => $extensao,
+                    'mime_type' => $mimeType,
                     'tamanho'   => $arquivo->getSize(),
                     'base64'    => base64_encode(file_get_contents($arquivo->getRealPath())),
                 ];
+
+                /** @var ChatAttachmentProcessingService $attachmentProcessor */
+                $attachmentProcessor = app(ChatAttachmentProcessingService::class);
+                $tipoAnexo = $attachmentProcessor->inferirTipo(
+                    $arquivoData['mime_type'] ?? null,
+                    $arquivoData['extensao'] ?? null
+                );
+                $anexoProcessado = $attachmentProcessor->processar($arquivo, $mensagem);
 
                 $arquivoIngestao = $this->espelharArquivoNoDriveSeSolicitado(
                     request: $request,
@@ -92,12 +120,15 @@ class ChatController extends Controller
                 'session_id' => $sessionId,
                 'metadata'   => $arquivoData ? array_filter([
                     'file_name' => $arquivoData['nome'],
+                    'file_mime_type' => $arquivoData['mime_type'] ?? null,
+                    'file_kind' => $tipoAnexo,
+                    'processed_attachment' => app(ChatAttachmentProcessingService::class)->resumoMetadata($anexoProcessado),
                     'drive_ingestion' => $arquivoIngestao,
                 ]) : null
             ]);
 
             // Respostas rápidas locais (consultas simples a clientes/faturas/OS)
-            $respostaRapida = $this->responderLocalmente($mensagem);
+            $respostaRapida = $arquivoData ? null : $this->responderLocalmente($mensagem);
             if ($respostaRapida) {
                 $chatMessage = ChatMessage::create([
                     'user_id'    => $user->id,
@@ -120,7 +151,15 @@ class ChatController extends Controller
             }
 
             // 1.3 Envio para N8N (Core Logic)
-            $respostaIa = $this->conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tipoProcessamento, $arquivoIngestao);
+            $respostaIa = $this->conectarComN8n(
+                $mensagem,
+                $user,
+                $sessionId,
+                $arquivoData,
+                $tipoProcessamento,
+                $arquivoIngestao,
+                $anexoProcessado
+            );
 
             // 1.4 Persistência da Resposta da IA
             $chatMessage = ChatMessage::create([
@@ -199,7 +238,7 @@ class ChatController extends Controller
     /**
      * Comunicação HTTP com o runtime configurado (LangChain ou N8N)
      */
-private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tipoProcessamento, $arquivoIngestao = null): array
+private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tipoProcessamento, $arquivoIngestao = null, $anexoProcessado = null): array
     {
         $isArquivo = !empty($arquivoData);
         $payload = [
@@ -216,9 +255,18 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
                 'timezone' => config('app.timezone'),
                 'acoes_confirmaveis' => [
                     'criar_cliente',
+                    'sincronizar_clientes',
+                    'inativar_cliente',
+                    'reativar_cliente',
                     'criar_despesa',
                     'criar_conta_pagar',
                     'criar_conta_receber',
+                    'criar_fatura',
+                    'gerar_fatura',
+                    'baixar_titulo',
+                    'baixar_despesa',
+                    'renegociar_titulo',
+                    'emitir_nfse',
                     'importar_clientes',
                     'gerar_os',
                 ],
@@ -231,7 +279,11 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
         ];
 
         if ($isArquivo) {
-            $payload['arquivo'] = $arquivoData;
+            $payload['arquivo'] = $this->arquivoParaRuntime($arquivoData);
+        }
+
+        if (!empty($anexoProcessado)) {
+            $payload['anexo_processado'] = $anexoProcessado;
         }
 
         /** @var AiChatGatewayService $gateway */
@@ -253,6 +305,86 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
             'dados_estruturados' => $normalizado['dados_estruturados'] ?? null,
             'acao_sugerida'      => $normalizado['acao_sugerida'] ?? ($normalizado['dados_estruturados']['acao_sugerida'] ?? null),
         ];
+    }
+
+    private function arquivoParaRuntime(array $arquivoData): array
+    {
+        return $arquivoData;
+    }
+
+    private function resolverExtensaoArquivo(?string $extensaoOriginal, ?string $mimeType): string
+    {
+        $extensao = strtolower(trim((string) $extensaoOriginal));
+        if ($extensao !== '') {
+            return $extensao;
+        }
+
+        $mime = strtolower(trim((string) $mimeType));
+
+        return match ($mime) {
+            'audio/webm' => 'webm',
+            'audio/ogg', 'application/ogg' => 'ogg',
+            'audio/mpeg', 'audio/mp3' => 'mp3',
+            'audio/wav', 'audio/x-wav', 'audio/wave' => 'wav',
+            'audio/mp4', 'audio/x-m4a', 'audio/m4a' => 'm4a',
+            'audio/aac' => 'aac',
+            'image/jpeg', 'image/jpg' => 'jpg',
+            'image/png' => 'png',
+            'image/webp' => 'webp',
+            'application/pdf' => 'pdf',
+            default => '',
+        };
+    }
+
+    private function resolverMimeTypeArquivo(?string $mimeTypeOriginal, ?string $mimeTypeInformado, ?string $extensaoOriginal): string
+    {
+        $mimeInformado = strtolower(trim((string) $mimeTypeInformado));
+        if ($mimeInformado !== '') {
+            return $mimeInformado;
+        }
+
+        $mimeOriginal = strtolower(trim((string) $mimeTypeOriginal));
+        if ($mimeOriginal !== '' && $mimeOriginal !== 'application/octet-stream') {
+            return $mimeOriginal;
+        }
+
+        $extensao = strtolower(trim((string) $extensaoOriginal));
+
+        return match ($extensao) {
+            'webm' => 'audio/webm',
+            'ogg' => 'audio/ogg',
+            'mp3' => 'audio/mpeg',
+            'wav' => 'audio/wav',
+            'm4a' => 'audio/m4a',
+            'aac' => 'audio/aac',
+            'jpg', 'jpeg' => 'image/jpeg',
+            'png' => 'image/png',
+            'webp' => 'image/webp',
+            'pdf' => 'application/pdf',
+            default => $mimeOriginal,
+        };
+    }
+
+    private function normalizarNomeArquivoChat(?string $nomeOriginal, string $extensao, ?string $mimeType): string
+    {
+        $nome = trim((string) $nomeOriginal);
+        $mime = strtolower(trim((string) $mimeType));
+
+        $nomeEhGenerico = $nome === ''
+            || strtolower($nome) === 'blob'
+            || strtolower($nome) === 'audio'
+            || strtolower($nome) === 'image';
+
+        if (!$nomeEhGenerico && str_contains($nome, '.')) {
+            return $nome;
+        }
+
+        $prefixo = str_starts_with($mime, 'audio/') ? 'gravacao_chat' : 'anexo_chat';
+        $sufixo = now()->format('Ymd_His');
+
+        return $extensao !== ''
+            ? "{$prefixo}_{$sufixo}.{$extensao}"
+            : "{$prefixo}_{$sufixo}";
     }
 
     private function carregarHistoricoContexto(int $userId, string $sessionId, int $limit = 12): array
@@ -432,6 +564,14 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
 
         if (!is_string($acao) || !in_array($acao, [
             'criar_cliente',
+            'sincronizar_clientes',
+            'importar_clientes',
+            'inativar_cliente',
+            'reativar_cliente',
+            'baixar_titulo',
+            'baixar_despesa',
+            'renegociar_titulo',
+            'emitir_nfse',
             'cliente',
             'criar_despesa',
             'despesa',
@@ -440,6 +580,9 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
             'criar_conta_receber',
             'titulo_receber',
             'criar_titulo_receber',
+            'criar_fatura',
+            'gerar_fatura',
+            'fatura',
         ], true)) {
             return false;
         }
@@ -481,10 +624,26 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
         }
 
         $body = is_array($resultado['body']) ? $resultado['body'] : [];
+        $requiresMoreInfo = !empty(data_get($body, 'detalhes.pendencias'))
+            || !empty($body['requires_more_info'])
+            || !empty($body['runtime_requires_more_info']);
+
+        if ($requiresMoreInfo) {
+            return response()->json([
+                'success' => true,
+                'completed' => false,
+                'requires_more_info' => true,
+                'message' => $body['message'] ?? 'Ainda faltam alguns dados para concluir a ação.',
+                'detalhes' => $body['detalhes'] ?? null,
+            ]);
+        }
+
         $status = !empty($body['success']) ? 200 : 422;
 
         return response()->json([
             'success' => (bool) ($body['success'] ?? false),
+            'completed' => (bool) ($body['success'] ?? false),
+            'requires_more_info' => false,
             'message' => $body['message'] ?? 'Ação processada pelo runtime.',
             'detalhes' => $body['detalhes'] ?? null,
         ], $status);
