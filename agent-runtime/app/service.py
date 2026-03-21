@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import re
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -73,6 +74,16 @@ class ChatRuntimeService:
                 parsed_file,
                 draft_context=self._draft_context_payload(session_draft),
             )
+
+            greeting_response = self._build_greeting_response(
+                payload=payload,
+                parsed_file=parsed_file,
+                session_context=session_context,
+                session_draft=session_draft,
+            )
+            if greeting_response is not None:
+                return greeting_response
+
             route = await self.router.route(
                 session_context=session_context,
                 current_message=current_message,
@@ -104,7 +115,11 @@ class ChatRuntimeService:
                 )
                 action_plan = self._merge_route_into_action_plan(route, action_plan)
                 action_plan = self._merge_attachment_candidates_into_action_plan(action_plan, parsed_file)
-                action_plan = self._merge_session_draft_into_action_plan(action_plan, session_draft)
+                action_plan = self._merge_session_draft_into_action_plan(
+                    action_plan,
+                    session_draft,
+                    payload.mensagem or "",
+                )
                 action_plan = self._redirect_fatura_draft_to_cliente_creation(
                     payload=payload,
                     plan=action_plan,
@@ -470,6 +485,42 @@ class ChatRuntimeService:
             response.dados_estruturados.sucesso = True
 
         return response
+
+    def _build_greeting_response(
+        self,
+        *,
+        payload: ChatPayload,
+        parsed_file: ParsedFile,
+        session_context: dict[str, Any],
+        session_draft: Any | None,
+    ) -> ChatbotResponse | None:
+        if payload.arquivo is not None or parsed_file.text or session_draft is not None:
+            return None
+
+        message = (payload.mensagem or "").strip()
+        if not self._is_plain_greeting(message):
+            return None
+
+        first_name = self._first_name(payload.user_name)
+        saudacao = self._preferred_greeting(message)
+        nome = f", {first_name}" if first_name else ""
+
+        if list(session_context.get("messages") or []):
+            texto = (
+                f"{saudacao}{nome}. Estou pronto para continuar. "
+                "Posso consultar faturamento, analisar um arquivo ou executar alguma rotina financeira."
+            )
+        else:
+            texto = (
+                f"{saudacao}{nome}. Bem-vindo ao MedIntelligence. "
+                "Posso consultar faturamento, gerar faturas, sincronizar clientes ou analisar arquivos, imagens e audios."
+            )
+
+        return ChatbotResponse(
+            mensagem=texto,
+            acao_sugerida=None,
+            dados_estruturados=None,
+        )
 
     async def _build_action_preview(
         self,
@@ -2440,6 +2491,7 @@ class ChatRuntimeService:
         self,
         plan: ActionPlan,
         pending: Any | None,
+        current_message_text: str,
     ) -> ActionPlan:
         if pending is None:
             return plan
@@ -2456,33 +2508,31 @@ class ChatRuntimeService:
 
         draft_records = list(pending.records or [])
         current_records = list(plan.dados_mapeados or [])
+        pending_fields = list((pending.metadata or {}).get("pending_fields") or [])
+        extracted_updates = self._extract_pending_updates_from_message(
+            action=plan_action,
+            message=current_message_text,
+            pending_fields=pending_fields,
+            draft_records=draft_records,
+        )
+
+        if extracted_updates:
+            if not current_records:
+                current_records = extracted_updates
+            else:
+                current_records = self._merge_records(current_records, extracted_updates)
 
         if not current_records:
             plan.dados_mapeados = draft_records
             plan.pendencias = list(
                 dict.fromkeys([
-                    *list((pending.metadata or {}).get("pending_fields") or []),
+                    *pending_fields,
                     *list(plan.pendencias or []),
                 ])
             )
             return plan
 
-        merged_records: list[dict[str, Any]] = []
-        max_len = max(len(draft_records), len(current_records))
-
-        for index in range(max_len):
-            draft_record = draft_records[index] if index < len(draft_records) else {}
-            current_record = current_records[index] if index < len(current_records) else {}
-            if not draft_record and len(draft_records) == 1 and current_record:
-                draft_record = draft_records[0]
-
-            merged_record = {
-                **(draft_record if isinstance(draft_record, dict) else {}),
-                **(current_record if isinstance(current_record, dict) else {}),
-            }
-            merged_records.append(merged_record)
-
-        plan.dados_mapeados = merged_records
+        plan.dados_mapeados = self._merge_records(draft_records, current_records)
         return plan
 
     def _redirect_fatura_draft_to_cliente_creation(
@@ -2533,6 +2583,87 @@ class ChatRuntimeService:
         mentions_client = "cliente" in normalized
         return has_create_verb and mentions_client
 
+    def _merge_records(
+        self,
+        draft_records: list[dict[str, Any]],
+        current_records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        merged_records: list[dict[str, Any]] = []
+        max_len = max(len(draft_records), len(current_records))
+
+        for index in range(max_len):
+            draft_record = draft_records[index] if index < len(draft_records) else {}
+            current_record = current_records[index] if index < len(current_records) else {}
+            if not draft_record and len(draft_records) == 1 and current_record:
+                draft_record = draft_records[0]
+            if not current_record and len(current_records) == 1 and draft_record:
+                current_record = current_records[0]
+
+            merged_record = {
+                **(draft_record if isinstance(draft_record, dict) else {}),
+                **(current_record if isinstance(current_record, dict) else {}),
+            }
+            merged_records.append(merged_record)
+
+        return merged_records
+
+    def _extract_pending_updates_from_message(
+        self,
+        *,
+        action: str,
+        message: str,
+        pending_fields: list[str],
+        draft_records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        text = (message or "").strip()
+        if not text or not pending_fields:
+            return []
+
+        updates: dict[str, Any] = {}
+
+        if "data_vencimento" in pending_fields:
+            if due_date := self._extract_date_from_text(text):
+                updates["data_vencimento"] = due_date
+
+        if "nova_data_vencimento" in pending_fields:
+            if due_date := self._extract_date_from_text(text):
+                updates["nova_data_vencimento"] = due_date
+
+        if "periodo_referencia" in pending_fields:
+            if periodo := self._extract_period_from_text(text):
+                updates["periodo_referencia"] = periodo
+
+        if "cliente" in pending_fields:
+            if cliente_id := self._extract_named_id(text, label="id"):
+                updates["cliente_id"] = cliente_id
+            if cliente_cnpj := self._extract_document_from_text(text, required_length=14):
+                updates["cliente_cnpj"] = cliente_cnpj
+            cliente_nome = self._extract_cliente_name_from_text(text)
+            if cliente_nome and "cliente_id" not in updates and "cliente_cnpj" not in updates:
+                updates["cliente"] = cliente_nome
+
+        if "cnpj" in pending_fields:
+            if cnpj := self._extract_document_from_text(text, required_length=14):
+                updates["cnpj"] = cnpj
+
+        if "razao_social" in pending_fields:
+            if razao_social := self._extract_named_value(text, labels=["razao social", "cliente", "empresa"]):
+                updates["razao_social"] = self._upper(razao_social)
+
+        if "valor_original" in pending_fields:
+            if valor := self._extract_currency_from_text(text):
+                updates["valor_original"] = valor
+
+        if "descricao" in pending_fields:
+            if descricao := self._extract_named_value(text, labels=["descricao", "histórico", "historico"]):
+                updates["descricao"] = descricao
+
+        if not updates:
+            return []
+
+        target_size = max(len(draft_records), 1)
+        return [dict(updates) for _ in range(target_size)]
+
     def _build_cliente_records_from_fatura_draft(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized_records: list[dict[str, Any]] = []
         seen_keys: set[str] = set()
@@ -2561,6 +2692,138 @@ class ChatRuntimeService:
                 normalized_records.append(cliente_record)
 
         return normalized_records
+
+    def _is_plain_greeting(self, message: str) -> bool:
+        normalized = self._normalize_free_text(message)
+        if not normalized:
+            return False
+
+        simple_greetings = {
+            "oi",
+            "ola",
+            "olá",
+            "bom dia",
+            "boa tarde",
+            "boa noite",
+            "e ai",
+            "e aí",
+            "tudo bem",
+        }
+
+        return normalized in simple_greetings
+
+    def _preferred_greeting(self, message: str) -> str:
+        normalized = self._normalize_free_text(message)
+        if "boa tarde" in normalized:
+            return "Boa tarde"
+        if "boa noite" in normalized:
+            return "Boa noite"
+        return "Bom dia" if "bom dia" in normalized else "Olá"
+
+    def _first_name(self, value: Any) -> str | None:
+        full_name = self._as_string(value)
+        if not full_name:
+            return None
+
+        return full_name.split()[0].title()
+
+    def _normalize_free_text(self, value: Any) -> str:
+        text = self._as_string(value) or ""
+        text = text.strip().lower()
+        text = re.sub(r"\s+", " ", text)
+        return text
+
+    def _extract_date_from_text(self, message: str) -> str | None:
+        normalized = self._normalize_free_text(message)
+        for pattern in (
+            r"(\d{2}/\d{2}/\d{4})",
+            r"(\d{2}-\d{2}-\d{4})",
+            r"(\d{4}-\d{2}-\d{2})",
+        ):
+            match = re.search(pattern, normalized)
+            if match:
+                return self._normalize_date(match.group(1))
+
+        return None
+
+    def _extract_period_from_text(self, message: str) -> str | None:
+        normalized = self._normalize_free_text(message)
+        for pattern in (
+            r"(\d{2}/\d{4})",
+            r"(\d{2}-\d{4})",
+            r"(\d{4}-\d{2})",
+        ):
+            match = re.search(pattern, normalized)
+            if match:
+                return self._normalize_periodo_referencia(match.group(1))
+
+        return None
+
+    def _extract_document_from_text(self, message: str, required_length: int | None = None) -> str | None:
+        match = re.search(r"\d[\d\.\-\/]{10,20}\d", message or "")
+        if not match:
+            return None
+
+        cleaned = self._clean_document(match.group(0))
+        if not cleaned:
+            return None
+
+        if required_length is not None and len(cleaned) != required_length:
+            return None
+
+        return cleaned
+
+    def _extract_named_id(self, message: str, *, label: str) -> int | None:
+        pattern = rf"\b{re.escape(label)}\s*[:#-]?\s*(\d{{1,10}})\b"
+        match = re.search(pattern, self._normalize_free_text(message))
+        if not match:
+            return None
+
+        return self._to_int(match.group(1))
+
+    def _extract_currency_from_text(self, message: str) -> float | None:
+        match = re.search(r"(?:r\$\s*)?(\d{1,3}(?:\.\d{3})*,\d{2}|\d+(?:,\d{2})?)", message or "", re.IGNORECASE)
+        if not match:
+            return None
+
+        raw = match.group(1).replace(".", "").replace(",", ".")
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    def _extract_named_value(self, message: str, *, labels: list[str]) -> str | None:
+        normalized = self._as_string(message)
+        if not normalized:
+            return None
+
+        for label in labels:
+            pattern = rf"{re.escape(label)}\s*[:\-]?\s*(.+)$"
+            match = re.search(pattern, normalized, re.IGNORECASE)
+            if match:
+                value = self._as_string(match.group(1))
+                if value:
+                    return value
+
+        return None
+
+    def _extract_cliente_name_from_text(self, message: str) -> str | None:
+        normalized = self._as_string(message)
+        if not normalized:
+            return None
+
+        match = re.search(r"cliente\s*[:\-]?\s*(.+)$", normalized, re.IGNORECASE)
+        if not match:
+            return None
+
+        candidate = self._as_string(match.group(1))
+        if not candidate:
+            return None
+
+        if self._extract_date_from_text(candidate) or self._extract_document_from_text(candidate):
+            return None
+
+        return candidate
 
     def _join_human_values(self, values: list[str]) -> str:
         cleaned = [value.strip() for value in values if isinstance(value, str) and value.strip()]

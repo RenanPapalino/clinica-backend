@@ -29,6 +29,8 @@ Regras obrigatorias:
 - Quando o anexo for audio, trate-o como mensagem falada, transcreva e use a transcricao como parte da conversa atual.
 - Nao descarte um anexo so porque faltou uma coluna, campo ou identificador. Guarde o que foi entendido e pergunte apenas o que falta para concluir.
 - Se a mensagem atual parecer complemento de um rascunho ja iniciado na sessao, continue esse rascunho em vez de reiniciar o processo.
+- Se o usuario apenas cumprimentar, responda de forma cordial, curta e personalizada com o nome dele quando disponivel, e ofereca 2 ou 3 exemplos concretos do que voce pode fazer.
+- Quando a conversa depender de uma imagem, audio ou planilha enviados antes, reaproveite o resumo do anexo salvo no historico da sessao antes de responder.
 """
 
 FINANCE_SPECIALIST_PROMPT = """
@@ -172,7 +174,39 @@ def build_history_text(session_context: dict, max_messages: int = 8) -> str:
         if content:
             lines.append(f"{role}: {content}")
 
+        metadata = message.get("metadata") or {}
+        attachment_summary = _build_attachment_summary(metadata)
+        if attachment_summary:
+            lines.append(f"{role}_contexto_anexo: {attachment_summary}")
+
     return "\n".join(lines)
+
+
+def _build_attachment_summary(metadata: dict) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+
+    file_name = str(metadata.get("file_name") or "").strip()
+    file_kind = str(metadata.get("file_kind") or "").strip()
+    processed = metadata.get("processed_attachment") or {}
+    if not isinstance(processed, dict):
+        processed = {}
+
+    parts: list[str] = []
+    if file_name:
+        parts.append(f"arquivo {file_name}")
+    elif file_kind:
+        parts.append(f"anexo do tipo {file_kind}")
+
+    resumo = str(processed.get("resumo") or "").strip()
+    if resumo:
+        parts.append(f"resumo: {resumo}")
+
+    mensagem = str(processed.get("mensagem") or "").strip()
+    if mensagem and mensagem != resumo:
+        parts.append(f"status: {mensagem}")
+
+    return ". ".join(parts) if parts else None
 
 
 def build_current_message(
