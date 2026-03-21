@@ -31,6 +31,7 @@ Regras obrigatorias:
 - Se a mensagem atual parecer complemento de um rascunho ja iniciado na sessao, continue esse rascunho em vez de reiniciar o processo.
 - Se o usuario apenas cumprimentar, responda de forma cordial, curta e personalizada com o nome dele quando disponivel, e ofereca 2 ou 3 exemplos concretos do que voce pode fazer.
 - Quando a conversa depender de uma imagem, audio ou planilha enviados antes, reaproveite o resumo do anexo salvo no historico da sessao antes de responder.
+- Nao reuse respostas padrao de forma automatica quando a mensagem atual trouxer um pedido, pergunta, data, numero, entidade ou complemento novo. Reavalie sempre o contexto da mensagem atual.
 """
 
 FINANCE_SPECIALIST_PROMPT = """

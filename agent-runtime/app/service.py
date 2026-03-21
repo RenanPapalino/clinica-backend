@@ -2698,6 +2698,9 @@ class ChatRuntimeService:
         if not normalized:
             return False
 
+        if self._message_contains_operational_signal(normalized):
+            return False
+
         simple_greetings = {
             "oi",
             "ola",
@@ -2711,6 +2714,61 @@ class ChatRuntimeService:
         }
 
         return normalized in simple_greetings
+
+    def _message_contains_operational_signal(self, normalized_message: str) -> bool:
+        if not normalized_message:
+            return False
+
+        if "?" in normalized_message:
+            return True
+
+        if re.search(r"\d", normalized_message):
+            return True
+
+        operational_terms = {
+            "fatura",
+            "faturamento",
+            "cliente",
+            "titulo",
+            "título",
+            "despesa",
+            "nfse",
+            "nfs-e",
+            "boleto",
+            "vencimento",
+            "valor",
+            "arquivo",
+            "imagem",
+            "audio",
+            "áudio",
+            "pdf",
+            "planilha",
+            "csv",
+            "conta",
+            "pagar",
+            "receber",
+            "baixa",
+            "baixar",
+            "emitir",
+            "gerar",
+            "consultar",
+            "mostrar",
+            "listar",
+            "inativar",
+            "reativar",
+            "renegociar",
+            "buscar",
+            "sincronizar",
+            "cadastro",
+            "cadastrar",
+            "criar",
+            "importar",
+            "fechamento",
+            "caixa",
+        }
+
+        tokens = set(re.findall(r"[a-zA-ZÀ-ÿ0-9_-]+", normalized_message))
+        return any(term in tokens or term in normalized_message for term in operational_terms)
 
     def _preferred_greeting(self, message: str) -> str:
         normalized = self._normalize_free_text(message)
