@@ -84,6 +84,14 @@ class ChatRuntimeService:
             if greeting_response is not None:
                 return greeting_response
 
+            cnpj_lookup_response = await self._build_cnpj_lookup_response(
+                payload=payload,
+                parsed_file=parsed_file,
+                session_draft=session_draft,
+            )
+            if cnpj_lookup_response is not None:
+                return cnpj_lookup_response
+
             route = await self.router.route(
                 session_context=session_context,
                 current_message=current_message,
@@ -479,7 +487,8 @@ class ChatRuntimeService:
         if response.dados_estruturados is not None:
             registros = list(response.dados_estruturados.dados_mapeados or [])
             if not response.dados_estruturados.colunas and registros:
-                response.dados_estruturados.colunas = self._build_columns(registros)
+                action = self._canonical_action(response.dados_estruturados.acao_sugerida)
+                response.dados_estruturados.colunas = self._build_columns_for_action(action or "", registros)
             if not response.dados_estruturados.total_registros:
                 response.dados_estruturados.total_registros = len(registros)
             response.dados_estruturados.sucesso = True
@@ -521,6 +530,172 @@ class ChatRuntimeService:
             acao_sugerida=None,
             dados_estruturados=None,
         )
+
+    async def _build_cnpj_lookup_response(
+        self,
+        *,
+        payload: ChatPayload,
+        parsed_file: ParsedFile,
+        session_draft: Any | None,
+    ) -> ChatbotResponse | None:
+        if payload.arquivo is not None or parsed_file.text or session_draft is not None:
+            return None
+
+        cnpj = self._extract_cnpj_lookup_candidate(payload.mensagem or "")
+        if cnpj is None:
+            return None
+
+        try:
+            data = await self.laravel_client.consultar_cnpj(
+                user_id=payload.user_id,
+                cnpj=cnpj,
+            )
+        except LaravelApiError as exc:
+            return ChatbotResponse(
+                mensagem=str(exc) or "Nao foi possivel consultar o CNPJ informado.",
+                acao_sugerida=None,
+                dados_estruturados=None,
+            )
+
+        return ChatbotResponse(
+            mensagem=self._format_cnpj_lookup_message(data),
+            acao_sugerida=None,
+            dados_estruturados=None,
+        )
+
+    def _extract_cnpj_lookup_candidate(self, message: str) -> str | None:
+        normalized = self._normalize_free_text(message)
+        if not normalized:
+            return None
+
+        cnpj = self._extract_document_from_text(message, required_length=14)
+        if not cnpj or not self._is_valid_cnpj(cnpj):
+            return None
+
+        normalized_digits = re.sub(r"\D", "", normalized)
+        if normalized_digits == cnpj and len(normalized_digits) == 14:
+            return cnpj
+
+        creation_or_change_terms = {
+            "criar",
+            "crie",
+            "cadastre",
+            "cadastrar",
+            "sincronizar",
+            "atualizar",
+            "inativar",
+            "reativar",
+            "gerar",
+            "emitir",
+            "importar",
+            "baixar",
+            "renegociar",
+        }
+        if any(term in normalized for term in creation_or_change_terms):
+            return None
+
+        lookup_terms = {
+            "cnpj",
+            "consultar",
+            "consulte",
+            "consulta",
+            "buscar",
+            "busque",
+            "dados",
+            "empresa",
+            "cadastro",
+            "informacoes",
+            "informações",
+        }
+        if any(term in normalized for term in lookup_terms):
+            return cnpj
+
+        return None
+
+    def _format_cnpj_lookup_message(self, data: dict[str, Any]) -> str:
+        cnpj_formatado = self._as_string(data.get("cnpj_formatado")) or self._format_cnpj(data.get("cnpj"))
+        empresa = data.get("empresa") if isinstance(data.get("empresa"), dict) else {}
+        metadata = empresa.get("metadata") if isinstance(empresa.get("metadata"), dict) else {}
+        endereco = empresa.get("endereco") if isinstance(empresa.get("endereco"), dict) else {}
+
+        razao_social = self._as_string(empresa.get("razao_social")) or "Nao informado"
+        nome_fantasia = self._as_string(empresa.get("nome_fantasia"))
+        status = self._as_string(metadata.get("status_text")) or self._as_string(empresa.get("status"))
+        abertura = self._format_date(metadata.get("founded"))
+        porte = self._as_string(metadata.get("company_size"))
+        natureza = self._as_string(metadata.get("legal_nature"))
+        email = self._as_string(empresa.get("email"))
+        telefone = self._as_string(empresa.get("telefone"))
+        site = self._as_string(empresa.get("site"))
+        inscricao_estadual = self._as_string(empresa.get("inscricao_estadual"))
+        inscricao_municipal = self._as_string(empresa.get("inscricao_municipal"))
+        observacoes = self._as_string(empresa.get("observacoes"))
+        provider = self._as_string(data.get("provider"))
+
+        endereco_partes = [
+            self._as_string(endereco.get("logradouro")),
+            self._as_string(endereco.get("numero")),
+            self._as_string(endereco.get("complemento")),
+            self._as_string(endereco.get("bairro")),
+            self._as_string(endereco.get("cidade")),
+            self._as_string(endereco.get("uf")),
+            self._format_cep(endereco.get("cep")),
+        ]
+        endereco_texto = ", ".join([item for item in endereco_partes if item])
+
+        linhas = [
+            f"Consultei o CNPJ {cnpj_formatado or self._clean_document(data.get('cnpj'))} na CNPJá.",
+            f"Razao social: {razao_social}.",
+        ]
+
+        if nome_fantasia and nome_fantasia != razao_social:
+            linhas.append(f"Nome fantasia: {nome_fantasia}.")
+        if status:
+            linhas.append(f"Situacao cadastral: {status}.")
+        if abertura:
+            linhas.append(f"Inicio da atividade: {abertura}.")
+        if porte:
+            linhas.append(f"Porte: {porte}.")
+        if natureza:
+            linhas.append(f"Natureza juridica: {natureza}.")
+        if inscricao_estadual:
+            linhas.append(f"Inscricao estadual: {inscricao_estadual}.")
+        if inscricao_municipal:
+            linhas.append(f"Inscricao municipal: {inscricao_municipal}.")
+        if email:
+            linhas.append(f"E-mail: {email}.")
+        if telefone:
+            linhas.append(f"Telefone: {telefone}.")
+        if site:
+            linhas.append(f"Site: {site}.")
+        if endereco_texto:
+            linhas.append(f"Endereco: {endereco_texto}.")
+        if observacoes:
+            linhas.append(f"Observacoes cadastrais: {observacoes}.")
+
+        cliente_existente = data.get("cliente_existente") if isinstance(data.get("cliente_existente"), dict) else None
+        fornecedor_existente = data.get("fornecedor_existente") if isinstance(data.get("fornecedor_existente"), dict) else None
+
+        if cliente_existente:
+            cliente_label = self._as_string(cliente_existente.get("razao_social")) or "cliente existente"
+            cliente_status = self._as_string(cliente_existente.get("status")) or "sem status"
+            linhas.append(
+                f"Ja existe um cliente cadastrado no sistema com esse CNPJ: ID {cliente_existente.get('id')} - {cliente_label} ({cliente_status})."
+            )
+        elif fornecedor_existente:
+            fornecedor_label = self._as_string(fornecedor_existente.get("razao_social")) or "fornecedor existente"
+            fornecedor_status = self._as_string(fornecedor_existente.get("status")) or "sem status"
+            linhas.append(
+                f"Ja existe um fornecedor cadastrado no sistema com esse CNPJ: ID {fornecedor_existente.get('id')} - {fornecedor_label} ({fornecedor_status})."
+            )
+        else:
+            linhas.append("Nao encontrei cliente ou fornecedor cadastrado no sistema com esse CNPJ.")
+
+        if provider:
+            linhas.append(f"Fonte da consulta: {provider}.")
+
+        linhas.append("Se quiser, posso usar esses dados para preparar o cadastro do cliente ou fornecedor.")
+        return " ".join(linhas)
 
     async def _build_action_preview(
         self,
@@ -617,7 +792,7 @@ class ChatRuntimeService:
                 dados_estruturados=StructuredData(
                     tipo=self._action_type(action),
                     dados_mapeados=normalized_records,
-                    colunas=self._build_columns(normalized_records),
+                    colunas=self._build_columns_for_action(action, normalized_records),
                     acao_sugerida=action,
                     total_registros=len(normalized_records),
                     confianca=plan.confianca,
@@ -626,6 +801,7 @@ class ChatRuntimeService:
                         "runtime_draft_action_id": draft.action_id,
                         "runtime_pending_fields": pending_fields,
                         "runtime_requires_more_info": True,
+                        **self._preview_metadata_for_action(action, normalized_records),
                     },
                 ),
             )
@@ -644,7 +820,7 @@ class ChatRuntimeService:
         structured = StructuredData(
             tipo=self._action_type(action),
             dados_mapeados=normalized_records,
-            colunas=self._build_columns(normalized_records),
+            colunas=self._build_columns_for_action(action, normalized_records),
             acao_sugerida=action,
             total_registros=len(normalized_records),
             confianca=plan.confianca,
@@ -652,6 +828,7 @@ class ChatRuntimeService:
                 "fonte": "langchain-runtime",
                 "runtime_pending_action_id": pending.action_id,
                 "runtime_requires_confirmation": True,
+                **self._preview_metadata_for_action(action, normalized_records),
             },
         )
 
@@ -1048,17 +1225,37 @@ class ChatRuntimeService:
             )
             if normalized_item
         ]
-        metadata = self._normalize_fatura_metadata(record.get("metadata"))
+        metadata = self._normalize_fatura_metadata(
+            record.get("metadata") or record.get("_metadata_payload")
+        )
         observacoes = self._compose_fatura_observacoes(
             record.get("observacoes"),
             metadata=metadata,
         )
+        auto_cliente_record = self._resolve_auto_cliente_record_for_fatura(
+            client_id=client_id,
+            client_rows=client_rows,
+            record=record,
+        )
+        resumo_funcionarios = self._build_metadata_people_preview(metadata)
+        resumo_exames = self._build_metadata_exam_preview(metadata)
+        valor_total = sum(
+            (self._parse_decimal(item.get("quantidade")) or 1.0)
+            * (self._parse_decimal(item.get("valor_unitario")) or 0.0)
+            for item in items
+        )
+        cliente_resumo_status = None
+        if client_id is not None:
+            cliente_resumo_status = f"Cliente resolvido no cadastro (ID {client_id})."
+        elif auto_cliente_record:
+            cliente_resumo_status = "Cliente não encontrado no cadastro. Será cadastrado automaticamente ao confirmar a fatura."
 
         normalized = {
             "cliente_id": client_id,
             "cliente": cliente_nome,
             "cliente_cnpj": cliente_cnpj,
             "_cliente_candidates": self._format_cliente_candidates(client_rows) if client_id is None else None,
+            "_auto_cliente_record": auto_cliente_record,
             "data_emissao": self._normalize_date(record.get("data_emissao") or record.get("emissao"))
             or self._today(),
             "data_vencimento": self._normalize_date(record.get("data_vencimento") or record.get("vencimento")),
@@ -1067,15 +1264,21 @@ class ChatRuntimeService:
             ),
             "status": self._as_string(record.get("status")) or "pendente",
             "observacoes": observacoes,
-            "metadata": metadata,
+            "valor_total": round(valor_total, 2) if valor_total else None,
+            "quantidade_itens": len(items) or None,
+            "unidade": self._as_string((metadata or {}).get("unidade")),
+            "funcionarios_resumo": resumo_funcionarios,
+            "exames_resumo": resumo_exames,
+            "cliente_status_resumo": cliente_resumo_status,
             "gerar_titulo": bool(record.get("gerar_titulo", True)),
-            "itens": items,
+            "_metadata_payload": metadata,
+            "_itens_payload": items,
         }
 
         return {key: value for key, value in normalized.items() if value not in (None, "", [])}
 
     def _extract_fatura_items(self, record: dict[str, Any]) -> list[dict[str, Any]]:
-        raw_items = record.get("itens")
+        raw_items = record.get("_itens_payload") or record.get("itens")
         if isinstance(raw_items, list):
             return [item for item in raw_items if isinstance(item, dict)]
 
@@ -1547,6 +1750,19 @@ class ChatRuntimeService:
         if action == "criar_conta_pagar":
             return await self.laravel_client.create_conta_pagar(user_id=user_id, payload=public_record)
         if action == "gerar_fatura":
+            if not public_record.get("cliente_id") and isinstance(record.get("_auto_cliente_record"), dict):
+                cliente_result = await self.laravel_client.upsert_cliente(
+                    user_id=user_id,
+                    payload=self._strip_internal_fields(record.get("_auto_cliente_record") or {}),
+                )
+                cliente_id = (
+                    self._to_int(cliente_result.get("id"))
+                    or self._to_int(cliente_result.get("cliente_id"))
+                    or self._to_int((cliente_result.get("cliente") or {}).get("id"))
+                )
+                if cliente_id is not None:
+                    public_record["cliente_id"] = cliente_id
+
             return await self.laravel_client.create_fatura(user_id=user_id, payload=public_record)
         raise LaravelApiError(f"Acao nao suportada: {action}")
 
@@ -1727,7 +1943,7 @@ class ChatRuntimeService:
 
     def _missing_fatura_fields(self, record: dict[str, Any]) -> list[str]:
         missing: list[str] = []
-        if not self._to_int(record.get("cliente_id")):
+        if not self._to_int(record.get("cliente_id")) and not isinstance(record.get("_auto_cliente_record"), dict):
             missing.append("cliente")
         if not self._normalize_periodo_referencia(record.get("periodo_referencia")):
             missing.append("periodo_referencia")
@@ -1770,6 +1986,80 @@ class ChatRuntimeService:
             for key in first.keys()
             if not str(key).startswith("_")
         ]
+
+    def _build_columns_for_action(self, action: str, records: list[dict[str, Any]]) -> list[ColumnDefinition]:
+        if action != "gerar_fatura":
+            return self._build_columns(records)
+
+        preferred_order = [
+            ("cliente", "Cliente"),
+            ("cliente_cnpj", "CNPJ"),
+            ("periodo_referencia", "Período"),
+            ("data_emissao", "Emissão"),
+            ("data_vencimento", "Vencimento"),
+            ("quantidade_itens", "Itens"),
+            ("valor_total", "Valor Total"),
+            ("unidade", "Unidade"),
+            ("funcionarios_resumo", "Funcionários"),
+            ("exames_resumo", "Exames"),
+            ("cliente_status_resumo", "Situação do Cliente"),
+            ("status", "Status"),
+            ("observacoes", "Observações"),
+        ]
+
+        first = records[0] if records else {}
+        if not isinstance(first, dict):
+            return []
+
+        available = {key for key in first.keys() if not str(key).startswith("_")}
+        columns = [
+            ColumnDefinition(key=key, label=label)
+            for key, label in preferred_order
+            if key in available
+        ]
+
+        remaining = [
+            key for key in first.keys()
+            if key in available and key not in {column.key for column in columns}
+        ]
+        columns.extend(
+            ColumnDefinition(key=key, label=key.replace("_", " ").title())
+            for key in remaining
+        )
+
+        return columns
+
+    def _preview_metadata_for_action(self, action: str, records: list[dict[str, Any]]) -> dict[str, Any]:
+        if action != "gerar_fatura" or not records:
+            return {}
+
+        total = sum(self._parse_decimal(record.get("valor_total")) or 0 for record in records)
+        total_items = sum(self._to_int(record.get("quantidade_itens")) or 0 for record in records)
+        clientes_pendentes_cadastro = sum(1 for record in records if isinstance(record.get("_auto_cliente_record"), dict))
+        periodos = list(dict.fromkeys([
+            self._as_string(record.get("periodo_referencia"))
+            for record in records
+            if self._as_string(record.get("periodo_referencia"))
+        ]))
+        vencimentos = list(dict.fromkeys([
+            self._format_date(record.get("data_vencimento"))
+            for record in records
+            if record.get("data_vencimento")
+        ]))
+
+        return {
+            "preview_layout": "fatura",
+            "preview_title": "Revisão de Faturamento",
+            "preview_subtitle": "Revise cliente, período, vencimento, itens e total antes de confirmar a geração da fatura.",
+            "summary": {
+                "total_faturas": len(records),
+                "total_itens": total_items,
+                "valor_total": round(total, 2),
+                "periodos": periodos,
+                "vencimentos": vencimentos,
+                "clientes_pendentes_cadastro": clientes_pendentes_cadastro,
+            },
+        }
 
     def _canonical_action(self, action: str | None) -> str | None:
         if not action:
@@ -2045,8 +2335,14 @@ class ChatRuntimeService:
             unidades: list[str] = []
             funcionarios: list[str] = []
             exames: list[str] = []
+            clientes: list[str] = []
+            clientes_pendentes_cadastro = 0
 
             for record in records:
+                cliente = self._as_string(record.get("cliente"))
+                if cliente:
+                    clientes.append(cliente)
+
                 period = self._as_string(record.get("periodo_referencia"))
                 if period:
                     periodos.append(period)
@@ -2055,7 +2351,7 @@ class ChatRuntimeService:
                 if due_date:
                     vencimentos.append(due_date)
 
-                metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else None
+                metadata = record.get("_metadata_payload") if isinstance(record.get("_metadata_payload"), dict) else None
                 if metadata:
                     unidade = self._as_string(metadata.get("unidade"))
                     if unidade:
@@ -2071,12 +2367,17 @@ class ChatRuntimeService:
                         if label:
                             exames.append(label)
 
-                for item in record.get("itens") or []:
+                for item in self._extract_fatura_items(record):
                     quantidade = self._parse_decimal(item.get("quantidade")) or 1.0
                     valor_unitario = self._parse_decimal(item.get("valor_unitario")) or 0.0
                     total += quantidade * valor_unitario
 
+                if isinstance(record.get("_auto_cliente_record"), dict):
+                    clientes_pendentes_cadastro += 1
+
             message = f"Preparei {len(records)} fatura(s) somando {self._format_currency(total)}."
+            if clientes:
+                message += f" Clientes: {self._join_human_values(list(dict.fromkeys(clientes))[:3])}."
             if unidades:
                 message += f" Unidades: {self._join_human_values(list(dict.fromkeys(unidades))[:3])}."
             if periodos:
@@ -2087,6 +2388,8 @@ class ChatRuntimeService:
                 message += f" Funcionários identificados: {self._join_human_values(list(dict.fromkeys(funcionarios))[:5])}."
             if exames:
                 message += f" Exames identificados: {self._join_human_values(list(dict.fromkeys(exames))[:6])}."
+            if clientes_pendentes_cadastro > 0:
+                message += " O cliente desta fatura não está cadastrado e será sincronizado automaticamente ao confirmar."
             message += " Posso confirmar a criacao?"
             return message
 
@@ -2693,6 +2996,77 @@ class ChatRuntimeService:
 
         return normalized_records
 
+    def _resolve_auto_cliente_record_for_fatura(
+        self,
+        *,
+        client_id: int | None,
+        client_rows: list[dict[str, Any]],
+        record: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if client_id is not None:
+            return None
+
+        if self._format_cliente_candidates(client_rows):
+            return None
+
+        cliente_records = self._build_cliente_records_from_fatura_draft([record])
+        if len(cliente_records) != 1:
+            return None
+
+        cliente_record = self._normalize_cliente_record(cliente_records[0])
+        if self._missing_cliente_fields(cliente_record):
+            return None
+
+        return cliente_record
+
+    def _build_metadata_people_preview(self, metadata: dict[str, Any] | None) -> str | None:
+        if not metadata:
+            return None
+
+        funcionarios = metadata.get("funcionarios") or []
+        if not isinstance(funcionarios, list) or not funcionarios:
+            return None
+
+        labels = [
+            self._as_string((item or {}).get("nome"))
+            for item in funcionarios
+            if isinstance(item, dict)
+        ]
+        labels = [label for label in labels if label]
+        if not labels:
+            return None
+
+        unique_labels = list(dict.fromkeys(labels))
+        preview = self._join_human_values(unique_labels[:4])
+        if len(unique_labels) > 4:
+            preview += f" + {len(unique_labels) - 4} outro(s)"
+
+        return preview
+
+    def _build_metadata_exam_preview(self, metadata: dict[str, Any] | None) -> str | None:
+        if not metadata:
+            return None
+
+        exames = metadata.get("exames") or []
+        if not isinstance(exames, list) or not exames:
+            return None
+
+        labels = [
+            self._as_string((item or {}).get("nome"))
+            for item in exames
+            if isinstance(item, dict)
+        ]
+        labels = [label for label in labels if label]
+        if not labels:
+            return None
+
+        unique_labels = list(dict.fromkeys(labels))
+        preview = self._join_human_values(unique_labels[:4])
+        if len(unique_labels) > 4:
+            preview += f" + {len(unique_labels) - 4} outro(s)"
+
+        return preview
+
     def _is_plain_greeting(self, message: str) -> bool:
         normalized = self._normalize_free_text(message)
         if not normalized:
@@ -2911,6 +3285,48 @@ class ChatRuntimeService:
             return datetime.strptime(normalized, "%Y-%m-%d").strftime("%d/%m/%Y")
         except ValueError:
             return normalized
+
+    def _format_cnpj(self, value: Any) -> str | None:
+        digits = self._clean_document(value)
+        if not digits:
+            return None
+        if len(digits) != 14:
+            return digits
+        return f"{digits[0:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:14]}"
+
+    def _format_cep(self, value: Any) -> str | None:
+        digits = self._clean_document(value)
+        if not digits:
+            return None
+        if len(digits) != 8:
+            return digits
+        return f"{digits[0:5]}-{digits[5:8]}"
+
+    def _is_valid_cnpj(self, cnpj: str) -> bool:
+        digits = self._clean_document(cnpj)
+        if not digits or len(digits) != 14:
+            return False
+        if re.fullmatch(r"(\d)\1{13}", digits):
+            return False
+
+        numbers = [int(char) for char in digits]
+        for size in (12, 13):
+            total = 0
+            cursor = 0
+
+            for multiplier in range(size - 7, 1, -1):
+                total += numbers[cursor] * multiplier
+                cursor += 1
+
+            for multiplier in range(9, 1, -1):
+                total += numbers[cursor] * multiplier
+                cursor += 1
+
+            digit = ((10 * total) % 11) % 10
+            if numbers[size] != digit:
+                return False
+
+        return True
 
     def _clean_document(self, value: Any) -> str | None:
         if value is None:

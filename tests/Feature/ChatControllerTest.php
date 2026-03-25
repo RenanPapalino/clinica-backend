@@ -3,6 +3,8 @@
 namespace Tests\Feature;
 
 use App\Models\ChatMessage;
+use App\Models\RagChunk;
+use App\Models\RagDocument;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\UploadedFile;
@@ -72,6 +74,7 @@ class ChatControllerTest extends TestCase
             'chatbot.runtime.secret' => 'runtime-secret',
             'chatbot.chat_upload.mirror_to_drive' => true,
             'chatbot.chat_upload.mirror_to_drive_required' => true,
+            'chatbot.chat_upload.index_to_rag' => true,
             'chatbot.chat_upload.drive_name_prefix' => 'chat-upload',
             'services.google_drive.folder_id' => 'folder-drive-123',
             'services.google_drive.oauth_access_token' => null,
@@ -82,9 +85,11 @@ class ChatControllerTest extends TestCase
             'services.google_drive.timeout' => 10,
         ]);
 
-        Sanctum::actingAs(User::factory()->create([
+        $user = User::factory()->create([
             'ativo' => true,
-        ]));
+        ]);
+
+        Sanctum::actingAs($user);
 
         Http::fake([
             'https://oauth2.googleapis.com/token' => Http::response([
@@ -114,10 +119,9 @@ class ChatControllerTest extends TestCase
             'tipo_processamento' => 'financeiro',
             'espelhar_no_drive' => '1',
             'drive_required' => '1',
-            'arquivo' => UploadedFile::fake()->create(
-                'clientes.xlsx',
-                16,
-                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            'arquivo' => UploadedFile::fake()->createWithContent(
+                'clientes.csv',
+                "razao_social,cnpj\nClinica Exemplo,12345678000190\nClinica Dois,98765432000100\n"
             ),
         ], [
             'Accept' => 'application/json',
@@ -130,13 +134,76 @@ class ChatControllerTest extends TestCase
             ->assertJsonPath('arquivo_ingestao.auth_mode', 'service_account')
             ->assertJsonPath('arquivo_ingestao.provider', 'google_drive')
             ->assertJsonPath('arquivo_ingestao.file_id', 'drive-file-001')
-            ->assertJsonPath('arquivo_ingestao.folder_id', 'folder-drive-123');
+            ->assertJsonPath('arquivo_ingestao.folder_id', 'folder-drive-123')
+            ->assertJsonPath('rag_ingestao.success', true)
+            ->assertJsonPath('rag_ingestao.provider', 'rag_mysql')
+            ->assertJsonPath('rag_ingestao.business_context', 'chat_upload')
+            ->assertJsonPath('rag_ingestao.context_key', 'chat_user_' . $user->id);
 
         Http::assertSent(fn ($request) => $request->url() === 'https://oauth2.googleapis.com/token'
             && $request['grant_type'] === 'urn:ietf:params:oauth:grant-type:jwt-bearer');
         Http::assertSent(fn ($request) => str_starts_with($request->url(), 'https://www.googleapis.com/drive/v3/files'));
         Http::assertSent(fn ($request) => str_starts_with($request->url(), 'https://www.googleapis.com/upload/drive/v3/files/drive-file-001'));
         Http::assertSent(fn ($request) => $request->url() === 'http://langchain-runtime.test/chat/file');
+
+        $document = RagDocument::firstOrFail();
+        $this->assertSame('chatbot_upload', $document->source_system);
+        $this->assertSame('chat-upload:drive-file-001', $document->external_id);
+        $this->assertSame('chat_upload', $document->business_context);
+        $this->assertSame('chat_user_' . $user->id, $document->context_key);
+        $this->assertDatabaseCount('rag_chunks', 1);
+        $this->assertStringContainsString('Clinica Exemplo', RagChunk::firstOrFail()->content);
+    }
+
+    public function test_upload_do_chat_com_imagem_indexa_conhecimento_com_base_na_analise_visual(): void
+    {
+        config([
+            'chatbot.runtime.driver' => 'langchain',
+            'chatbot.runtime.base_url' => 'http://langchain-runtime.test',
+            'chatbot.runtime.secret' => 'runtime-secret',
+            'chatbot.chat_upload.mirror_to_drive' => false,
+            'chatbot.chat_upload.index_to_rag' => true,
+            'services.openai.key' => 'openai-test-key',
+        ]);
+
+        Sanctum::actingAs(User::factory()->create([
+            'ativo' => true,
+        ]));
+
+        Http::fake([
+            'https://api.openai.com/v1/chat/completions' => Http::response([
+                'choices' => [[
+                    'message' => [
+                        'content' => json_encode([
+                            'resumo' => 'Imagem com tabela de clientes.',
+                            'texto_extraido' => 'Alpha Sistemas Ltda CNPJ 11222333000132',
+                            'itens_relevantes' => ['Cliente Alpha Sistemas Ltda', 'CNPJ 11222333000132'],
+                            'proxima_acao_sugerida' => 'sincronizar_clientes',
+                        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+                    ],
+                ]],
+            ], 200),
+            'http://langchain-runtime.test/chat/file' => Http::response([
+                'mensagem' => 'Imagem recebida para analise.',
+            ], 200),
+        ]);
+
+        $response = $this->post('/api/chat/enviar', [
+            'mensagem' => 'Use a imagem como base de conhecimento.',
+            'tipo_processamento' => 'cadastros',
+            'arquivo' => UploadedFile::fake()->image('clientes.png'),
+        ], [
+            'Accept' => 'application/json',
+        ]);
+
+        $response->assertOk()
+            ->assertJsonPath('rag_ingestao.success', true)
+            ->assertJsonPath('rag_ingestao.extraction_mode', 'image');
+
+        $this->assertDatabaseHas('rag_documents', [
+            'business_context' => 'chat_upload',
+        ]);
+        $this->assertStringContainsString('Alpha Sistemas Ltda', RagChunk::firstOrFail()->content);
     }
 
     public function test_upload_do_chat_pode_espelhar_arquivo_no_google_drive_via_oauth_refresh_token(): void

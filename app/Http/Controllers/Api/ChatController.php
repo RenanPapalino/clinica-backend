@@ -15,6 +15,7 @@ use App\Models\Fatura;
 use App\Services\Ai\AiChatGatewayService;
 use App\Services\Ai\ChatAttachmentProcessingService;
 use App\Services\GoogleDriveFileMirrorService;
+use App\Services\Rag\ChatKnowledgeIngestionService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
@@ -45,6 +46,7 @@ class ChatController extends Controller
             $tipoProcessamento = $request->input('tipo_processamento', 'auto');
             $arquivoData = null;
             $arquivoIngestao = null;
+            $ragIngestao = null;
             $anexoProcessado = null;
             $tipoAnexo = null;
 
@@ -94,6 +96,7 @@ class ChatController extends Controller
                     userId: $user->id,
                     sessionId: $sessionId,
                     tipoProcessamento: $tipoProcessamento,
+                    processedAttachment: $anexoProcessado,
                 );
 
                 if (($arquivoIngestao['required'] ?? false) && !($arquivoIngestao['success'] ?? false)) {
@@ -103,6 +106,15 @@ class ChatController extends Controller
                         'arquivo_ingestao' => $arquivoIngestao,
                     ], 502);
                 }
+
+                $ragIngestao = $this->indexarArquivoNoRagSeConfigurado(
+                    request: $request,
+                    userId: $user->id,
+                    sessionId: $sessionId,
+                    tipoProcessamento: $tipoProcessamento,
+                    processedAttachment: $anexoProcessado,
+                    driveIngestion: $arquivoIngestao,
+                );
             }
 
             // Validação: Não pode enviar nada vazio
@@ -124,6 +136,7 @@ class ChatController extends Controller
                     'file_kind' => $tipoAnexo,
                     'processed_attachment' => app(ChatAttachmentProcessingService::class)->resumoMetadata($anexoProcessado),
                     'drive_ingestion' => $arquivoIngestao,
+                    'rag_ingestion' => $ragIngestao,
                 ]) : null
             ]);
 
@@ -147,6 +160,7 @@ class ChatController extends Controller
                     'dados_estruturados' => null,
                     'acao_sugerida'      => null,
                     'arquivo_ingestao'   => $arquivoIngestao,
+                    'rag_ingestao'       => $ragIngestao,
                 ]);
             }
 
@@ -179,6 +193,7 @@ class ChatController extends Controller
                 'dados_estruturados' => $respostaIa['dados_estruturados'] ?? null,
                 'acao_sugerida'      => $respostaIa['acao_sugerida'] ?? null,
                 'arquivo_ingestao'   => $arquivoIngestao,
+                'rag_ingestao'       => $ragIngestao,
             ]);
 
         } catch (\Throwable $e) {
@@ -407,11 +422,17 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
             ->all();
     }
 
-    private function espelharArquivoNoDriveSeSolicitado(Request $request, int $userId, string $sessionId, string $tipoProcessamento): ?array
+    private function espelharArquivoNoDriveSeSolicitado(
+        Request $request,
+        int $userId,
+        string $sessionId,
+        string $tipoProcessamento,
+        ?array $processedAttachment = null,
+    ): ?array
     {
         $espelhar = $request->has('espelhar_no_drive')
             ? $request->boolean('espelhar_no_drive')
-            : (bool) config('chatbot.chat_upload.mirror_to_drive');
+            : (bool) config('chatbot.chat_upload.mirror_to_drive', true);
 
         if (!$espelhar || !$request->hasFile('arquivo') || !$request->file('arquivo')->isValid()) {
             return null;
@@ -439,6 +460,7 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
                 'user_id' => $userId,
                 'session_id' => $sessionId,
                 'tipo_processamento' => $tipoProcessamento,
+                'processed_attachment' => $processedAttachment,
             ]) + [
                 'attempted' => true,
                 'required' => $required,
@@ -456,6 +478,53 @@ private function conectarComN8n($mensagem, $user, $sessionId, $arquivoData, $tip
                 'attempted' => true,
                 'required' => $required,
                 'provider' => 'google_drive',
+                'message' => $e->getMessage(),
+            ];
+        }
+    }
+
+    private function indexarArquivoNoRagSeConfigurado(
+        Request $request,
+        int $userId,
+        string $sessionId,
+        string $tipoProcessamento,
+        ?array $processedAttachment = null,
+        ?array $driveIngestion = null,
+    ): ?array {
+        if (!(bool) config('chatbot.chat_upload.index_to_rag', true)) {
+            return null;
+        }
+
+        if (!$request->hasFile('arquivo') || !$request->file('arquivo')->isValid()) {
+            return null;
+        }
+
+        try {
+            /** @var ChatKnowledgeIngestionService $ingestion */
+            $ingestion = app(ChatKnowledgeIngestionService::class);
+
+            return $ingestion->ingestChatUpload(
+                file: $request->file('arquivo'),
+                context: [
+                    'user_id' => $userId,
+                    'session_id' => $sessionId,
+                    'tipo_processamento' => $tipoProcessamento,
+                ],
+                processedAttachment: $processedAttachment,
+                driveIngestion: $driveIngestion,
+            );
+        } catch (\Throwable $e) {
+            Log::warning('Falha ao indexar anexo do chat no RAG', [
+                'user_id' => $userId,
+                'session_id' => $sessionId,
+                'tipo_processamento' => $tipoProcessamento,
+                'error' => $e->getMessage(),
+            ]);
+
+            return [
+                'success' => false,
+                'provider' => 'rag_mysql',
+                'status' => 'failed',
                 'message' => $e->getMessage(),
             ];
         }
@@ -1635,6 +1704,8 @@ private function detectarAcaoPelosDados(array $dados): string
             'criar_conta_pagar',
             'criar_conta_receber',
             'criar_titulo_receber',
+            'gerar_fatura',
+            'criar_fatura',
         ], true)) {
             return $normalizado;
         }
@@ -1752,21 +1823,33 @@ private function detectarAcaoPelosDados(array $dados): string
             'criar_cliente' => 'cliente',
             'criar_despesa', 'criar_conta_pagar' => 'despesa',
             'criar_conta_receber', 'criar_titulo_receber' => 'titulo_receber',
+            'gerar_fatura', 'criar_fatura' => 'fatura',
             default => 'dados',
         };
+
+        $colunas = in_array($acao, ['gerar_fatura', 'criar_fatura'], true)
+            ? $this->montarColunasFaturas($registros)
+            : $this->montarColunasPreview($registros);
+
+        $metadata = [
+            'fonte' => 'langchain',
+            'acao' => $acao,
+        ];
+
+        if (in_array($acao, ['gerar_fatura', 'criar_fatura'], true)) {
+            $metadata['preview_layout'] = 'fatura';
+            $metadata['summary'] = $this->montarResumoPreviewFaturas($registros);
+        }
 
         return [
             'sucesso' => true,
             'tipo' => $tipo,
             'acao_sugerida' => $acao,
             'dados_mapeados' => array_values($registros),
-            'colunas' => $this->montarColunasPreview($registros),
+            'colunas' => $colunas,
             'total_registros' => count($registros),
             'confianca' => is_numeric($body['confianca'] ?? null) ? (float) $body['confianca'] : null,
-            'metadata' => [
-                'fonte' => 'langchain',
-                'acao' => $acao,
-            ],
+            'metadata' => $metadata,
             'raw_output' => $body,
         ];
     }
@@ -1784,6 +1867,90 @@ private function detectarAcaoPelosDados(array $dados): string
                 'label' => ucwords(str_replace('_', ' ', $key)),
             ];
         }, array_keys($primeiro));
+    }
+
+    private function montarColunasFaturas(array $registros): array
+    {
+        $primeiro = $registros[0] ?? [];
+        if (!is_array($primeiro)) {
+            return [];
+        }
+
+        $preferidas = [
+            'cliente' => 'Cliente',
+            'cliente_cnpj' => 'CNPJ',
+            'periodo_referencia' => 'Período',
+            'data_emissao' => 'Emissão',
+            'data_vencimento' => 'Vencimento',
+            'quantidade_itens' => 'Itens',
+            'valor_total' => 'Valor Total',
+            'unidade' => 'Unidade',
+            'funcionarios_resumo' => 'Funcionários',
+            'exames_resumo' => 'Exames',
+            'cliente_status_resumo' => 'Situação do Cliente',
+            'status' => 'Status',
+            'observacoes' => 'Observações',
+        ];
+
+        $colunas = [];
+        foreach ($preferidas as $key => $label) {
+            if (array_key_exists($key, $primeiro)) {
+                $colunas[] = [
+                    'key' => $key,
+                    'label' => $label,
+                ];
+            }
+        }
+
+        foreach (array_keys($primeiro) as $key) {
+            if (str_starts_with((string) $key, '_')) {
+                continue;
+            }
+
+            if (collect($colunas)->contains(fn ($coluna) => $coluna['key'] === $key)) {
+                continue;
+            }
+
+            $colunas[] = [
+                'key' => $key,
+                'label' => ucwords(str_replace('_', ' ', $key)),
+            ];
+        }
+
+        return $colunas;
+    }
+
+    private function montarResumoPreviewFaturas(array $registros): array
+    {
+        $valorTotal = 0.0;
+        $itensTotal = 0;
+        $periodos = [];
+        $vencimentos = [];
+
+        foreach ($registros as $registro) {
+            if (!is_array($registro)) {
+                continue;
+            }
+
+            $valorTotal += (float) ($registro['valor_total'] ?? 0);
+            $itensTotal += (int) ($registro['quantidade_itens'] ?? 0);
+
+            if (!empty($registro['periodo_referencia'])) {
+                $periodos[] = (string) $registro['periodo_referencia'];
+            }
+
+            if (!empty($registro['data_vencimento'])) {
+                $vencimentos[] = (string) $registro['data_vencimento'];
+            }
+        }
+
+        return [
+            'total_faturas' => count($registros),
+            'total_itens' => $itensTotal,
+            'valor_total' => round($valorTotal, 2),
+            'periodos' => array_values(array_unique($periodos)),
+            'vencimentos' => array_values(array_unique($vencimentos)),
+        ];
     }
 
     private function montarPayloadClientes(array $lista): array

@@ -20,6 +20,15 @@ def build_read_tools(
     max_rows = max(1, max_rows)
 
     @tool
+    async def consultar_cnpj(cnpj: str) -> str:
+        """Consulta um CNPJ na CNPJá e retorna os dados estruturados da empresa. Aceita CNPJ com ou sem pontuacao."""
+        data = await client.consultar_cnpj(
+            user_id=user_id,
+            cnpj=cnpj,
+        )
+        return _dump_json(data)
+
+    @tool
     async def buscar_clientes(query: str, limit: int = 5) -> str:
         """Busca clientes por nome, fantasia ou CNPJ."""
         data = await client.search_clientes(
@@ -186,6 +195,7 @@ def build_read_tools(
         return _dump_json(data)
 
     return [
+        consultar_cnpj,
         buscar_clientes,
         buscar_fornecedores,
         buscar_titulos,

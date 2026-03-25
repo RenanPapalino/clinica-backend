@@ -45,6 +45,14 @@ class LaravelInternalClient:
             },
         )
 
+    async def consultar_cnpj(self, *, user_id: int, cnpj: str) -> dict[str, Any]:
+        return await self._request(
+            path="/api/internal/agent/cnpj/consultar",
+            method="POST",
+            user_id=user_id,
+            body={"cnpj": cnpj},
+        )
+
     async def financial_summary(self, *, user_id: int) -> dict[str, Any]:
         return await self._request(
             path="/api/internal/agent/financial-summary",

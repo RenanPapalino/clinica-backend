@@ -16,6 +16,7 @@ use App\Models\Titulo;
 use App\Models\User;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
 use Tests\TestCase;
 
@@ -54,6 +55,103 @@ class AgentToolControllerTest extends TestCase
             ->assertJsonPath('data.user.id', $user->id)
             ->assertJsonPath('data.user.role', 'admin')
             ->assertJsonCount(2, 'data.messages');
+    }
+
+    public function test_agent_runtime_consulta_cnpj_com_pontuacao_e_retorna_dados_estruturados(): void
+    {
+        config([
+            'chatbot.runtime.secret' => 'agent-secret',
+            'services.cnpja.api_key' => 'api-key-teste',
+            'services.cnpja.base_url' => 'https://api.cnpja.com',
+            'services.cnpja.include_simples' => true,
+        ]);
+
+        Http::fake([
+            'https://api.cnpja.com/office/04252011000110*' => Http::response([
+                'company' => [
+                    'name' => 'GOOGLE BRASIL INTERNET LTDA',
+                    'alias' => 'GOOGLE BRASIL',
+                    'nature' => ['text' => 'Sociedade Empresária Limitada'],
+                    'size' => ['text' => 'Demais'],
+                    'municipalRegistration' => '123456',
+                    'website' => 'https://www.google.com.br',
+                ],
+                'status' => ['text' => 'Ativa'],
+                'address' => [
+                    'street' => 'Avenida Brigadeiro Faria Lima',
+                    'number' => '3477',
+                    'district' => 'Itaim Bibi',
+                    'city' => 'São Paulo',
+                    'state' => 'SP',
+                    'zip' => '04538133',
+                ],
+                'emails' => [
+                    ['address' => 'contato@google.com'],
+                ],
+                'phones' => [
+                    ['area' => '11', 'number' => '23950000'],
+                ],
+                'registrations' => [
+                    ['state' => 'SP', 'number' => '148765432'],
+                ],
+                'simples' => ['optant' => false],
+                'founded' => '2005-09-15',
+            ], 200),
+        ]);
+
+        $user = User::factory()->create([
+            'ativo' => true,
+        ]);
+
+        $cliente = Cliente::create([
+            'cnpj' => '04252011000110',
+            'razao_social' => 'GOOGLE BRASIL INTERNET LTDA',
+            'status' => 'ativo',
+        ]);
+
+        $this->postJson('/api/internal/agent/cnpj/consultar', [
+            'cnpj' => '04.252.011/0001-10',
+        ], $this->headersFor($user))
+            ->assertOk()
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.cnpj', '04252011000110')
+            ->assertJsonPath('data.cnpj_formatado', '04.252.011/0001-10')
+            ->assertJsonPath('data.provider', 'cnpja_commercial')
+            ->assertJsonPath('data.empresa.razao_social', 'GOOGLE BRASIL INTERNET LTDA')
+            ->assertJsonPath('data.empresa.endereco.cidade', 'São Paulo')
+            ->assertJsonPath('data.cliente_existente.id', $cliente->id)
+            ->assertJsonPath('data.cliente_existente.cnpj_formatado', '04.252.011/0001-10');
+    }
+
+    public function test_agent_runtime_consulta_cnpj_sem_pontuacao(): void
+    {
+        config([
+            'chatbot.runtime.secret' => 'agent-secret',
+            'services.cnpja.api_key' => 'api-key-teste',
+            'services.cnpja.base_url' => 'https://api.cnpja.com',
+            'services.cnpja.include_simples' => true,
+        ]);
+
+        Http::fake([
+            'https://api.cnpja.com/office/04252011000110*' => Http::response([
+                'company' => [
+                    'name' => 'GOOGLE BRASIL INTERNET LTDA',
+                ],
+                'status' => ['text' => 'Ativa'],
+            ], 200),
+        ]);
+
+        $user = User::factory()->create([
+            'ativo' => true,
+        ]);
+
+        $this->postJson('/api/internal/agent/cnpj/consultar', [
+            'cnpj' => '04252011000110',
+        ], $this->headersFor($user))
+            ->assertOk()
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.cnpj', '04252011000110')
+            ->assertJsonPath('data.empresa.razao_social', 'GOOGLE BRASIL INTERNET LTDA');
     }
 
     public function test_agent_runtime_busca_conhecimento_por_contexto_de_negocio(): void
@@ -117,6 +215,89 @@ class AgentToolControllerTest extends TestCase
             ->assertJsonCount(1, 'data')
             ->assertJsonPath('data.0.document.file_name', 'manual-financeiro.pdf')
             ->assertJsonPath('data.0.document.business_context', 'financeiro');
+    }
+
+    public function test_agent_runtime_busca_conhecimento_inclui_uploads_do_usuario_e_exclui_uploads_de_outros(): void
+    {
+        config(['chatbot.runtime.secret' => 'agent-secret']);
+
+        $user = User::factory()->create([
+            'ativo' => true,
+        ]);
+
+        $global = RagDocument::create([
+            'source_system' => 'google_drive',
+            'external_id' => 'global-1',
+            'file_name' => 'manual-global.txt',
+            'business_context' => 'financeiro',
+            'context_key' => 'geral',
+            'status' => 'active',
+            'current_version' => 1,
+            'chunks_count' => 1,
+            'last_indexed_at' => now(),
+            'metadata' => ['source_scope' => 'global'],
+        ]);
+
+        RagChunk::create([
+            'rag_document_id' => $global->id,
+            'version' => 1,
+            'chunk_index' => 0,
+            'content' => 'Regra global sobre faturamento e cobrança clínica.',
+            'metadata' => [],
+            'is_active' => true,
+        ]);
+
+        $ownedUpload = RagDocument::create([
+            'source_system' => 'chatbot_upload',
+            'external_id' => 'chat-1',
+            'file_name' => 'base-cliente.txt',
+            'business_context' => 'chat_upload',
+            'context_key' => 'chat_user_' . $user->id,
+            'status' => 'active',
+            'current_version' => 1,
+            'chunks_count' => 1,
+            'last_indexed_at' => now(),
+            'metadata' => ['source_scope' => 'chat_upload'],
+        ]);
+
+        RagChunk::create([
+            'rag_document_id' => $ownedUpload->id,
+            'version' => 1,
+            'chunk_index' => 0,
+            'content' => 'Alpha Sistemas Ltda contratou PCMSO e exames admissionais.',
+            'metadata' => [],
+            'is_active' => true,
+        ]);
+
+        $foreignUpload = RagDocument::create([
+            'source_system' => 'chatbot_upload',
+            'external_id' => 'chat-2',
+            'file_name' => 'base-outro-usuario.txt',
+            'business_context' => 'chat_upload',
+            'context_key' => 'chat_user_999',
+            'status' => 'active',
+            'current_version' => 1,
+            'chunks_count' => 1,
+            'last_indexed_at' => now(),
+            'metadata' => ['source_scope' => 'chat_upload'],
+        ]);
+
+        RagChunk::create([
+            'rag_document_id' => $foreignUpload->id,
+            'version' => 1,
+            'chunk_index' => 0,
+            'content' => 'Documento privado de outro usuário sobre cobrança confidencial.',
+            'metadata' => [],
+            'is_active' => true,
+        ]);
+
+        $this->postJson('/api/internal/agent/knowledge/search', [
+            'query' => 'Alpha Sistemas',
+        ], $this->headersFor($user))
+            ->assertOk()
+            ->assertJsonPath('success', true)
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.document.file_name', 'base-cliente.txt');
     }
 
     public function test_agent_runtime_cria_cliente_conta_receber_e_conta_pagar(): void

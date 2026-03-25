@@ -18,8 +18,9 @@ return [
     ],
 
     'chat_upload' => [
-        'mirror_to_drive' => filter_var(env('CHATBOT_CHAT_UPLOAD_MIRROR_TO_DRIVE', false), FILTER_VALIDATE_BOOL),
+        'mirror_to_drive' => filter_var(env('CHATBOT_CHAT_UPLOAD_MIRROR_TO_DRIVE', true), FILTER_VALIDATE_BOOL),
         'mirror_to_drive_required' => filter_var(env('CHATBOT_CHAT_UPLOAD_MIRROR_TO_DRIVE_REQUIRED', false), FILTER_VALIDATE_BOOL),
         'drive_name_prefix' => env('CHATBOT_CHAT_UPLOAD_DRIVE_NAME_PREFIX', 'chat-upload'),
+        'index_to_rag' => filter_var(env('CHATBOT_CHAT_UPLOAD_INDEX_TO_RAG', true), FILTER_VALIDATE_BOOL),
     ],
 ];

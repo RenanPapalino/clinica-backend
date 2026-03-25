@@ -21,9 +21,11 @@ use App\Models\Fatura;
 use App\Models\Fornecedor;
 use App\Models\Nfse;
 use App\Models\Titulo;
+use App\Services\CnpjaService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 
@@ -71,10 +73,95 @@ class AgentToolController extends Controller
             'limit' => 'nullable|integer|min:1|max:20',
         ]);
 
+        $data['user_context_keys'] = ['chat_user_' . $request->user()->id];
+
         return response()->json([
             'success' => true,
             'data' => $searchRagChunksAction->execute($data['query'], $data),
         ]);
+    }
+
+    public function consultarCnpj(Request $request, CnpjaService $cnpjaService)
+    {
+        $data = $request->validate([
+            'cnpj' => ['required', 'string', 'min:14', 'max:25'],
+        ]);
+
+        $cnpj = preg_replace('/\D/', '', (string) $data['cnpj']);
+
+        if (strlen($cnpj) !== 14 || !Cliente::isValidCnpj($cnpj)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Informe um CNPJ válido para consulta.',
+            ], 422);
+        }
+
+        try {
+            $result = $cnpjaService->consultarCnpj($cnpj);
+            $mapped = (array) ($result['mapped'] ?? []);
+            $clienteExistente = Cliente::query()->where('cnpj', $cnpj)->first();
+            $fornecedorExistente = Fornecedor::query()->where('cnpj', $cnpj)->first();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Consulta CNPJ realizada com sucesso.',
+                'data' => [
+                    'cnpj' => $cnpj,
+                    'cnpj_formatado' => $this->formatarCnpj($cnpj),
+                    'provider' => $result['provider'] ?? 'cnpja',
+                    'empresa' => [
+                        'razao_social' => $mapped['razao_social'] ?? null,
+                        'nome_fantasia' => $mapped['nome_fantasia'] ?? null,
+                        'status' => $mapped['status'] ?? null,
+                        'email' => $mapped['email'] ?? null,
+                        'telefone' => $mapped['telefone'] ?? null,
+                        'site' => $mapped['site'] ?? null,
+                        'inscricao_estadual' => $mapped['inscricao_estadual'] ?? null,
+                        'inscricao_municipal' => $mapped['inscricao_municipal'] ?? null,
+                        'observacoes' => $mapped['observacoes'] ?? null,
+                        'metadata' => $mapped['metadata'] ?? [],
+                        'endereco' => [
+                            'cep' => $mapped['cep'] ?? null,
+                            'logradouro' => $mapped['logradouro'] ?? null,
+                            'numero' => $mapped['numero'] ?? null,
+                            'complemento' => $mapped['complemento'] ?? null,
+                            'bairro' => $mapped['bairro'] ?? null,
+                            'cidade' => $mapped['cidade'] ?? null,
+                            'uf' => $mapped['uf'] ?? null,
+                        ],
+                    ],
+                    'cliente_existente' => $clienteExistente ? [
+                        'id' => $clienteExistente->id,
+                        'cnpj' => $clienteExistente->cnpj,
+                        'cnpj_formatado' => $clienteExistente->cnpj_formatado,
+                        'razao_social' => $clienteExistente->razao_social,
+                        'nome_fantasia' => $clienteExistente->nome_fantasia,
+                        'status' => $clienteExistente->status,
+                    ] : null,
+                    'fornecedor_existente' => $fornecedorExistente ? [
+                        'id' => $fornecedorExistente->id,
+                        'cnpj' => $fornecedorExistente->cnpj,
+                        'cnpj_formatado' => $this->formatarCnpj($fornecedorExistente->cnpj),
+                        'razao_social' => $fornecedorExistente->razao_social,
+                        'nome_fantasia' => $fornecedorExistente->nome_fantasia,
+                        'status' => $fornecedorExistente->status,
+                    ] : null,
+                ],
+            ]);
+        } catch (\Throwable $e) {
+            Log::warning('Falha ao consultar CNPJá no runtime do agente', [
+                'cnpj' => $cnpj,
+                'message' => $e->getMessage(),
+            ]);
+
+            $message = $e->getMessage();
+            $status = str_contains(mb_strtolower($message), 'não foi possível') ? 502 : 422;
+
+            return response()->json([
+                'success' => false,
+                'message' => $message,
+            ], $status);
+        }
     }
 
     public function financialSummary()
@@ -1324,5 +1411,24 @@ class AgentToolController extends Controller
         $base['exames_resumo'] = $exames->take(20)->all();
 
         return $base;
+    }
+
+    private function formatarCnpj(?string $cnpj): ?string
+    {
+        $cnpj = preg_replace('/\D/', '', (string) $cnpj);
+
+        if ($cnpj === '') {
+            return null;
+        }
+
+        if (strlen($cnpj) !== 14) {
+            return $cnpj;
+        }
+
+        return substr($cnpj, 0, 2) . '.'
+            . substr($cnpj, 2, 3) . '.'
+            . substr($cnpj, 5, 3) . '/'
+            . substr($cnpj, 8, 4) . '-'
+            . substr($cnpj, 12, 2);
     }
 }

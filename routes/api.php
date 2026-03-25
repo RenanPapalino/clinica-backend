@@ -73,6 +73,7 @@ Route::prefix('internal/n8n/rag')->middleware('n8n.ingest')->group(function () {
 Route::prefix('internal/agent')->middleware('agent.runtime')->group(function () {
     Route::post('/session-context', [AgentToolController::class, 'sessionContext']);
     Route::post('/knowledge/search', [AgentToolController::class, 'searchKnowledge']);
+    Route::post('/cnpj/consultar', [AgentToolController::class, 'consultarCnpj']);
     Route::get('/financial-summary', [AgentToolController::class, 'financialSummary']);
     Route::post('/faturamento/summary', [AgentToolController::class, 'faturamentoSummary']);
     Route::post('/caixa/previsao', [AgentToolController::class, 'previsaoCaixa']);

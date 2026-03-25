@@ -31,6 +31,28 @@ class SearchRagChunksAction
 
                 if (!empty($filters['context_key'])) {
                     $documentQuery->where('context_key', $filters['context_key']);
+                    return;
+                }
+
+                $userContextKeys = collect($filters['user_context_keys'] ?? [])
+                    ->map(fn ($key) => trim((string) $key))
+                    ->filter()
+                    ->values();
+
+                if ($userContextKeys->isNotEmpty()) {
+                    $documentQuery->where(function ($scopeQuery) use ($userContextKeys) {
+                        $scopeQuery
+                            ->where(function ($globalQuery) {
+                                $globalQuery
+                                    ->where('business_context', '!=', 'chat_upload')
+                                    ->orWhereNull('business_context');
+                            })
+                            ->orWhere(function ($userUploadQuery) use ($userContextKeys) {
+                                $userUploadQuery
+                                    ->where('business_context', 'chat_upload')
+                                    ->whereIn('context_key', $userContextKeys->all());
+                            });
+                    });
                 }
             });
 
