@@ -7,6 +7,7 @@ use App\Models\Cliente;
 use App\Models\Cobranca;
 use App\Models\Despesa;
 use App\Models\Fatura;
+use App\Models\FaturaItem;
 use App\Models\Fornecedor;
 use App\Models\Nfse;
 use App\Models\RagChunk;
@@ -1207,8 +1208,19 @@ class AgentToolControllerTest extends TestCase
             'razao_social' => 'CLINICA RENEGOCIACAO LTDA',
         ]);
 
+        $fatura = Fatura::create([
+            'cliente_id' => $cliente->id,
+            'numero_fatura' => 'FAT-REN-001',
+            'data_emissao' => now()->toDateString(),
+            'data_vencimento' => now()->addDays(4)->toDateString(),
+            'periodo_referencia' => '2026-03',
+            'valor_total' => 900.00,
+            'status' => 'pendente',
+        ]);
+
         $titulo = Titulo::create([
             'cliente_id' => $cliente->id,
+            'fatura_id' => $fatura->id,
             'descricao' => 'Mensalidade maio',
             'tipo' => 'receber',
             'numero_titulo' => 'REN-001',
@@ -1236,6 +1248,299 @@ class AgentToolControllerTest extends TestCase
             'id' => $titulo->id,
             'status' => 'aberto',
             'data_vencimento' => $novoVencimento . ' 00:00:00',
+        ]);
+
+        $this->assertDatabaseHas('faturas', [
+            'id' => $fatura->id,
+            'data_vencimento' => $novoVencimento,
+        ]);
+    }
+
+    public function test_agent_runtime_gera_boleto_para_fatura_existente(): void
+    {
+        config(['chatbot.runtime.secret' => 'agent-secret']);
+
+        $user = User::factory()->create([
+            'ativo' => true,
+        ]);
+
+        $cliente = Cliente::factory()->create([
+            'cnpj' => '99887766000111',
+            'razao_social' => 'CLINICA BOLETO LTDA',
+            'status' => 'ativo',
+        ]);
+
+        $fatura = Fatura::create([
+            'cliente_id' => $cliente->id,
+            'numero_fatura' => 'FAT-BOLETO-001',
+            'data_emissao' => now()->toDateString(),
+            'data_vencimento' => now()->addDays(5)->toDateString(),
+            'periodo_referencia' => '2026-03',
+            'valor_total' => 736.45,
+            'status' => 'emitida',
+        ]);
+
+        Titulo::create([
+            'cliente_id' => $cliente->id,
+            'fatura_id' => $fatura->id,
+            'descricao' => 'Cobrança FAT-BOLETO-001',
+            'tipo' => 'receber',
+            'numero_titulo' => 'BOL-001',
+            'data_emissao' => now()->toDateString(),
+            'data_vencimento' => now()->addDays(5)->toDateString(),
+            'valor_original' => 736.45,
+            'valor_pago' => 0,
+            'valor_saldo' => 736.45,
+            'status' => 'aberto',
+        ]);
+
+        $this->mock(ItauService::class, function ($mock) {
+            $mock->shouldReceive('registrarBoleto')
+                ->once()
+                ->andReturn([
+                    'nosso_numero' => '44556677889',
+                    'codigo_barras' => '34191790010104351004791020150008291070026002',
+                    'linha_digitavel' => '34191.79001 01043.510047 91020.150008 2 91070026002',
+                    'url_boleto' => 'https://boletos.test/44556677889',
+                ]);
+        });
+
+        $this->postJson('/api/internal/agent/faturas/gerar-boleto', [
+            'fatura_id' => $fatura->id,
+        ], $this->headersFor($user))
+            ->assertOk()
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.mode', 'banco')
+            ->assertJsonPath('data.fatura.id', $fatura->id)
+            ->assertJsonPath('data.boleto.nosso_numero', '44556677889')
+            ->assertJsonPath('data.boleto.url_boleto', 'https://boletos.test/44556677889');
+
+        $this->assertDatabaseHas('titulos', [
+            'fatura_id' => $fatura->id,
+            'nosso_numero' => '44556677889',
+            'url_boleto' => 'https://boletos.test/44556677889',
+        ]);
+    }
+
+    public function test_agent_runtime_exclui_boleto_local_da_fatura(): void
+    {
+        config(['chatbot.runtime.secret' => 'agent-secret']);
+
+        $user = User::factory()->create([
+            'ativo' => true,
+        ]);
+
+        $cliente = Cliente::factory()->create([
+            'cnpj' => '99887766000111',
+            'razao_social' => 'CLINICA BOLETO LOCAL LTDA',
+            'status' => 'ativo',
+        ]);
+
+        $fatura = Fatura::create([
+            'cliente_id' => $cliente->id,
+            'numero_fatura' => 'FAT-DEL-BOL-001',
+            'data_emissao' => now()->toDateString(),
+            'data_vencimento' => now()->addDays(5)->toDateString(),
+            'periodo_referencia' => '2026-03',
+            'valor_total' => 736.45,
+            'status' => 'concluida',
+            'nfse_emitida' => false,
+        ]);
+
+        $titulo = Titulo::create([
+            'cliente_id' => $cliente->id,
+            'fatura_id' => $fatura->id,
+            'descricao' => 'Cobrança FAT-DEL-BOL-001',
+            'tipo' => 'receber',
+            'numero_titulo' => 'DEL-BOL-001',
+            'data_emissao' => now()->toDateString(),
+            'data_vencimento' => now()->addDays(5)->toDateString(),
+            'valor_original' => 736.45,
+            'valor_pago' => 0,
+            'valor_saldo' => 736.45,
+            'status' => 'aberto',
+            'nosso_numero' => 'LOCAL0000000700',
+            'linha_digitavel' => '34191.79001 01043.510047 91020.150008 6 89870000073645',
+            'url_boleto' => 'https://boletos.test/local-700',
+            'forma_pagamento' => 'boleto',
+        ]);
+
+        $cobranca = Cobranca::create([
+            'cliente_id' => $cliente->id,
+            'fatura_id' => $fatura->id,
+            'titulo_id' => $titulo->id,
+            'meio' => 'boleto',
+            'status' => 'enviada',
+            'canal' => 'manual',
+            'descricao' => 'Boleto enviado ao cliente.',
+            'data_envio' => now(),
+            'valor_cobrado' => 736.45,
+        ]);
+
+        $this->postJson('/api/internal/agent/faturas/excluir-boleto', [
+            'fatura_id' => $fatura->id,
+            'runtime_audit' => [
+                'confirmation_strength' => 'strong',
+                'confirmation_phrase' => 'confirmo excluir o boleto da fatura FAT-DEL-BOL-001',
+                'confirmation_message' => 'confirmo excluir o boleto da fatura FAT-DEL-BOL-001',
+                'confirmation_source' => 'chat_message',
+                'runtime_pending_action_id' => 'pending-del-bol-001',
+                'session_id' => 'sessao-del-bol-001',
+                'approved_at' => now()->toIso8601String(),
+            ],
+        ], $this->headersFor($user))
+            ->assertOk()
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.boleto_excluido', true)
+            ->assertJsonPath('data.titulo_id', $titulo->id)
+            ->assertJsonPath('data.fatura.id', $fatura->id)
+            ->assertJsonPath('data.fatura.status', 'pendente')
+            ->assertJsonPath('data.nosso_numero_anterior', 'LOCAL0000000700');
+
+        $this->assertDatabaseHas('titulos', [
+            'id' => $titulo->id,
+            'nosso_numero' => null,
+            'linha_digitavel' => null,
+            'url_boleto' => null,
+            'forma_pagamento' => null,
+        ]);
+
+        $this->assertDatabaseHas('faturas', [
+            'id' => $fatura->id,
+            'status' => 'pendente',
+        ]);
+
+        $this->assertSoftDeleted('cobrancas', [
+            'id' => $cobranca->id,
+        ]);
+
+        $this->assertDatabaseHas('agent_action_audits', [
+            'user_id' => $user->id,
+            'action' => 'excluir_boleto',
+            'target_type' => 'boleto',
+            'target_id' => $titulo->id,
+            'target_label' => 'Boleto da fatura FAT-DEL-BOL-001',
+            'confirmation_strength' => 'strong',
+            'confirmation_phrase' => 'confirmo excluir o boleto da fatura FAT-DEL-BOL-001',
+            'confirmation_message' => 'confirmo excluir o boleto da fatura FAT-DEL-BOL-001',
+            'confirmation_source' => 'chat_message',
+            'runtime_pending_action_id' => 'pending-del-bol-001',
+            'session_id' => 'sessao-del-bol-001',
+        ]);
+    }
+
+    public function test_agent_runtime_exclui_fatura_com_registros_vinculados(): void
+    {
+        config(['chatbot.runtime.secret' => 'agent-secret']);
+
+        $user = User::factory()->create([
+            'ativo' => true,
+        ]);
+
+        $cliente = Cliente::factory()->create([
+            'cnpj' => '11223344000155',
+            'razao_social' => 'CLINICA EXCLUI FATURA LTDA',
+            'status' => 'ativo',
+        ]);
+
+        $servico = Servico::create([
+            'codigo' => 'EXC-FAT-001',
+            'descricao' => 'Serviço de exclusão',
+            'valor_unitario' => 736.45,
+            'tipo_servico' => 'mensalidade',
+            'ativo' => true,
+        ]);
+
+        $fatura = Fatura::create([
+            'cliente_id' => $cliente->id,
+            'numero_fatura' => 'FAT-DEL-001',
+            'data_emissao' => now()->toDateString(),
+            'data_vencimento' => now()->addDays(5)->toDateString(),
+            'periodo_referencia' => '2026-03',
+            'valor_servicos' => 736.45,
+            'valor_total' => 736.45,
+            'status' => 'pendente',
+            'nfse_emitida' => false,
+        ]);
+
+        $item = FaturaItem::create([
+            'fatura_id' => $fatura->id,
+            'servico_id' => $servico->id,
+            'item_numero' => 1,
+            'descricao' => 'Serviço de exclusão',
+            'quantidade' => 1,
+            'valor_unitario' => 736.45,
+            'valor_total' => 736.45,
+        ]);
+
+        $titulo = Titulo::create([
+            'cliente_id' => $cliente->id,
+            'fatura_id' => $fatura->id,
+            'descricao' => 'Cobrança FAT-DEL-001',
+            'tipo' => 'receber',
+            'numero_titulo' => 'DEL-FAT-001',
+            'data_emissao' => now()->toDateString(),
+            'data_vencimento' => now()->addDays(5)->toDateString(),
+            'valor_original' => 736.45,
+            'valor_pago' => 0,
+            'valor_saldo' => 736.45,
+            'status' => 'aberto',
+        ]);
+
+        $cobranca = Cobranca::create([
+            'cliente_id' => $cliente->id,
+            'fatura_id' => $fatura->id,
+            'titulo_id' => $titulo->id,
+            'meio' => 'email',
+            'status' => 'enviada',
+            'canal' => 'manual',
+            'descricao' => 'Cobrança vinculada à fatura.',
+            'data_envio' => now(),
+            'valor_cobrado' => 736.45,
+        ]);
+
+        $this->postJson('/api/internal/agent/faturas/excluir', [
+            'fatura_id' => $fatura->id,
+            'runtime_audit' => [
+                'confirmation_strength' => 'strong',
+                'confirmation_phrase' => 'confirmo excluir a fatura FAT-DEL-001',
+                'confirmation_message' => 'confirmo excluir a fatura FAT-DEL-001',
+                'confirmation_source' => 'chat_message',
+                'runtime_pending_action_id' => 'pending-del-fat-001',
+                'session_id' => 'sessao-del-fat-001',
+                'approved_at' => now()->toIso8601String(),
+            ],
+        ], $this->headersFor($user))
+            ->assertOk()
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.id', $fatura->id)
+            ->assertJsonPath('data.numero_fatura', 'FAT-DEL-001');
+
+        $this->assertSoftDeleted('faturas', [
+            'id' => $fatura->id,
+        ]);
+        $this->assertSoftDeleted('fatura_itens', [
+            'id' => $item->id,
+        ]);
+        $this->assertSoftDeleted('titulos', [
+            'id' => $titulo->id,
+        ]);
+        $this->assertSoftDeleted('cobrancas', [
+            'id' => $cobranca->id,
+        ]);
+
+        $this->assertDatabaseHas('agent_action_audits', [
+            'user_id' => $user->id,
+            'action' => 'excluir_fatura',
+            'target_type' => 'fatura',
+            'target_id' => $fatura->id,
+            'target_label' => 'FAT-DEL-001',
+            'confirmation_strength' => 'strong',
+            'confirmation_phrase' => 'confirmo excluir a fatura FAT-DEL-001',
+            'confirmation_message' => 'confirmo excluir a fatura FAT-DEL-001',
+            'confirmation_source' => 'chat_message',
+            'runtime_pending_action_id' => 'pending-del-fat-001',
+            'session_id' => 'sessao-del-fat-001',
         ]);
     }
 

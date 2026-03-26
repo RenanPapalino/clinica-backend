@@ -283,6 +283,30 @@ class LaravelInternalClient:
             body=payload,
         )
 
+    async def gerar_boleto(self, *, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._request(
+            path="/api/internal/agent/faturas/gerar-boleto",
+            method="POST",
+            user_id=user_id,
+            body=payload,
+        )
+
+    async def excluir_boleto(self, *, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._request(
+            path="/api/internal/agent/faturas/excluir-boleto",
+            method="POST",
+            user_id=user_id,
+            body=payload,
+        )
+
+    async def excluir_fatura(self, *, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._request(
+            path="/api/internal/agent/faturas/excluir",
+            method="POST",
+            user_id=user_id,
+            body=payload,
+        )
+
     async def emitir_nfse(self, *, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request(
             path="/api/internal/agent/nfse/emitir",

@@ -830,6 +830,113 @@ class ChatControllerTest extends TestCase
         });
     }
 
+    public function test_confirmacao_de_gerar_boleto_langchain_e_delegada_ao_runtime(): void
+    {
+        config([
+            'chatbot.runtime.driver' => 'langchain',
+            'chatbot.runtime.base_url' => 'https://langchain-runtime.test',
+            'chatbot.runtime.secret' => 'runtime-secret',
+        ]);
+
+        Sanctum::actingAs(User::factory()->create([
+            'ativo' => true,
+        ]));
+
+        Http::fake([
+            'https://langchain-runtime.test/chat/resume' => Http::response([
+                'success' => true,
+                'message' => 'Gerei o boleto da fatura FAT-202603-5937 com sucesso.',
+                'detalhes' => [
+                    'resumo' => ['criados' => 1, 'erros' => 0],
+                    'registros' => [
+                        [
+                            'fatura' => ['id' => 900, 'numero_fatura' => 'FAT-202603-5937'],
+                            'boleto' => ['titulo_id' => 700, 'nosso_numero' => 'LOCAL0000000700'],
+                        ],
+                    ],
+                    'erros_lista' => [],
+                ],
+            ], 200),
+        ]);
+
+        $this->postJson('/api/chat/confirmar', [
+            'acao' => 'gerar_boleto',
+            'dados' => [
+                [
+                    'fatura_id' => 900,
+                    'fatura_label' => 'FAT-202603-5937',
+                ],
+            ],
+            'metadata' => [
+                'fonte' => 'langchain-runtime',
+                'runtime_pending_action_id' => 'pending-bol-001',
+            ],
+        ])->assertOk()
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('detalhes.resumo.criados', 1);
+
+        Http::assertSent(function ($request) {
+            return $request->url() === 'https://langchain-runtime.test/chat/resume'
+                && $request->hasHeader('X-Agent-Secret', 'runtime-secret')
+                && $request['acao'] === 'gerar_boleto'
+                && $request['metadata']['runtime_pending_action_id'] === 'pending-bol-001';
+        });
+    }
+
+    public function test_confirmacao_de_excluir_fatura_langchain_e_delegada_ao_runtime(): void
+    {
+        config([
+            'chatbot.runtime.driver' => 'langchain',
+            'chatbot.runtime.base_url' => 'https://langchain-runtime.test',
+            'chatbot.runtime.secret' => 'runtime-secret',
+        ]);
+
+        Sanctum::actingAs(User::factory()->create([
+            'ativo' => true,
+        ]));
+
+        Http::fake([
+            'https://langchain-runtime.test/chat/resume' => Http::response([
+                'success' => true,
+                'message' => 'Exclui a fatura FAT-202603-5937 com sucesso.',
+                'detalhes' => [
+                    'resumo' => ['criados' => 1, 'erros' => 0],
+                    'registros' => [
+                        [
+                            'id' => 900,
+                            'numero_fatura' => 'FAT-202603-5937',
+                        ],
+                    ],
+                    'erros_lista' => [],
+                ],
+            ], 200),
+        ]);
+
+        $this->postJson('/api/chat/confirmar', [
+            'acao' => 'excluir_fatura',
+            'dados' => [
+                [
+                    'fatura_id' => 900,
+                    'fatura_label' => 'FAT-202603-5937',
+                ],
+            ],
+            'metadata' => [
+                'fonte' => 'langchain-runtime',
+                'runtime_pending_action_id' => 'pending-del-fat-001',
+                'runtime_confirmation_strength' => 'strong',
+            ],
+        ])->assertOk()
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('detalhes.registros.0.numero_fatura', 'FAT-202603-5937');
+
+        Http::assertSent(function ($request) {
+            return $request->url() === 'https://langchain-runtime.test/chat/resume'
+                && $request->hasHeader('X-Agent-Secret', 'runtime-secret')
+                && $request['acao'] === 'excluir_fatura'
+                && $request['metadata']['runtime_pending_action_id'] === 'pending-del-fat-001';
+        });
+    }
+
     public function test_confirmacao_langchain_com_pendencias_nao_retorna_erro_fatal(): void
     {
         config([

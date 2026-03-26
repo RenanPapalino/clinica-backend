@@ -156,6 +156,8 @@ class ChatRuntimeService:
                         metadata={
                             **dict(session_draft.metadata or {}),
                             "runtime_pending_action_id": session_draft.action_id,
+                            "runtime_confirmation_source": "chat_message",
+                            "runtime_confirmation_message": payload.mensagem or "",
                         },
                         decision="approve",
                         session_id=payload.session_id,
@@ -166,6 +168,13 @@ class ChatRuntimeService:
                     )
                 )
                 return self._chat_response_from_confirmation(confirmation)
+            strong_confirmation_reminder = self._build_strong_confirmation_reminder_response(
+                pending=session_draft,
+                message=payload.mensagem or "",
+                parsed_file=parsed_file,
+            )
+            if strong_confirmation_reminder is not None:
+                return strong_confirmation_reminder
             updated_pending_preview = await self._build_updated_pending_confirmation_preview(
                 pending=session_draft,
                 payload=payload,
@@ -228,6 +237,16 @@ class ChatRuntimeService:
             if cnpj_lookup_response is not None:
                 return cnpj_lookup_response
 
+            unsupported_action_response = self._build_unsupported_action_response(
+                message=payload.mensagem or "",
+                parsed_file=parsed_file,
+                session_draft=session_draft,
+            )
+            if unsupported_action_response is not None:
+                return unsupported_action_response
+
+            heuristic_action = self._detect_heuristic_operational_action(payload.mensagem or "")
+
             local_intent = self._classify_local_intent(
                 message=payload.mensagem or "",
                 has_pending=session_draft is not None,
@@ -262,6 +281,7 @@ class ChatRuntimeService:
             should_attempt_action = (
                 route.tipo_interacao == "acao_operacional"
                 or route.acao_sugerida != "nenhuma"
+                or heuristic_action is not None
                 or payload.arquivo is not None
                 or session_draft is not None
             )
@@ -438,6 +458,15 @@ class ChatRuntimeService:
                 )
                 if missing:
                     raise ValueError("Faltam campos obrigatorios: " + ", ".join(missing))
+
+                if self._is_destructive_action(action):
+                    normalized_record["runtime_audit"] = self._build_runtime_audit_payload(
+                        action=action,
+                        record=normalized_record,
+                        metadata=payload.metadata,
+                        session_id=payload.session_id,
+                        timestamp=payload.timestamp,
+                    )
 
                 result = await self._execute_confirmed_record(
                     action=action,
@@ -1147,6 +1176,75 @@ class ChatRuntimeService:
             dados_estruturados=None,
         )
 
+    def _build_unsupported_action_response(
+        self,
+        *,
+        message: str,
+        parsed_file: ParsedFile,
+        session_draft: Any | None,
+    ) -> ChatbotResponse | None:
+        return None
+
+    def _detect_heuristic_operational_action(self, message: str) -> str | None:
+        normalized = self._normalize_free_text(message)
+        if not normalized:
+            return None
+
+        has_invoice_reference = bool(
+            self._extract_invoice_number_from_text(message)
+            or self._extract_named_id(message, label="fatura")
+            or self._extract_named_id(message, label="id da fatura")
+        )
+        existing_fatura_signal = has_invoice_reference or any(
+            term in normalized
+            for term in [
+                "da fatura",
+                "dessa fatura",
+                "desta fatura",
+                "fatura numero",
+                "fatura número",
+                "fatura #",
+                "numero: fat",
+                "número: fat",
+            ]
+        )
+        delete_terms = ["excluir", "exclua", "apagar", "apague", "remover", "remova", "deletar", "delete"]
+        has_delete_intent = any(term in normalized for term in delete_terms)
+
+        if has_delete_intent and "boleto" in normalized:
+            return "excluir_boleto"
+
+        if has_delete_intent and "fatura" in normalized:
+            return "excluir_fatura"
+
+        if any(term in normalized for term in ["boleto", "linha digitavel", "linha digitável"]) and any(
+            term in normalized for term in ["gerar", "gere", "emitir", "emita", "criar", "crie"]
+        ):
+            if existing_fatura_signal:
+                return "gerar_boleto"
+
+        if any(term in normalized for term in ["nfse", "nfs-e"]) and any(
+            term in normalized for term in ["emitir", "emita", "gerar", "gere", "criar", "crie"]
+        ):
+            if existing_fatura_signal:
+                return "emitir_nfse"
+
+        if "vencimento" in normalized and any(
+            term in normalized for term in ["alterar", "altere", "mudar", "mude", "atualizar", "atualize", "prorrogar", "prorrogue", "renegociar", "renegocie"]
+        ):
+            if any(term in normalized for term in ["fatura", "titulo", "título", "boleto"]) or existing_fatura_signal:
+                return "renegociar_titulo"
+
+        if self._message_requests_client_creation(message):
+            return "criar_cliente"
+
+        if "fatura" in normalized and any(
+            term in normalized for term in ["fature", "faturar", "gerar", "gere", "criar", "crie", "emitir", "emita"]
+        ):
+            return "gerar_fatura"
+
+        return None
+
     def _extract_cnpj_lookup_candidate(self, message: str) -> str | None:
         normalized = self._normalize_free_text(message)
         if not normalized:
@@ -1561,6 +1659,12 @@ class ChatRuntimeService:
             return await self._normalize_baixa_despesa_record(record, user_id), self._missing_baixa_despesa_fields(record)
         if action == "renegociar_titulo":
             return await self._normalize_renegociacao_titulo_record(record, user_id), self._missing_renegociacao_titulo_fields(record)
+        if action == "gerar_boleto":
+            return await self._normalize_gerar_boleto_record(record, user_id), self._missing_gerar_boleto_fields(record)
+        if action == "excluir_boleto":
+            return await self._normalize_excluir_boleto_record(record, user_id), self._missing_excluir_boleto_fields(record)
+        if action == "excluir_fatura":
+            return await self._normalize_excluir_fatura_record(record, user_id), self._missing_excluir_fatura_fields(record)
         if action == "emitir_nfse":
             return await self._normalize_emitir_nfse_record(record, user_id), self._missing_emitir_nfse_fields(record)
         if action == "criar_conta_receber":
@@ -1619,8 +1723,18 @@ class ChatRuntimeService:
         }
         normalized = {
             "cnpj": self._clean_document(record.get("cnpj")),
-            "razao_social": self._upper(record.get("razao_social")),
-            "nome_fantasia": self._upper(record.get("nome_fantasia")),
+            "razao_social": self._upper(
+                record.get("razao_social")
+                or record.get("cliente")
+                or record.get("cliente_nome")
+                or record.get("empresa")
+            ),
+            "nome_fantasia": self._upper(
+                record.get("nome_fantasia")
+                or record.get("razao_social")
+                or record.get("cliente")
+                or record.get("cliente_nome")
+            ),
             "email": self._lower(record.get("email")),
             "telefone": self._as_string(record.get("telefone")),
             "celular": self._as_string(record.get("celular")),
@@ -1766,6 +1880,41 @@ class ChatRuntimeService:
 
         return {key: value for key, value in normalized.items() if value not in (None, "")}
 
+    async def _normalize_gerar_boleto_record(self, record: dict[str, Any], user_id: int) -> dict[str, Any]:
+        matched = await self._find_fatura_match(record, user_id)
+        fatura_id = self._to_int(record.get("fatura_id")) or self._to_int(matched.get("id") if matched else None)
+
+        normalized = {
+            "fatura_id": fatura_id,
+            "fatura_label": self._as_string(
+                record.get("fatura_label")
+                or record.get("numero_fatura")
+                or record.get("fatura")
+                or (matched.get("numero_fatura") if matched else None)
+            ),
+        }
+
+        return {key: value for key, value in normalized.items() if value not in (None, "")}
+
+    async def _normalize_excluir_boleto_record(self, record: dict[str, Any], user_id: int) -> dict[str, Any]:
+        return await self._normalize_gerar_boleto_record(record, user_id)
+
+    async def _normalize_excluir_fatura_record(self, record: dict[str, Any], user_id: int) -> dict[str, Any]:
+        matched = await self._find_fatura_match(record, user_id)
+        fatura_id = self._to_int(record.get("fatura_id")) or self._to_int(matched.get("id") if matched else None)
+
+        normalized = {
+            "fatura_id": fatura_id,
+            "fatura_label": self._as_string(
+                record.get("fatura_label")
+                or record.get("numero_fatura")
+                or record.get("fatura")
+                or (matched.get("numero_fatura") if matched else None)
+            ),
+        }
+
+        return {key: value for key, value in normalized.items() if value not in (None, "")}
+
     async def _normalize_emitir_nfse_record(self, record: dict[str, Any], user_id: int) -> dict[str, Any]:
         matched = await self._find_fatura_match(record, user_id)
         fatura_id = self._to_int(record.get("fatura_id")) or self._to_int(matched.get("id") if matched else None)
@@ -1780,7 +1929,8 @@ class ChatRuntimeService:
                 or (matched.get("observacoes") if matched else None)
             ),
             "fatura_label": self._as_string(
-                record.get("numero_fatura")
+                record.get("fatura_label")
+                or record.get("numero_fatura")
                 or record.get("fatura")
                 or (matched.get("numero_fatura") if matched else None)
             ),
@@ -2318,6 +2468,12 @@ class ChatRuntimeService:
             ]
             candidates = exact_by_value or candidates
 
+        if len(candidates) != 1:
+            fatura_match = await self._find_fatura_match(record, user_id)
+            titulo_from_fatura = self._extract_receber_titulo_from_fatura(fatura_match)
+            if titulo_from_fatura is not None:
+                return titulo_from_fatura
+
         return candidates[0] if len(candidates) == 1 else None
 
     async def _find_despesa_match(self, record: dict[str, Any], user_id: int) -> dict[str, Any] | None:
@@ -2390,7 +2546,7 @@ class ChatRuntimeService:
             user_id=user_id,
             query=query,
             cliente_id=cliente_id,
-            nfse_emitida=False,
+            nfse_emitida=None,
             limit=self.settings.max_result_rows,
         )
 
@@ -2402,6 +2558,29 @@ class ChatRuntimeService:
             ] or candidates
 
         return candidates[0] if len(candidates) == 1 else None
+
+    def _extract_receber_titulo_from_fatura(self, fatura_match: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(fatura_match, dict):
+            return None
+
+        titulos = fatura_match.get("titulos")
+        if not isinstance(titulos, list):
+            return None
+
+        for titulo in titulos:
+            if not isinstance(titulo, dict):
+                continue
+
+            if self._as_string(titulo.get("tipo")) != "receber":
+                continue
+
+            titulo_id = self._to_int(titulo.get("id"))
+            if titulo_id is None:
+                continue
+
+            return titulo
+
+        return None
 
     async def _execute_confirmed_record(
         self,
@@ -2425,6 +2604,12 @@ class ChatRuntimeService:
             return await self.laravel_client.baixar_despesa(user_id=user_id, payload=public_record)
         if action == "renegociar_titulo":
             return await self.laravel_client.renegociar_titulo(user_id=user_id, payload=public_record)
+        if action == "gerar_boleto":
+            return await self.laravel_client.gerar_boleto(user_id=user_id, payload=public_record)
+        if action == "excluir_boleto":
+            return await self.laravel_client.excluir_boleto(user_id=user_id, payload=public_record)
+        if action == "excluir_fatura":
+            return await self.laravel_client.excluir_fatura(user_id=user_id, payload=public_record)
         if action == "emitir_nfse":
             return await self.laravel_client.emitir_nfse(user_id=user_id, payload=public_record)
         if action == "criar_conta_receber":
@@ -2524,6 +2709,33 @@ class ChatRuntimeService:
 
         return public_record
 
+    def _build_runtime_audit_payload(
+        self,
+        *,
+        action: str,
+        record: dict[str, Any],
+        metadata: dict[str, Any],
+        session_id: str | None,
+        timestamp: str | None,
+    ) -> dict[str, Any]:
+        confirmation_phrase = self._as_string(metadata.get("runtime_confirmation_phrase")) or self._strong_confirmation_phrase(action, [record])
+        confirmation_message = self._as_string(metadata.get("runtime_confirmation_message"))
+        confirmation_source = self._as_string(metadata.get("runtime_confirmation_source")) or (
+            "chat_message" if confirmation_message else "resume_payload"
+        )
+
+        return {
+            "confirmation_strength": self._as_string(metadata.get("runtime_confirmation_strength")) or (
+                "strong" if self._is_destructive_action(action) else "standard"
+            ),
+            "confirmation_phrase": confirmation_phrase,
+            "confirmation_message": confirmation_message,
+            "confirmation_source": confirmation_source,
+            "runtime_pending_action_id": self._as_string(metadata.get("runtime_pending_action_id")),
+            "session_id": self._as_string(session_id),
+            "approved_at": self._as_string(timestamp) or datetime.now(timezone.utc).isoformat(),
+        }
+
     def _missing_cliente_fields(self, record: dict[str, Any]) -> list[str]:
         missing: list[str] = []
         if not self._clean_document(record.get("cnpj")):
@@ -2594,6 +2806,9 @@ class ChatRuntimeService:
             or self._as_string(record.get("numero_titulo"))
             or self._as_string(record.get("titulo"))
             or self._as_string(record.get("descricao"))
+            or self._to_int(record.get("fatura_id"))
+            or self._as_string(record.get("numero_fatura"))
+            or self._as_string(record.get("fatura"))
             or self._upper(record.get("cliente") or record.get("cliente_nome"))
             or self._clean_document(record.get("cliente_cnpj") or record.get("cnpj_cliente"))
         ):
@@ -2608,6 +2823,24 @@ class ChatRuntimeService:
             missing.append("nova_data_vencimento")
 
         return missing
+
+    def _missing_gerar_boleto_fields(self, record: dict[str, Any]) -> list[str]:
+        if (
+            self._to_int(record.get("fatura_id"))
+            or self._as_string(record.get("numero_fatura"))
+            or self._as_string(record.get("fatura"))
+            or self._upper(record.get("cliente") or record.get("cliente_nome"))
+            or self._clean_document(record.get("cliente_cnpj") or record.get("cnpj_cliente"))
+        ):
+            return []
+
+        return ["fatura"]
+
+    def _missing_excluir_boleto_fields(self, record: dict[str, Any]) -> list[str]:
+        return self._missing_gerar_boleto_fields(record)
+
+    def _missing_excluir_fatura_fields(self, record: dict[str, Any]) -> list[str]:
+        return self._missing_gerar_boleto_fields(record)
 
     def _missing_emitir_nfse_fields(self, record: dict[str, Any]) -> list[str]:
         if (
@@ -2723,6 +2956,13 @@ class ChatRuntimeService:
         return columns
 
     def _preview_metadata_for_action(self, action: str, records: list[dict[str, Any]]) -> dict[str, Any]:
+        if action in {"excluir_boleto", "excluir_fatura"}:
+            return {
+                "runtime_confirmation_strength": "strong",
+                "runtime_confirmation_phrase": self._strong_confirmation_phrase(action, records),
+                "preview_tone": "danger",
+            }
+
         if action != "gerar_fatura" or not records:
             return {}
 
@@ -2756,6 +2996,19 @@ class ChatRuntimeService:
             },
         }
 
+    def _is_destructive_action(self, action: str | None) -> bool:
+        return action in {"excluir_boleto", "excluir_fatura"}
+
+    def _strong_confirmation_phrase(self, action: str, records: list[dict[str, Any]] | None = None) -> str:
+        label = None
+        if records and len(records) == 1:
+            label = self._as_string(records[0].get("fatura_label") or records[0].get("numero_fatura"))
+        if action == "excluir_boleto":
+            return f"confirmo excluir o boleto da fatura {label}" if label else "confirmo excluir o boleto"
+        if action == "excluir_fatura":
+            return f"confirmo excluir a fatura {label}" if label else "confirmo excluir a fatura"
+        return ""
+
     def _canonical_action(self, action: str | None) -> str | None:
         if not action:
             return None
@@ -2770,6 +3023,16 @@ class ChatRuntimeService:
             "baixar_titulo": "baixar_titulo",
             "baixar_despesa": "baixar_despesa",
             "renegociar_titulo": "renegociar_titulo",
+            "gerar_boleto": "gerar_boleto",
+            "excluir_boleto": "excluir_boleto",
+            "remover_boleto": "excluir_boleto",
+            "apagar_boleto": "excluir_boleto",
+            "deletar_boleto": "excluir_boleto",
+            "excluir_fatura": "excluir_fatura",
+            "remover_fatura": "excluir_fatura",
+            "apagar_fatura": "excluir_fatura",
+            "deletar_fatura": "excluir_fatura",
+            "boleto": "gerar_boleto",
             "emitir_nfse": "emitir_nfse",
             "nfse": "emitir_nfse",
             "criar_despesa": "criar_conta_pagar",
@@ -2795,6 +3058,9 @@ class ChatRuntimeService:
             "baixar_titulo": "baixa_titulo",
             "baixar_despesa": "baixa_despesa",
             "renegociar_titulo": "renegociacao_titulo",
+            "gerar_boleto": "boleto",
+            "excluir_boleto": "boleto_exclusao",
+            "excluir_fatura": "fatura_exclusao",
             "emitir_nfse": "nfse",
             "criar_conta_pagar": "despesa",
             "criar_conta_receber": "titulo_receber",
@@ -2810,6 +3076,9 @@ class ChatRuntimeService:
             "baixar_titulo": "baixa(s) de titulo",
             "baixar_despesa": "baixa(s) de despesa",
             "renegociar_titulo": "renegociacao(oes) de titulo",
+            "gerar_boleto": "geracao(oes) de boleto",
+            "excluir_boleto": "exclusao(oes) de boleto",
+            "excluir_fatura": "exclusao(oes) de fatura",
             "emitir_nfse": "emissao(oes) de NFS-e",
             "criar_conta_pagar": "conta(s) a pagar",
             "criar_conta_receber": "conta(s) a receber",
@@ -2856,6 +3125,9 @@ class ChatRuntimeService:
             "criar_conta_pagar": "Consigo preparar a conta a pagar, mas ainda preciso de alguns dados.",
             "criar_conta_receber": "Consigo preparar a conta a receber, mas ainda preciso de alguns dados.",
             "gerar_fatura": "Consigo preparar a fatura, mas ainda preciso confirmar alguns dados.",
+            "gerar_boleto": "Consigo preparar a geracao do boleto, mas ainda preciso confirmar alguns dados.",
+            "excluir_boleto": "Consigo preparar a exclusao do boleto, mas ainda preciso confirmar alguns dados.",
+            "excluir_fatura": "Consigo preparar a exclusao da fatura, mas ainda preciso confirmar alguns dados.",
             "emitir_nfse": "Consigo preparar a emissao da NFS-e, mas ainda preciso confirmar alguns dados.",
         }.get(action, "Consigo continuar, mas ainda preciso de alguns dados.")
 
@@ -2899,6 +3171,9 @@ class ChatRuntimeService:
         intro = {
             "gerar_fatura": "Suspendi este rascunho de fatura",
             "criar_cliente": "Suspendi este rascunho de cadastro",
+            "gerar_boleto": "Suspendi este rascunho de geracao de boleto",
+            "excluir_boleto": "Suspendi este rascunho de exclusao de boleto",
+            "excluir_fatura": "Suspendi este rascunho de exclusao de fatura",
             "emitir_nfse": "Suspendi este rascunho de emissao da NFS-e",
         }.get(action, "Suspendi este rascunho")
 
@@ -3030,6 +3305,34 @@ class ChatRuntimeService:
             if vencimentos:
                 message += f" Novos vencimentos: {self._join_human_values(vencimentos[:3])}."
             message += " Posso confirmar?"
+            return message
+
+        if action == "gerar_boleto":
+            labels = [
+                record.get("fatura_label") or record.get("fatura_id")
+                for record in records
+                if record.get("fatura_label") or record.get("fatura_id")
+            ]
+            message = f"Preparei {len(records)} geracao(oes) de boleto."
+            if labels:
+                message += f" Faturas: {self._join_human_values([str(label) for label in labels[:3]])}."
+            message += " Posso confirmar?"
+            return message
+
+        if action in {"excluir_boleto", "excluir_fatura"}:
+            labels = [
+                record.get("fatura_label") or record.get("fatura_id")
+                for record in records
+                if record.get("fatura_label") or record.get("fatura_id")
+            ]
+            target = "boleto" if action == "excluir_boleto" else "fatura"
+            message = f"Preparei {len(records)} exclusao(oes) de {target}."
+            if labels:
+                message += f" Referencias: {self._join_human_values([str(label) for label in labels[:3]])}."
+            message += " Esta acao e destrutiva e exige confirmacao forte."
+            phrase = self._strong_confirmation_phrase(action, records)
+            if phrase:
+                message += f' Para confirmar por texto, responda exatamente ou de forma equivalente a: "{phrase}".'
             return message
 
         if action == "emitir_nfse":
@@ -3224,6 +3527,55 @@ class ChatRuntimeService:
 
         if action == "gerar_fatura":
             return self._summarize_completed_faturas(records, chained=chained)
+
+        if action == "gerar_boleto":
+            prefix = "Tambem gerei" if chained else "Gerei"
+            labels = [
+                record.get("numero_fatura")
+                or (record.get("fatura") or {}).get("numero_fatura")
+                or record.get("fatura_label")
+                for record in records
+            ]
+            labels = [str(label) for label in labels if label]
+
+            if len(records) == 1 and labels:
+                return f"{prefix} o boleto da fatura {labels[0]} com sucesso."
+
+            message = f"{prefix} {len(records)} boleto(s) com sucesso."
+            if labels:
+                message += f" Faturas: {self._join_human_values(labels[:3])}."
+            return message
+
+        if action == "excluir_boleto":
+            prefix = "Tambem exclui" if chained else "Exclui"
+            labels = [
+                (record.get("fatura") or {}).get("numero_fatura")
+                or record.get("fatura_label")
+                or record.get("numero_fatura")
+                for record in records
+            ]
+            labels = [str(label) for label in labels if label]
+            if len(records) == 1 and labels:
+                return f"{prefix} o boleto da fatura {labels[0]} com sucesso."
+            message = f"{prefix} {len(records)} boleto(s) com sucesso."
+            if labels:
+                message += f" Faturas: {self._join_human_values(labels[:3])}."
+            return message
+
+        if action == "excluir_fatura":
+            prefix = "Tambem exclui" if chained else "Exclui"
+            labels = [
+                record.get("numero_fatura")
+                or record.get("fatura_label")
+                for record in records
+            ]
+            labels = [str(label) for label in labels if label]
+            if len(records) == 1 and labels:
+                return f"{prefix} a fatura {labels[0]} com sucesso."
+            message = f"{prefix} {len(records)} fatura(s) com sucesso."
+            if labels:
+                message += f" Referencias: {self._join_human_values(labels[:3])}."
+            return message
 
         if action == "criar_conta_receber":
             return self._summarize_completed_titulos(
@@ -3500,6 +3852,7 @@ class ChatRuntimeService:
             "periodo_referencia": "o periodo de referencia",
             "itens": "os itens da fatura",
             "itens_missing": "os itens da fatura",
+            "fatura": "a fatura",
             "codigo_servico": "o codigo do servico",
         }
 
@@ -3687,6 +4040,13 @@ class ChatRuntimeService:
         if action is None:
             return False
 
+        if self._is_destructive_action(action) and self._message_approves_pending_action(
+            message,
+            action=action,
+            records=list(pending.records or []),
+        ):
+            return True
+
         editable_fields = self._editable_fields_for_pending_confirmation(
             action=action,
             records=list(pending.records or []),
@@ -3699,7 +4059,11 @@ class ChatRuntimeService:
         ):
             return False
 
-        return self._message_approves_pending_action(message)
+        return self._message_approves_pending_action(
+            message,
+            action=action,
+            records=list(pending.records or []),
+        )
 
     def _should_reject_pending_action(
         self,
@@ -3723,10 +4087,23 @@ class ChatRuntimeService:
 
         return self._message_rejects_pending_action(message)
 
-    def _message_approves_pending_action(self, message: str) -> bool:
+    def _message_approves_pending_action(
+        self,
+        message: str,
+        *,
+        action: str | None = None,
+        records: list[dict[str, Any]] | None = None,
+    ) -> bool:
         normalized = self._normalize_free_text(message)
         if not normalized:
             return False
+
+        if self._is_destructive_action(action):
+            return self._message_strongly_approves_destructive_action(
+                message=message,
+                action=action,
+                records=records or [],
+            )
 
         direct_approvals = {
             "sim",
@@ -3770,6 +4147,128 @@ class ChatRuntimeService:
         ]
 
         return any(term in normalized for term in approval_terms)
+
+    def _message_has_simple_approval_signal(self, message: str) -> bool:
+        return self._message_approves_pending_action(message)
+
+    def _message_strongly_approves_destructive_action(
+        self,
+        *,
+        message: str,
+        action: str | None,
+        records: list[dict[str, Any]],
+    ) -> bool:
+        normalized = self._normalize_free_text(message)
+        if not normalized or not self._is_destructive_action(action):
+            return False
+
+        strong_phrase = self._normalize_free_text(self._strong_confirmation_phrase(action, records))
+        if strong_phrase and strong_phrase in normalized:
+            return True
+
+        confirmation_terms = [
+            "confirmo",
+            "confirmar",
+            "confirmado",
+            "autorizo",
+            "autorizar",
+            "pode excluir",
+            "pode apagar",
+            "pode remover",
+            "pode deletar",
+            "pode prosseguir com a exclusao",
+            "pode prosseguir com a exclusão",
+            "prosseguir com a exclusao",
+            "prosseguir com a exclusão",
+        ]
+        if not any(term in normalized for term in confirmation_terms):
+            return False
+
+        destructive_terms = {"excluir", "apagar", "remover", "deletar", "exclusao", "exclusão"}
+        target_term = "boleto" if action == "excluir_boleto" else "fatura"
+        if target_term not in normalized or not any(term in normalized for term in destructive_terms):
+            return False
+
+        expected_number = None
+        if records and len(records) == 1:
+            expected_number = self._as_string(records[0].get("numero_fatura") or records[0].get("fatura_label"))
+        if expected_number:
+            expected_normalized = self._normalize_free_text(expected_number)
+            invoice_number = self._extract_invoice_number_from_text(message)
+            if expected_normalized and expected_normalized in normalized:
+                return True
+            if invoice_number and expected_normalized and self._normalize_free_text(invoice_number) == expected_normalized:
+                return True
+            return False
+
+        return True
+
+    def _build_strong_confirmation_reminder_response(
+        self,
+        *,
+        pending: Any | None,
+        message: str,
+        parsed_file: ParsedFile,
+    ) -> ChatbotResponse | None:
+        if pending is None:
+            return None
+
+        if parsed_file.text:
+            return None
+
+        if parsed_file.mode is not None and parsed_file.mode != "text":
+            return None
+
+        metadata = dict(pending.metadata or {})
+        if str(metadata.get("state") or "").strip() != "pending_confirmation":
+            return None
+
+        action = self._canonical_action(pending.action)
+        if not self._is_destructive_action(action):
+            return None
+
+        editable_fields = self._editable_fields_for_pending_confirmation(
+            action=action,
+            records=list(pending.records or []),
+        )
+        if self._extract_pending_updates_from_message(
+            action=action,
+            message=message,
+            pending_fields=editable_fields,
+            draft_records=list(pending.records or []),
+        ):
+            return None
+
+        if self._message_rejects_pending_action(message):
+            return None
+
+        if not self._message_has_simple_approval_signal(message):
+            return None
+
+        phrase = self._strong_confirmation_phrase(action, list(pending.records or []))
+        reminder = (
+            "Essa acao e destrutiva e nao sera executada com uma confirmacao simples. "
+            f'Responda com "{phrase}" para concluir a exclusao.'
+        )
+        summary = self._summarize_action_records(action, list(pending.records or []))
+        message_text = f"{summary} {reminder}" if summary else reminder
+
+        return ChatbotResponse(
+            mensagem=message_text,
+            acao_sugerida=action,
+            dados_estruturados=StructuredData(
+                tipo=self._action_type(action),
+                acao_sugerida=action,
+                colunas=self._build_columns(list(pending.records or [])),
+                dados_mapeados=[self._strip_internal_fields(record) for record in list(pending.records or [])],
+                metadata={
+                    "fonte": "langchain-runtime",
+                    "runtime_requires_confirmation": True,
+                    "runtime_pending_action_id": pending.action_id,
+                    **self._preview_metadata_for_action(action, list(pending.records or [])),
+                },
+            ),
+        )
 
     def _message_rejects_pending_action(self, message: str) -> bool:
         normalized = self._normalize_free_text(message)
@@ -3978,6 +4477,15 @@ class ChatRuntimeService:
         if action == "criar_cliente":
             return ["cnpj", "razao_social"]
 
+        if action == "gerar_boleto":
+            return ["fatura"]
+
+        if action in {"excluir_boleto", "excluir_fatura"}:
+            return ["fatura"]
+
+        if action == "renegociar_titulo":
+            return ["titulo", "nova_data_vencimento"]
+
         return fields
 
     def _chat_response_from_confirmation(self, confirmation: dict[str, Any]) -> ChatbotResponse:
@@ -4104,18 +4612,43 @@ class ChatRuntimeService:
         route: RouteDecision,
         plan: ActionPlan,
     ) -> ActionPlan:
-        canonical_action = self._canonical_action(plan.acao_sugerida or route.acao_sugerida)
-        if canonical_action not in {"gerar_fatura"}:
+        detected_action = self._detect_heuristic_operational_action(payload.mensagem or "")
+        canonical_action = self._canonical_action(plan.acao_sugerida or route.acao_sugerida) or detected_action
+        if canonical_action is None:
             return plan
 
-        if list(plan.dados_mapeados or []):
+        should_override = not list(plan.dados_mapeados or [])
+        if detected_action and detected_action != self._canonical_action(plan.acao_sugerida):
+            should_override = should_override or self._canonical_action(plan.acao_sugerida) in {None, "gerar_fatura"}
+
+        if not should_override:
             return plan
 
-        heuristic = self._build_heuristic_fatura_plan(payload.mensagem or "")
+        heuristic = self._build_heuristic_action_plan(
+            action=detected_action or canonical_action,
+            message=payload.mensagem or "",
+        )
         if heuristic is None:
             return plan
 
         return heuristic
+
+    def _build_heuristic_action_plan(self, *, action: str, message: str) -> ActionPlan | None:
+        if action == "gerar_fatura":
+            return self._build_heuristic_fatura_plan(message)
+        if action == "gerar_boleto":
+            return self._build_heuristic_gerar_boleto_plan(message)
+        if action == "excluir_boleto":
+            return self._build_heuristic_excluir_boleto_plan(message)
+        if action == "excluir_fatura":
+            return self._build_heuristic_excluir_fatura_plan(message)
+        if action == "renegociar_titulo":
+            return self._build_heuristic_renegociar_titulo_plan(message)
+        if action == "criar_cliente":
+            return self._build_heuristic_criar_cliente_plan(message)
+        if action == "emitir_nfse":
+            return self._build_heuristic_emitir_nfse_plan(message)
+        return None
 
     def _build_heuristic_fatura_plan(self, message: str) -> ActionPlan | None:
         normalized = self._normalize_free_text(message)
@@ -4171,6 +4704,133 @@ class ChatRuntimeService:
             pendencias=[],
         )
 
+    def _build_heuristic_gerar_boleto_plan(self, message: str) -> ActionPlan | None:
+        normalized = self._normalize_free_text(message)
+        if "boleto" not in normalized:
+            return None
+
+        record = self._build_existing_fatura_reference_record(message)
+
+        return ActionPlan(
+            mensagem="Identifiquei um pedido de geração de boleto para uma fatura existente.",
+            acao_sugerida="gerar_boleto",
+            confianca=0.92,
+            dados_mapeados=[record or {}],
+            pendencias=[],
+        )
+
+    def _build_heuristic_excluir_boleto_plan(self, message: str) -> ActionPlan | None:
+        normalized = self._normalize_free_text(message)
+        if "boleto" not in normalized or not any(
+            term in normalized for term in ["excluir", "exclua", "apagar", "apague", "remover", "remova", "deletar", "delete"]
+        ):
+            return None
+
+        record = self._build_existing_fatura_reference_record(message)
+
+        return ActionPlan(
+            mensagem="Identifiquei um pedido de exclusao de boleto para uma fatura existente.",
+            acao_sugerida="excluir_boleto",
+            confianca=0.95,
+            dados_mapeados=[record or {}],
+            pendencias=[],
+        )
+
+    def _build_heuristic_excluir_fatura_plan(self, message: str) -> ActionPlan | None:
+        normalized = self._normalize_free_text(message)
+        if "fatura" not in normalized or not any(
+            term in normalized for term in ["excluir", "exclua", "apagar", "apague", "remover", "remova", "deletar", "delete"]
+        ):
+            return None
+
+        record = self._build_existing_fatura_reference_record(message)
+
+        return ActionPlan(
+            mensagem="Identifiquei um pedido de exclusao de fatura existente.",
+            acao_sugerida="excluir_fatura",
+            confianca=0.95,
+            dados_mapeados=[record or {}],
+            pendencias=[],
+        )
+
+    def _build_heuristic_renegociar_titulo_plan(self, message: str) -> ActionPlan | None:
+        normalized = self._normalize_free_text(message)
+        if "vencimento" not in normalized:
+            return None
+
+        nova_data_vencimento = self._extract_date_from_text(message)
+        record = self._build_existing_fatura_reference_record(message)
+        if not nova_data_vencimento:
+            return None
+
+        return ActionPlan(
+            mensagem="Identifiquei um pedido de alteração de vencimento para uma fatura existente.",
+            acao_sugerida="renegociar_titulo",
+            confianca=0.92,
+            dados_mapeados=[{**record, "nova_data_vencimento": nova_data_vencimento}],
+            pendencias=[],
+        )
+
+    def _build_heuristic_emitir_nfse_plan(self, message: str) -> ActionPlan | None:
+        normalized = self._normalize_free_text(message)
+        if "nfse" not in normalized and "nfs-e" not in normalized:
+            return None
+
+        record = self._build_existing_fatura_reference_record(message)
+        codigo_servico = self._extract_service_code_from_message(message)
+        if codigo_servico:
+            record["codigo_servico"] = codigo_servico
+
+        return ActionPlan(
+            mensagem="Identifiquei um pedido de emissao de NFS-e para uma fatura existente.",
+            acao_sugerida="emitir_nfse",
+            confianca=0.92,
+            dados_mapeados=[record or {}],
+            pendencias=[],
+        )
+
+    def _build_heuristic_criar_cliente_plan(self, message: str) -> ActionPlan | None:
+        cnpj = self._extract_document_from_text(message, required_length=14)
+        razao_social = self._extract_razao_social_from_message(message)
+        if not cnpj and not razao_social and not self._message_requests_client_creation(message):
+            return None
+
+        record: dict[str, Any] = {}
+        if cnpj:
+            record["cnpj"] = cnpj
+        if razao_social:
+            record["razao_social"] = razao_social
+            record["nome_fantasia"] = razao_social
+
+        return ActionPlan(
+            mensagem="Identifiquei um pedido de cadastro de cliente.",
+            acao_sugerida="criar_cliente",
+            confianca=0.9,
+            dados_mapeados=[record],
+            pendencias=[],
+        )
+
+    def _build_existing_fatura_reference_record(self, message: str) -> dict[str, Any]:
+        record: dict[str, Any] = {}
+
+        if fatura_id := (
+            self._extract_named_id(message, label="id da fatura")
+            or self._extract_named_id(message, label="fatura id")
+            or self._extract_named_id(message, label="fatura")
+        ):
+            record["fatura_id"] = fatura_id
+
+        if numero_fatura := self._extract_invoice_number_from_text(message):
+            record["numero_fatura"] = numero_fatura
+
+        if cliente := self._extract_cliente_reference_from_action_message(message):
+            record["cliente"] = cliente
+
+        if cliente_cnpj := self._extract_document_from_text(message, required_length=14):
+            record["cliente_cnpj"] = cliente_cnpj
+
+        return {key: value for key, value in record.items() if value not in (None, "")}
+
     def _redirect_fatura_draft_to_cliente_creation(
         self,
         *,
@@ -4215,7 +4875,10 @@ class ChatRuntimeService:
         if not normalized:
             return False
 
-        has_create_verb = any(token in normalized for token in ["cadastre", "cadastrar", "crie", "criar"])
+        has_create_verb = any(
+            token in normalized
+            for token in ["cadastre", "cadastrar", "crie", "criar", "gere", "gerar"]
+        )
         mentions_client = "cliente" in normalized
         return has_create_verb and mentions_client
 
@@ -4276,9 +4939,40 @@ class ChatRuntimeService:
                 updates["cliente_id"] = cliente_id
             if cliente_cnpj := self._extract_document_from_text(text, required_length=14):
                 updates["cliente_cnpj"] = cliente_cnpj
-            cliente_nome = self._extract_cliente_name_from_text(text)
+            cliente_nome = self._extract_cliente_reference_from_action_message(text)
             if cliente_nome and "cliente_id" not in updates and "cliente_cnpj" not in updates:
                 updates["cliente"] = cliente_nome
+
+        if "fatura" in pending_fields:
+            if fatura_id := (
+                self._extract_named_id(text, label="id da fatura")
+                or self._extract_named_id(text, label="fatura id")
+                or self._extract_named_id(text, label="fatura")
+            ):
+                updates["fatura_id"] = fatura_id
+            if numero_fatura := self._extract_invoice_number_from_text(text):
+                updates["numero_fatura"] = numero_fatura
+            if cliente_nome := self._extract_cliente_reference_from_action_message(text):
+                updates.setdefault("cliente", cliente_nome)
+            if cliente_cnpj := self._extract_document_from_text(text, required_length=14):
+                updates.setdefault("cliente_cnpj", cliente_cnpj)
+
+        if "titulo" in pending_fields:
+            if titulo_id := (
+                self._extract_named_id(text, label="id do titulo")
+                or self._extract_named_id(text, label="id do título")
+                or self._extract_named_id(text, label="titulo id")
+                or self._extract_named_id(text, label="título id")
+                or self._extract_named_id(text, label="titulo")
+                or self._extract_named_id(text, label="título")
+            ):
+                updates["titulo_id"] = titulo_id
+            if numero_fatura := self._extract_invoice_number_from_text(text):
+                updates["numero_fatura"] = numero_fatura
+            if cliente_nome := self._extract_cliente_reference_from_action_message(text):
+                updates.setdefault("cliente", cliente_nome)
+            if cliente_cnpj := self._extract_document_from_text(text, required_length=14):
+                updates.setdefault("cliente_cnpj", cliente_cnpj)
 
         if any(field in pending_fields for field in ["itens", "itens_missing"]):
             item_descricao = self._extract_fatura_item_description_from_message(text)
@@ -4300,8 +4994,9 @@ class ChatRuntimeService:
                 updates["cnpj"] = cnpj
 
         if "razao_social" in pending_fields:
-            if razao_social := self._extract_named_value(text, labels=["razao social", "cliente", "empresa"]):
-                updates["razao_social"] = self._upper(razao_social)
+            if razao_social := self._extract_razao_social_from_message(text):
+                updates["razao_social"] = razao_social
+                updates.setdefault("nome_fantasia", razao_social)
 
         if "valor_original" in pending_fields:
             if valor := self._extract_currency_from_text(text):
@@ -4515,7 +5210,7 @@ class ChatRuntimeService:
             elif field in {"cliente", "cliente_missing", "cliente_ambiguous"}:
                 if self._extract_document_from_text(normalized_message, required_length=14):
                     return True
-                if self._extract_cliente_name_from_text(normalized_message):
+                if self._extract_cliente_reference_from_action_message(normalized_message):
                     return True
                 terms.update({"cnpj", "id", "cadastre"})
             elif field == "cnpj":
@@ -4523,7 +5218,23 @@ class ChatRuntimeService:
                     return True
                 terms.update({"cnpj", "empresa"})
             elif field == "razao_social":
+                if self._extract_razao_social_from_message(normalized_message):
+                    return True
                 terms.update({"razao", "razão", "social", "empresa", "cliente"})
+            elif field == "fatura":
+                if self._extract_invoice_number_from_text(normalized_message):
+                    return True
+                if self._extract_named_id(normalized_message, label="fatura"):
+                    return True
+                terms.update({"fatura", "fat", "numero", "número"})
+            elif field == "titulo":
+                if self._extract_invoice_number_from_text(normalized_message):
+                    return True
+                if self._extract_named_id(normalized_message, label="titulo"):
+                    return True
+                if self._extract_named_id(normalized_message, label="título"):
+                    return True
+                terms.update({"titulo", "título", "renegociar", "vencimento", "fat"})
             elif field == "valor_original":
                 if self._extract_currency_values_from_text(normalized_message):
                     return True
@@ -4580,9 +5291,23 @@ class ChatRuntimeService:
         if action == "gerar_fatura" and any(
             term in normalized_message
             for term in [
+                "gere o boleto",
+                "gerar boleto",
+                "excluir o boleto",
+                "excluir boleto",
+                "apagar o boleto",
+                "remover o boleto",
+                "emitir boleto",
+                "alterar o vencimento",
+                "mudar o vencimento",
+                "atualizar o vencimento",
                 "gere a nfse",
                 "gerar nfse",
                 "emitir nfse",
+                "excluir a fatura",
+                "excluir fatura",
+                "apagar a fatura",
+                "remover a fatura",
                 "nfs-e do cliente",
                 "nfse do cliente",
                 "quantos clientes",
@@ -4907,6 +5632,9 @@ class ChatRuntimeService:
                 except ValueError:
                     continue
 
+        if not any(term in self._normalize_free_text(text) for term in ["r$", "valor", "reais", "real"]):
+            return None
+
         values = self._extract_currency_values_from_text(text)
         for value in values:
             if value >= 100:
@@ -4923,6 +5651,9 @@ class ChatRuntimeService:
         values: list[float] = []
 
         for raw in matches:
+            digits_only = raw.replace(".", "").replace(",", "")
+            if "," not in raw and "." not in raw and len(digits_only) >= 5:
+                continue
             normalized = raw.replace(".", "").replace(",", ".")
             try:
                 value = float(normalized)
@@ -4938,13 +5669,45 @@ class ChatRuntimeService:
         if not normalized:
             return None
 
-        for label in labels:
-            pattern = rf"{re.escape(label)}\s*[:\-]?\s*(.+)$"
-            match = re.search(pattern, normalized, re.IGNORECASE)
-            if match:
-                value = self._as_string(match.group(1))
-                if value:
-                    return value
+        lines = [line.strip() for line in re.split(r"[\r\n]+", normalized) if line.strip()]
+
+        for current in lines or [normalized]:
+            for label in labels:
+                pattern = rf"^\s*{re.escape(label)}\s*[:\-]?\s*(.+?)\s*$"
+                match = re.search(pattern, current, re.IGNORECASE)
+                if match:
+                    value = self._as_string(match.group(1))
+                    if value:
+                        return value
+
+        return None
+
+    def _extract_invoice_number_from_text(self, message: str) -> str | None:
+        match = re.search(r"\bFAT(?:-[A-Z0-9]+)+\b", self._as_string(message) or "", re.IGNORECASE)
+        if not match:
+            return None
+
+        return self._upper(match.group(0))
+
+    def _extract_razao_social_from_message(self, message: str) -> str | None:
+        candidate = self._extract_named_value(
+            message,
+            labels=["razao social", "razão social", "empresa", "cliente"],
+        )
+        if candidate and not self._extract_document_from_text(candidate):
+            cleaned = self._clean_entity_name_candidate(candidate)
+            if cleaned:
+                return self._upper(cleaned)
+
+        direct_match = re.search(
+            r"(?:gere|gerar|crie|criar|cadastre|cadastrar)\s+(?:o\s+)?cliente\s+(.+?)(?:\s+cnpj\b|$)",
+            self._as_string(message) or "",
+            re.IGNORECASE,
+        )
+        if direct_match:
+            cleaned = self._clean_entity_name_candidate(direct_match.group(1))
+            if cleaned:
+                return self._upper(cleaned)
 
         return None
 
@@ -4980,6 +5743,68 @@ class ChatRuntimeService:
                 "nfs-e",
             ]
         ):
+            return None
+
+        return candidate
+
+    def _extract_cliente_reference_from_action_message(self, message: str) -> str | None:
+        candidate = self._extract_cliente_name_from_text(message)
+        if candidate:
+            cleaned = self._clean_entity_name_candidate(candidate)
+            if cleaned:
+                return self._upper(cleaned)
+
+        raw = self._as_string(message)
+        if not raw:
+            return None
+
+        patterns = [
+            r"(?:fatura\s+d[ao]\s+|boleto\s+d[ao]\s+|cliente\s+)(.+?)(?:\s+para\b|\s+com\b|\s+numero\b|\s+n[úu]mero\b|\s+id\b|$)",
+            r"(?:do\s+cliente|da\s+empresa)\s+(.+?)(?:\s+para\b|\s+com\b|\s+numero\b|\s+n[úu]mero\b|\s+id\b|$)",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, raw, re.IGNORECASE)
+            if not match:
+                continue
+
+            cleaned = self._clean_entity_name_candidate(match.group(1))
+            if cleaned:
+                return self._upper(cleaned)
+
+        return None
+
+    def _clean_entity_name_candidate(self, value: Any) -> str | None:
+        candidate = self._as_string(value)
+        if not candidate:
+            return None
+
+        candidate = re.sub(r"^\s*(?:numero|n[úu]mero|cliente|empresa|fatura)\s*[:\-]\s*", "", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\b(?:com\s+vencimento|vencimento|periodo|período|referente|codigo\s+de\s+servico|c[oó]digo\s+de\s+servi[cç]o)\b.*$", "", candidate, flags=re.IGNORECASE)
+        candidate = candidate.strip(" :-#\n\t")
+
+        if not candidate:
+            return None
+
+        lowered = self._normalize_free_text(candidate)
+        if any(
+            term in lowered
+            for term in [
+                "quantos",
+                "quais",
+                "qual",
+                "quero saber",
+                "nao sao",
+                "não são",
+                "cidade de",
+                "gere a nfse",
+                "emitir nfse",
+                "nfs-e",
+            ]
+        ):
+            return None
+
+        if self._extract_date_from_text(candidate) or self._extract_document_from_text(candidate):
             return None
 
         return candidate

@@ -37,6 +37,34 @@ class ChatRuntimeServiceTest(unittest.IsolatedAsyncioTestCase):
                 }
             ]
         )
+        self.laravel_client.search_faturas = AsyncMock(
+            return_value=[
+                {
+                    "id": 900,
+                    "numero_fatura": "FAT-202603-5937",
+                    "cliente_id": 101,
+                    "periodo_referencia": "2026-03",
+                    "data_vencimento": "2026-04-20",
+                    "valor_total": 736.45,
+                    "cliente": {
+                        "id": 101,
+                        "razao_social": "ALPHA SISTEMAS LTDA",
+                        "cnpj": "11222333000132",
+                    },
+                    "titulos": [
+                        {
+                            "id": 700,
+                            "tipo": "receber",
+                            "numero_titulo": "TIT-202603-5937",
+                            "descricao": "Fatura FAT-202603-5937",
+                            "data_vencimento": "2026-04-20",
+                            "status": "aberto",
+                        }
+                    ],
+                }
+            ]
+        )
+        self.laravel_client.search_titulos = AsyncMock(return_value=[])
         self.laravel_client.upsert_cliente = AsyncMock(
             return_value={
                 "id": 101,
@@ -77,6 +105,54 @@ class ChatRuntimeServiceTest(unittest.IsolatedAsyncioTestCase):
                     "id": 101,
                     "razao_social": "ACME SAUDE LTDA",
                     "cnpj": "12345678000190",
+                },
+            }
+        )
+        self.laravel_client.gerar_boleto = AsyncMock(
+            return_value={
+                "mode": "local",
+                "boleto": {
+                    "titulo_id": 700,
+                    "nosso_numero": "LOCAL0000000700",
+                    "linha_digitavel": "34191.79001 01043.510047 91020.150008 6 89870000073645",
+                    "status": "aberto",
+                },
+                "fatura": {
+                    "id": 900,
+                    "numero_fatura": "FAT-202603-5937",
+                    "data_vencimento": "2026-04-20",
+                },
+            }
+        )
+        self.laravel_client.excluir_boleto = AsyncMock(
+            return_value={
+                "titulo_id": 700,
+                "boleto_excluido": True,
+                "fatura": {
+                    "id": 900,
+                    "numero_fatura": "FAT-202603-5937",
+                    "data_vencimento": "2026-04-20",
+                },
+            }
+        )
+        self.laravel_client.excluir_fatura = AsyncMock(
+            return_value={
+                "id": 900,
+                "numero_fatura": "FAT-202603-5937",
+                "cliente_id": 101,
+                "data_vencimento": "2026-04-20",
+            }
+        )
+        self.laravel_client.renegociar_titulo = AsyncMock(
+            return_value={
+                "id": 700,
+                "numero_titulo": "TIT-202603-5937",
+                "data_vencimento": "2026-05-01",
+                "status": "aberto",
+                "fatura": {
+                    "id": 900,
+                    "numero_fatura": "FAT-202603-5937",
+                    "data_vencimento": "2026-05-01",
                 },
             }
         )
@@ -476,6 +552,373 @@ class ChatRuntimeServiceTest(unittest.IsolatedAsyncioTestCase):
         payload = self.laravel_client.create_fatura.await_args.kwargs["payload"]
         self.assertEqual(payload["data_vencimento"], "2026-04-20")
         self.assertFalse(payload["emitir_nfse"])
+
+    async def test_heuristica_de_boleto_para_fatura_existente_corrige_acao_e_confirma(self) -> None:
+        self.service.router.route = AsyncMock(
+            return_value=RouteDecision(
+                tipo_interacao="acao_operacional",
+                dominio="faturamento",
+                acao_sugerida="gerar_fatura",
+                precisa_confirmacao=True,
+            )
+        )
+        self.service.action_planner.plan = AsyncMock(
+            return_value=ActionPlan(
+                mensagem="Pedido recebido.",
+                acao_sugerida="gerar_fatura",
+                dados_mapeados=[],
+            )
+        )
+
+        preview = await self.service.process_chat(
+            ChatPayload(
+                mensagem="gere o boleto da fatura Número: FAT-202603-5937",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-boleto-fatura",
+            )
+        )
+
+        self.assertEqual(preview.acao_sugerida, "gerar_boleto")
+        self.assertTrue(preview.dados_estruturados.metadata["runtime_requires_confirmation"])
+        self.assertEqual(preview.dados_estruturados.dados_mapeados[0]["fatura_id"], 900)
+        self.assertEqual(preview.dados_estruturados.dados_mapeados[0]["fatura_label"], "FAT-202603-5937")
+
+        result = await self.service.process_chat(
+            ChatPayload(
+                mensagem="pode seguir",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-boleto-fatura",
+            )
+        )
+
+        self.assertIsNone(result.acao_sugerida)
+        self.assertIn("FAT-202603-5937", result.mensagem)
+        self.laravel_client.gerar_boleto.assert_awaited_once()
+        payload = self.laravel_client.gerar_boleto.await_args.kwargs["payload"]
+        self.assertEqual(payload["fatura_id"], 900)
+
+    async def test_heuristica_de_renegociacao_localiza_titulo_pela_fatura(self) -> None:
+        self.service.router.route = AsyncMock(
+            return_value=RouteDecision(
+                tipo_interacao="consulta_operacional",
+                dominio="faturamento",
+                acao_sugerida="nenhuma",
+                precisa_confirmacao=False,
+            )
+        )
+        self.service.action_planner.plan = AsyncMock(
+            return_value=ActionPlan(
+                mensagem="Consulta recebida.",
+                acao_sugerida="nenhuma",
+                dados_mapeados=[],
+            )
+        )
+
+        preview = await self.service.process_chat(
+            ChatPayload(
+                mensagem="quero alterar o vencimento da fatura da alpha sistemas para a data 01/05/2026",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-renegociacao-fatura",
+            )
+        )
+
+        self.assertEqual(preview.acao_sugerida, "renegociar_titulo")
+        record = preview.dados_estruturados.dados_mapeados[0]
+        self.assertEqual(record["titulo_id"], 700)
+        self.assertEqual(record["nova_data_vencimento"], "2026-05-01")
+
+        result = await self.service.process_chat(
+            ChatPayload(
+                mensagem="confirmar",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-renegociacao-fatura",
+            )
+        )
+
+        self.assertIsNone(result.acao_sugerida)
+        self.assertIn("01/05/2026", result.mensagem)
+        self.laravel_client.renegociar_titulo.assert_awaited_once()
+        payload = self.laravel_client.renegociar_titulo.await_args.kwargs["payload"]
+        self.assertEqual(payload["titulo_id"], 700)
+        self.assertEqual(payload["nova_data_vencimento"], "2026-05-01")
+
+    async def test_heuristica_de_cliente_captura_razao_social_em_texto_livre(self) -> None:
+        self.service.router.route = AsyncMock(
+            return_value=RouteDecision(
+                tipo_interacao="ambigua",
+                dominio="cadastros",
+                acao_sugerida="nenhuma",
+                precisa_confirmacao=False,
+            )
+        )
+        self.service.action_planner.plan = AsyncMock(
+            return_value=ActionPlan(
+                mensagem="Pedido recebido.",
+                acao_sugerida="nenhuma",
+                dados_mapeados=[],
+            )
+        )
+
+        preview = await self.service.process_chat(
+            ChatPayload(
+                mensagem="gere o cliente Renan Lima\ncnpj: 12.345.678/0001-90",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-criar-cliente-texto-livre",
+            )
+        )
+
+        self.assertEqual(preview.acao_sugerida, "criar_cliente")
+        self.assertTrue(preview.dados_estruturados.metadata["runtime_requires_confirmation"])
+        record = preview.dados_estruturados.dados_mapeados[0]
+        self.assertEqual(record["razao_social"], "RENAN LIMA")
+        self.assertEqual(record["cnpj"], "12345678000190")
+
+    async def test_pergunta_sobre_cadastro_de_cliente_gera_pendencias_objetivas(self) -> None:
+        self.service.router.route = AsyncMock(
+            return_value=RouteDecision(
+                tipo_interacao="consulta_operacional",
+                dominio="cadastros",
+                acao_sugerida="nenhuma",
+                precisa_confirmacao=False,
+            )
+        )
+        self.service.action_planner.plan = AsyncMock(
+            return_value=ActionPlan(
+                mensagem="Consulta recebida.",
+                acao_sugerida="nenhuma",
+                dados_mapeados=[],
+            )
+        )
+
+        response = await self.service.process_chat(
+            ChatPayload(
+                mensagem="quero criar um novo cliente, quais dados vc precisa pra gerar?",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-pergunta-cliente",
+            )
+        )
+
+        self.assertEqual(response.acao_sugerida, "criar_cliente")
+        self.assertTrue(response.dados_estruturados.metadata["runtime_requires_more_info"])
+        self.assertEqual(
+            response.dados_estruturados.metadata["runtime_pending_fields"],
+            ["cnpj", "razao_social"],
+        )
+        self.assertIn("CNPJ", response.mensagem)
+
+    async def test_complemento_de_cliente_com_razao_social_acentuada_avanca_rascunho(self) -> None:
+        self.service.pending_actions.save(
+            action="criar_cliente",
+            records=[
+                {
+                    "cnpj": "12345678000190",
+                    "status": "ativo",
+                }
+            ],
+            user_id=7,
+            session_id="sessao-razao-social-acento",
+            metadata={
+                "state": "draft",
+                "pending_fields": ["razao_social"],
+                "fonte": "langchain-runtime",
+            },
+        )
+
+        self.service.router.route = AsyncMock(
+            return_value=RouteDecision(
+                tipo_interacao="acao_operacional",
+                dominio="cadastros",
+                acao_sugerida="criar_cliente",
+                precisa_confirmacao=True,
+            )
+        )
+        self.service.action_planner.plan = AsyncMock(
+            return_value=ActionPlan(
+                mensagem="Complemento recebido.",
+                acao_sugerida="criar_cliente",
+                dados_mapeados=[],
+            )
+        )
+
+        response = await self.service.process_chat(
+            ChatPayload(
+                mensagem="Razão social: Renan Lima",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-razao-social-acento",
+            )
+        )
+
+        self.assertEqual(response.acao_sugerida, "criar_cliente")
+        self.assertTrue(response.dados_estruturados.metadata["runtime_requires_confirmation"])
+        record = response.dados_estruturados.dados_mapeados[0]
+        self.assertEqual(record["razao_social"], "RENAN LIMA")
+        self.assertEqual(record["nome_fantasia"], "RENAN LIMA")
+
+    async def test_heuristica_de_excluir_boleto_gera_preview_com_confirmacao_forte(self) -> None:
+        self.service.router.route = AsyncMock(
+            return_value=RouteDecision(
+                tipo_interacao="acao_operacional",
+                dominio="faturamento",
+                acao_sugerida="gerar_fatura",
+                precisa_confirmacao=True,
+            )
+        )
+        self.service.action_planner.plan = AsyncMock(
+            return_value=ActionPlan(
+                mensagem="Pedido recebido.",
+                acao_sugerida="gerar_fatura",
+                dados_mapeados=[],
+            )
+        )
+
+        preview = await self.service.process_chat(
+            ChatPayload(
+                mensagem="pode excluir o boleto da fatura FAT-202603-5937",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-exclusao-boleto",
+            )
+        )
+
+        self.assertEqual(preview.acao_sugerida, "excluir_boleto")
+        self.assertTrue(preview.dados_estruturados.metadata["runtime_requires_confirmation"])
+        self.assertEqual(preview.dados_estruturados.metadata["runtime_confirmation_strength"], "strong")
+        self.assertEqual(
+            preview.dados_estruturados.metadata["runtime_confirmation_phrase"],
+            "confirmo excluir o boleto da fatura FAT-202603-5937",
+        )
+        self.assertEqual(preview.dados_estruturados.dados_mapeados[0]["fatura_id"], 900)
+
+    async def test_confirmacao_fraca_nao_executa_exclusao_boleto(self) -> None:
+        self.service.pending_actions.save(
+            action="excluir_boleto",
+            records=[
+                {
+                    "fatura_id": 900,
+                    "fatura_label": "FAT-202603-5937",
+                }
+            ],
+            user_id=7,
+            session_id="sessao-exclusao-boleto-fraca",
+            metadata={
+                "state": "pending_confirmation",
+                "fonte": "langchain-runtime",
+            },
+        )
+
+        reminder = await self.service.process_chat(
+            ChatPayload(
+                mensagem="pode seguir",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-exclusao-boleto-fraca",
+            )
+        )
+
+        self.assertEqual(reminder.acao_sugerida, "excluir_boleto")
+        self.assertIn("confirmacao simples", reminder.mensagem)
+        self.assertIn("confirmo excluir o boleto da fatura FAT-202603-5937", reminder.mensagem)
+        self.laravel_client.excluir_boleto.assert_not_awaited()
+
+    async def test_confirmacao_forte_executa_exclusao_boleto(self) -> None:
+        self.service.pending_actions.save(
+            action="excluir_boleto",
+            records=[
+                {
+                    "fatura_id": 900,
+                    "fatura_label": "FAT-202603-5937",
+                }
+            ],
+            user_id=7,
+            session_id="sessao-exclusao-boleto-forte",
+            metadata={
+                "state": "pending_confirmation",
+                "fonte": "langchain-runtime",
+            },
+        )
+
+        result = await self.service.process_chat(
+            ChatPayload(
+                mensagem="confirmo excluir o boleto da fatura FAT-202603-5937",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-exclusao-boleto-forte",
+            )
+        )
+
+        self.assertIsNone(result.acao_sugerida)
+        self.assertIn("Exclui o boleto da fatura FAT-202603-5937", result.mensagem)
+        self.laravel_client.excluir_boleto.assert_awaited_once()
+        payload = self.laravel_client.excluir_boleto.await_args.kwargs["payload"]
+        self.assertEqual(payload["runtime_audit"]["confirmation_strength"], "strong")
+        self.assertEqual(
+            payload["runtime_audit"]["confirmation_phrase"],
+            "confirmo excluir o boleto da fatura FAT-202603-5937",
+        )
+        self.assertEqual(
+            payload["runtime_audit"]["confirmation_message"],
+            "confirmo excluir o boleto da fatura FAT-202603-5937",
+        )
+        self.assertEqual(payload["runtime_audit"]["confirmation_source"], "chat_message")
+
+    async def test_confirmacao_forte_executa_exclusao_fatura(self) -> None:
+        self.service.pending_actions.save(
+            action="excluir_fatura",
+            records=[
+                {
+                    "fatura_id": 900,
+                    "fatura_label": "FAT-202603-5937",
+                }
+            ],
+            user_id=7,
+            session_id="sessao-exclusao-fatura-forte",
+            metadata={
+                "state": "pending_confirmation",
+                "fonte": "langchain-runtime",
+            },
+        )
+
+        result = await self.service.process_chat(
+            ChatPayload(
+                mensagem="confirmo excluir a fatura FAT-202603-5937",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-exclusao-fatura-forte",
+            )
+        )
+
+        self.assertIsNone(result.acao_sugerida)
+        self.assertIn("Exclui a fatura FAT-202603-5937", result.mensagem)
+        self.laravel_client.excluir_fatura.assert_awaited_once()
+        payload = self.laravel_client.excluir_fatura.await_args.kwargs["payload"]
+        self.assertEqual(payload["runtime_audit"]["confirmation_strength"], "strong")
+        self.assertEqual(
+            payload["runtime_audit"]["confirmation_phrase"],
+            "confirmo excluir a fatura FAT-202603-5937",
+        )
+        self.assertEqual(
+            payload["runtime_audit"]["confirmation_message"],
+            "confirmo excluir a fatura FAT-202603-5937",
+        )
+        self.assertEqual(payload["runtime_audit"]["confirmation_source"], "chat_message")
 
     async def test_complemento_de_itens_em_rascunho_de_fatura_mapeia_item_por_linguagem_natural(self) -> None:
         self.service.pending_actions.save(

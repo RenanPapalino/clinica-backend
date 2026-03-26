@@ -13,6 +13,7 @@ use App\Actions\Rag\SearchRagChunksAction;
 use App\Http\Controllers\Controller;
 use App\Http\Resources\FaturaResource;
 use App\Http\Resources\NfseResource;
+use App\Models\AgentActionAudit;
 use App\Models\ChatMessage;
 use App\Models\Cliente;
 use App\Models\Cobranca;
@@ -20,6 +21,7 @@ use App\Models\Despesa;
 use App\Models\Fatura;
 use App\Models\Fornecedor;
 use App\Models\Nfse;
+use App\Models\OrdemServico;
 use App\Models\Servico;
 use App\Models\Titulo;
 use App\Services\Bancos\ItauService;
@@ -593,6 +595,290 @@ class AgentToolController extends Controller
                 'nfse' => (new NfseResource($nfse))->resolve(),
                 'fatura' => (new FaturaResource($fatura->fresh(['cliente', 'itens', 'titulos'])))->resolve(),
             ],
+        ]);
+    }
+
+    public function gerarBoleto(Request $request, ItauService $bancoService)
+    {
+        $data = $request->validate([
+            'fatura_id' => ['required', 'integer', 'exists:faturas,id'],
+        ]);
+
+        try {
+            $fatura = Fatura::with(['cliente', 'titulos.cliente'])->findOrFail($data['fatura_id']);
+
+            /** @var Titulo|null $titulo */
+            $titulo = $fatura->titulos->firstWhere('tipo', 'receber');
+
+            if (!$titulo) {
+                $titulo = $fatura->gerarTituloPadrao();
+
+                if (!$titulo) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Não foi possível gerar um título financeiro para esta fatura.',
+                    ], 422);
+                }
+
+                $titulo->load('cliente');
+            } else {
+                $titulo->loadMissing('cliente');
+            }
+
+            if (!$titulo->cliente) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'O título da fatura não possui cliente vinculado para registrar boleto.',
+                ], 422);
+            }
+
+            if (!empty($titulo->nosso_numero)) {
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Boleto já registrado anteriormente para esta fatura.',
+                    'data' => [
+                        'mode' => 'existing',
+                        'boleto' => $this->serializeTituloBoleto($titulo),
+                        'fatura' => (new FaturaResource($fatura->fresh(['cliente', 'itens', 'titulos'])))->resolve(),
+                    ],
+                ]);
+            }
+
+            $mode = 'banco';
+
+            try {
+                $dadosBancarios = $bancoService->registrarBoleto($titulo);
+            } catch (\Throwable $exception) {
+                Log::warning('AGENT_RUNTIME: falha ao registrar boleto no banco; aplicando fallback local.', [
+                    'fatura_id' => $fatura->id,
+                    'titulo_id' => $titulo->id,
+                    'error' => $exception->getMessage(),
+                ]);
+
+                $mode = 'local';
+                $dadosBancarios = [
+                    'nosso_numero' => 'LOCAL' . str_pad((string) $titulo->id, 10, '0', STR_PAD_LEFT),
+                    'linha_digitavel' => $titulo->linha_digitavel,
+                    'url_boleto' => $titulo->url_boleto,
+                ];
+            }
+
+            $payload = [
+                'nosso_numero' => $dadosBancarios['nosso_numero'] ?? $titulo->nosso_numero,
+                'linha_digitavel' => $dadosBancarios['linha_digitavel'] ?? $titulo->linha_digitavel,
+                'url_boleto' => $dadosBancarios['url_boleto'] ?? $titulo->url_boleto,
+                'status' => $titulo->status === 'pago' ? 'pago' : 'aberto',
+            ];
+
+            if (Schema::hasColumn('titulos', 'codigo_barras')) {
+                $payload['codigo_barras'] = $dadosBancarios['codigo_barras'] ?? $titulo->codigo_barras;
+            }
+
+            $titulo->update($payload);
+
+            if (in_array($fatura->status, ['emitida', 'nfse_emitida', 'aguardando_boleto'], true)) {
+                $fatura->update(['status' => 'concluida']);
+            }
+
+            return response()->json([
+                'success' => true,
+                'message' => $mode === 'banco'
+                    ? 'Boleto registrado com sucesso no banco.'
+                    : 'Boleto preparado em modo local. Homologue a integração bancária para emissão oficial.',
+                'data' => [
+                    'mode' => $mode,
+                    'boleto' => $this->serializeTituloBoleto($titulo->fresh()),
+                    'fatura' => (new FaturaResource($fatura->fresh(['cliente', 'itens', 'titulos'])))->resolve(),
+                ],
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erro ao gerar boleto: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function excluirBoleto(Request $request)
+    {
+        $data = $request->validate([
+            'fatura_id' => ['required', 'integer', 'exists:faturas,id'],
+        ]);
+
+        $fatura = Fatura::with(['cliente', 'itens', 'titulos.cobrancas'])->findOrFail($data['fatura_id']);
+
+        /** @var Titulo|null $titulo */
+        $titulo = $fatura->titulos->firstWhere('tipo', 'receber');
+        if (!$titulo) {
+            return response()->json([
+                'success' => false,
+                'message' => 'A fatura informada não possui título de cobrança vinculado.',
+            ], 422);
+        }
+
+        $boletoRegistrado = !empty($titulo->nosso_numero)
+            || !empty($titulo->linha_digitavel)
+            || !empty($titulo->url_boleto)
+            || (Schema::hasColumn('titulos', 'codigo_barras') && !empty($titulo->codigo_barras));
+
+        if (!$boletoRegistrado) {
+            return response()->json([
+                'success' => false,
+                'message' => 'A fatura informada não possui boleto registrado para exclusão.',
+            ], 422);
+        }
+
+        if ($titulo->estaPago()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Não é possível excluir um boleto de título já pago.',
+            ], 422);
+        }
+
+        $nossoNumeroAnterior = (string) ($titulo->nosso_numero ?? '');
+        if ($nossoNumeroAnterior !== '' && !Str::startsWith($nossoNumeroAnterior, 'LOCAL')) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Este boleto foi registrado no banco e não pode ser excluído via chatbot sem rotina de cancelamento bancário.',
+            ], 422);
+        }
+
+        $statusAnteriorFatura = $fatura->status;
+
+        DB::transaction(function () use ($request, $fatura, $titulo, $statusAnteriorFatura, $nossoNumeroAnterior) {
+            $payload = [
+                'nosso_numero' => null,
+                'linha_digitavel' => null,
+                'url_boleto' => null,
+                'forma_pagamento' => null,
+                'status' => $titulo->status === 'pago' ? 'pago' : 'aberto',
+            ];
+
+            if (Schema::hasColumn('titulos', 'codigo_barras')) {
+                $payload['codigo_barras'] = null;
+            }
+
+            $titulo->update($payload);
+
+            Cobranca::query()
+                ->where(function ($query) use ($fatura, $titulo) {
+                    $query->where('titulo_id', $titulo->id)
+                        ->orWhere('fatura_id', $fatura->id);
+                })
+                ->where('meio', 'boleto')
+                ->delete();
+
+            if ($fatura->status === 'concluida') {
+                $fatura->update([
+                    'status' => $fatura->nfse_emitida ? 'emitida' : 'pendente',
+                ]);
+            }
+
+            $faturaAtualizada = $fatura->fresh(['cliente', 'itens', 'titulos']);
+            $this->registrarAuditoriaDestrutiva(
+                request: $request,
+                action: 'excluir_boleto',
+                targetType: 'boleto',
+                targetId: $titulo->id,
+                targetLabel: 'Boleto da fatura ' . ($faturaAtualizada->numero_fatura ?? $fatura->numero_fatura),
+                requestPayload: [
+                    'fatura_id' => $fatura->id,
+                ],
+                resultPayload: [
+                    'boleto_excluido' => true,
+                    'titulo_id' => $titulo->id,
+                    'fatura_id' => $faturaAtualizada->id,
+                    'numero_fatura' => $faturaAtualizada->numero_fatura,
+                    'status_fatura' => $faturaAtualizada->status,
+                    'nosso_numero_anterior' => $nossoNumeroAnterior ?: null,
+                ],
+                metadata: [
+                    'performed_via' => 'agent_runtime_internal_api',
+                    'fatura_id' => $fatura->id,
+                    'numero_fatura' => $fatura->numero_fatura,
+                    'status_fatura_antes' => $statusAnteriorFatura,
+                    'status_fatura_depois' => $faturaAtualizada->status,
+                    'nosso_numero_anterior' => $nossoNumeroAnterior ?: null,
+                ],
+            );
+        });
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Boleto excluído com sucesso.',
+            'data' => [
+                'titulo_id' => $titulo->id,
+                'fatura' => (new FaturaResource($fatura->fresh(['cliente', 'itens', 'titulos'])))->resolve(),
+                'boleto_excluido' => true,
+                'nosso_numero_anterior' => $nossoNumeroAnterior ?: null,
+            ],
+        ]);
+    }
+
+    public function excluirFatura(Request $request)
+    {
+        $data = $request->validate([
+            'fatura_id' => ['required', 'integer', 'exists:faturas,id'],
+        ]);
+
+        $fatura = Fatura::with(['cliente', 'itens', 'titulos', 'cobrancas'])->findOrFail($data['fatura_id']);
+
+        if ($fatura->nfse_emitida || Nfse::query()->where('fatura_id', $fatura->id)->exists()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Fatura com NFS-e vinculada não pode ser excluída via chatbot.',
+            ], 422);
+        }
+
+        if ($fatura->titulos->contains(fn (Titulo $titulo) => $titulo->estaPago())) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Fatura com título já pago não pode ser excluída via chatbot.',
+            ], 422);
+        }
+
+        if (OrdemServico::query()->where('fatura_gerada_id', $fatura->id)->exists()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Fatura vinculada a ordem de serviço não pode ser excluída automaticamente.',
+            ], 422);
+        }
+
+        $payload = (new FaturaResource($fatura))->resolve();
+
+        DB::transaction(function () use ($request, $fatura, $payload) {
+            $fatura->cobrancas()->delete();
+            $fatura->titulos()->delete();
+            $fatura->itens()->delete();
+            $fatura->delete();
+
+            $this->registrarAuditoriaDestrutiva(
+                request: $request,
+                action: 'excluir_fatura',
+                targetType: 'fatura',
+                targetId: $fatura->id,
+                targetLabel: $fatura->numero_fatura,
+                requestPayload: [
+                    'fatura_id' => $fatura->id,
+                ],
+                resultPayload: [
+                    'fatura_excluida' => true,
+                    'fatura_id' => $fatura->id,
+                    'numero_fatura' => $fatura->numero_fatura,
+                ],
+                metadata: [
+                    'performed_via' => 'agent_runtime_internal_api',
+                    'cliente_id' => $fatura->cliente_id,
+                    'numero_fatura' => $fatura->numero_fatura,
+                    'snapshot' => $payload,
+                ],
+            );
+        });
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Fatura excluída com sucesso.',
+            'data' => $payload,
         ]);
     }
 
@@ -1616,6 +1902,53 @@ class AgentToolController extends Controller
         $base['exames_resumo'] = $exames->take(20)->all();
 
         return $base;
+    }
+
+    private function serializeTituloBoleto(Titulo $titulo): array
+    {
+        return [
+            'titulo_id' => $titulo->id,
+            'nosso_numero' => $titulo->nosso_numero,
+            'codigo_barras' => Schema::hasColumn('titulos', 'codigo_barras') ? $titulo->codigo_barras : null,
+            'linha_digitavel' => $titulo->linha_digitavel,
+            'url_boleto' => $titulo->url_boleto,
+            'status' => $titulo->status,
+        ];
+    }
+
+    private function registrarAuditoriaDestrutiva(
+        Request $request,
+        string $action,
+        string $targetType,
+        ?int $targetId,
+        ?string $targetLabel,
+        array $requestPayload = [],
+        array $resultPayload = [],
+        array $metadata = [],
+    ): void {
+        $runtimeAudit = $request->input('runtime_audit');
+        $runtimeAudit = is_array($runtimeAudit) ? $runtimeAudit : [];
+
+        AgentActionAudit::create([
+            'user_id' => $request->user()?->id,
+            'action' => $action,
+            'target_type' => $targetType,
+            'target_id' => $targetId,
+            'target_label' => $targetLabel,
+            'confirmation_strength' => $runtimeAudit['confirmation_strength'] ?? null,
+            'confirmation_phrase' => $runtimeAudit['confirmation_phrase'] ?? null,
+            'confirmation_message' => $runtimeAudit['confirmation_message'] ?? null,
+            'confirmation_source' => $runtimeAudit['confirmation_source'] ?? 'internal_api',
+            'runtime_pending_action_id' => $runtimeAudit['runtime_pending_action_id'] ?? null,
+            'session_id' => $runtimeAudit['session_id'] ?? null,
+            'request_payload' => $requestPayload,
+            'result_payload' => $resultPayload,
+            'metadata' => array_filter([
+                ...$metadata,
+                'approved_at' => $runtimeAudit['approved_at'] ?? null,
+            ], static fn ($value) => $value !== null),
+            'executed_at' => now(),
+        ]);
     }
 
     private function formatarCnpj(?string $cnpj): ?string

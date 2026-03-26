@@ -88,6 +88,9 @@ Route::prefix('internal/agent')->middleware('agent.runtime')->group(function () 
     Route::post('/titulos/baixar', [AgentToolController::class, 'baixarTitulo']);
     Route::post('/titulos/renegociar', [AgentToolController::class, 'renegociarTitulo']);
     Route::post('/faturas/search', [AgentToolController::class, 'searchFaturas']);
+    Route::post('/faturas/gerar-boleto', [AgentToolController::class, 'gerarBoleto']);
+    Route::post('/faturas/excluir-boleto', [AgentToolController::class, 'excluirBoleto']);
+    Route::post('/faturas/excluir', [AgentToolController::class, 'excluirFatura']);
     Route::post('/nfse/search', [AgentToolController::class, 'searchNfse']);
     Route::post('/nfse/emitir', [AgentToolController::class, 'emitirNfse']);
     Route::post('/fechamento/diario', [AgentToolController::class, 'fechamentoDiario']);

@@ -101,6 +101,9 @@ Acoes validas:
 - criar_conta_pagar
 - criar_conta_receber
 - gerar_fatura
+- gerar_boleto
+- excluir_boleto
+- excluir_fatura
 - inativar_cliente
 - reativar_cliente
 - baixar_titulo
@@ -131,6 +134,9 @@ As unicas acoes validas sao:
 - criar_conta_pagar
 - criar_conta_receber
 - gerar_fatura
+- gerar_boleto
+- excluir_boleto
+- excluir_fatura
 - inativar_cliente
 - reativar_cliente
 - baixar_titulo
@@ -158,6 +164,9 @@ Regras:
 - Para baixar_titulo, aceite titulo_id, numero_titulo, descricao, cliente, cliente_nome, cliente_cnpj, valor, valor_pago, valor_baixa, data_pagamento e forma_pagamento.
 - Para baixar_despesa, aceite despesa_id, descricao, fornecedor, fornecedor_nome, fornecedor_cnpj, valor, valor_pago, valor_baixa e data_pagamento.
 - Para renegociar_titulo, aceite titulo_id, numero_titulo, descricao, cliente, cliente_nome, cliente_cnpj, nova_data_vencimento e observacoes.
+- Para gerar_boleto, aceite fatura_id, numero_fatura, fatura, cliente, cliente_nome e cliente_cnpj.
+- Para excluir_boleto, aceite fatura_id, numero_fatura, fatura, cliente, cliente_nome e cliente_cnpj.
+- Para excluir_fatura, aceite fatura_id, numero_fatura, fatura, cliente, cliente_nome e cliente_cnpj.
 - Para emitir_nfse, aceite fatura_id, numero_fatura, fatura, cliente, cliente_nome, cliente_cnpj, periodo_referencia, codigo_servico e discriminacao.
 - Para gerar_fatura, cada registro representa uma fatura com cliente, periodo_referencia, data_vencimento e itens.
 - Para gerar_fatura, aceite cliente_id, cliente, cliente_nome, cliente_cnpj.
