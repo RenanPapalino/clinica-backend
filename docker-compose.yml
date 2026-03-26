@@ -48,8 +48,15 @@ services:
       REQUEST_TIMEOUT_SECONDS: ${CHATBOT_REQUEST_TIMEOUT_SECONDS:-30}
       MAX_RESULT_ROWS: ${CHATBOT_MAX_RESULT_ROWS:-10}
       DEFAULT_HISTORY_LIMIT: ${CHATBOT_RUNTIME_HISTORY_LIMIT:-20}
+      PENDING_ACTIONS_BACKEND: ${CHATBOT_RUNTIME_PENDING_ACTIONS_BACKEND:-auto}
+      PENDING_ACTIONS_DATABASE_URL: ${CHATBOT_RUNTIME_PENDING_ACTIONS_DATABASE_URL:-}
+      PENDING_ACTIONS_DB_PATH: ${CHATBOT_RUNTIME_PENDING_ACTIONS_DB_PATH:-.runtime/pending_actions.sqlite3}
+      PENDING_ACTIONS_TTL_MINUTES: ${CHATBOT_RUNTIME_PENDING_ACTIONS_TTL_MINUTES:-30}
+      PENDING_ACTIONS_MAX_REPEAT_COUNT: ${CHATBOT_RUNTIME_PENDING_ACTIONS_MAX_REPEAT_COUNT:-2}
     ports:
       - "${RUNTIME_PORT:-8787}:8787"
+    volumes:
+      - runtime_data:/app/.runtime
     depends_on:
       api:
         condition: service_healthy
@@ -65,6 +72,7 @@ services:
 volumes:
   storage_data:
   cache_data:
+  runtime_data:
 
 networks:
   medintelligence-network:

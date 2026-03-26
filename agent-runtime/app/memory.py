@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import sqlite3
 from dataclasses import dataclass, field
@@ -54,6 +55,17 @@ class PendingActionStoreProtocol(Protocol):
         session_id: str,
         states: set[str] | None = None,
     ) -> PendingAction | None: ...
+
+    def mark_completed(self, action_id: str, result: dict) -> PendingAction | None: ...
+
+    def list_for_diagnostics(
+        self,
+        *,
+        user_id: int | None = None,
+        session_id: str | None = None,
+        states: set[str] | None = None,
+        limit: int | None = 20,
+    ) -> list[PendingAction]: ...
 
 
 class PendingActionStore:
@@ -122,6 +134,51 @@ class PendingActionStore:
 
             return max(matches, key=lambda pending: pending.created_at)
 
+    def mark_completed(self, action_id: str, result: dict) -> PendingAction | None:
+        with self._lock:
+            self._cleanup_locked()
+            pending = self._items.get(action_id)
+            if pending is None:
+                return None
+
+            pending.metadata = {
+                **dict(pending.metadata or {}),
+                "state": "completed",
+                "completed_result": result,
+                "completed_at": utcnow().isoformat(),
+            }
+            return pending
+
+    def list_for_diagnostics(
+        self,
+        *,
+        user_id: int | None = None,
+        session_id: str | None = None,
+        states: set[str] | None = None,
+        limit: int | None = 20,
+    ) -> list[PendingAction]:
+        with self._lock:
+            self._cleanup_locked()
+            items = sorted(
+                self._items.values(),
+                key=lambda pending: pending.created_at,
+                reverse=True,
+            )
+
+        filtered = [
+            pending
+            for pending in items
+            if _matches_diagnostic_filters(
+                pending=pending,
+                user_id=user_id,
+                session_id=session_id,
+                states=states,
+            )
+        ]
+        if limit is None:
+            return filtered
+        return filtered[: max(0, limit)]
+
     def _cleanup_locked(self) -> None:
         expired_before = utcnow() - self._ttl
         expired_ids = [
@@ -160,7 +217,7 @@ class SqlitePendingActionStore:
             metadata=metadata or {},
         )
 
-        with self._lock, self._connect() as connection:
+        with self._lock, closing(self._connect()) as connection:
             self._cleanup_locked(connection)
             connection.execute(
                 """
@@ -190,7 +247,7 @@ class SqlitePendingActionStore:
         return pending
 
     def get(self, action_id: str) -> PendingAction | None:
-        with self._lock, self._connect() as connection:
+        with self._lock, closing(self._connect()) as connection:
             self._cleanup_locked(connection)
             row = connection.execute(
                 """
@@ -204,7 +261,7 @@ class SqlitePendingActionStore:
         return self._row_to_pending_action(row)
 
     def pop(self, action_id: str) -> PendingAction | None:
-        with self._lock, self._connect() as connection:
+        with self._lock, closing(self._connect()) as connection:
             self._cleanup_locked(connection)
             row = connection.execute(
                 """
@@ -232,7 +289,7 @@ class SqlitePendingActionStore:
         session_id: str,
         states: set[str] | None = None,
     ) -> PendingAction | None:
-        with self._lock, self._connect() as connection:
+        with self._lock, closing(self._connect()) as connection:
             self._cleanup_locked(connection)
             rows = connection.execute(
                 """
@@ -260,13 +317,87 @@ class SqlitePendingActionStore:
 
         return None
 
+    def mark_completed(self, action_id: str, result: dict) -> PendingAction | None:
+        with self._lock, closing(self._connect()) as connection:
+            self._cleanup_locked(connection)
+            row = connection.execute(
+                """
+                SELECT action_id, action, records_json, user_id, session_id, metadata_json, created_at
+                FROM pending_actions
+                WHERE action_id = ?
+                """,
+                (action_id,),
+            ).fetchone()
+            if row is None:
+                return None
+
+            pending = self._row_to_pending_action(row)
+            metadata = {
+                **dict((pending.metadata if pending else {}) or {}),
+                "state": "completed",
+                "completed_result": result,
+                "completed_at": utcnow().isoformat(),
+            }
+            connection.execute(
+                "UPDATE pending_actions SET metadata_json = ? WHERE action_id = ?",
+                (json.dumps(metadata, ensure_ascii=True), action_id),
+            )
+            connection.commit()
+
+        return self.get(action_id)
+
+    def list_for_diagnostics(
+        self,
+        *,
+        user_id: int | None = None,
+        session_id: str | None = None,
+        states: set[str] | None = None,
+        limit: int | None = 20,
+    ) -> list[PendingAction]:
+        with self._lock, closing(self._connect()) as connection:
+            self._cleanup_locked(connection)
+
+            query = [
+                "SELECT action_id, action, records_json, user_id, session_id, metadata_json, created_at",
+                "FROM pending_actions",
+            ]
+            params: list[object] = []
+            clauses: list[str] = []
+            if user_id is not None:
+                clauses.append("user_id = ?")
+                params.append(user_id)
+            if session_id:
+                clauses.append("session_id = ?")
+                params.append(session_id)
+            if clauses:
+                query.append("WHERE " + " AND ".join(clauses))
+            query.append("ORDER BY created_at DESC")
+
+            rows = connection.execute("\n".join(query), tuple(params)).fetchall()
+
+        items = [self._row_to_pending_action(row) for row in rows]
+        filtered = [
+            pending
+            for pending in items
+            if pending is not None
+            and _matches_diagnostic_filters(
+                pending=pending,
+                user_id=user_id,
+                session_id=session_id,
+                states=states,
+            )
+        ]
+        if limit is None:
+            return filtered
+        return filtered[: max(0, limit)]
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self._db_path))
         connection.row_factory = sqlite3.Row
         return connection
 
     def _init_db(self) -> None:
-        with self._lock, self._connect() as connection:
+        with self._lock, closing(self._connect()) as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS pending_actions (
@@ -464,6 +595,87 @@ class PostgresPendingActionStore:
 
         return None
 
+    def mark_completed(self, action_id: str, result: dict) -> PendingAction | None:
+        with self._lock, self._connect() as connection:
+            self._cleanup_locked(connection)
+            with connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute(
+                    """
+                    SELECT action_id, action, records_json, user_id, session_id, metadata_json, created_at
+                    FROM pending_actions
+                    WHERE action_id = %s
+                    """,
+                    (action_id,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+
+                pending = self._dict_to_pending_action(row)
+                metadata = {
+                    **dict((pending.metadata if pending else {}) or {}),
+                    "state": "completed",
+                    "completed_result": result,
+                    "completed_at": utcnow().isoformat(),
+                }
+                cursor.execute(
+                    """
+                    UPDATE pending_actions
+                    SET metadata_json = %s::jsonb
+                    WHERE action_id = %s
+                    """,
+                    (json.dumps(metadata, ensure_ascii=True), action_id),
+                )
+            connection.commit()
+
+        return self.get(action_id)
+
+    def list_for_diagnostics(
+        self,
+        *,
+        user_id: int | None = None,
+        session_id: str | None = None,
+        states: set[str] | None = None,
+        limit: int | None = 20,
+    ) -> list[PendingAction]:
+        with self._lock, self._connect() as connection:
+            self._cleanup_locked(connection)
+            query = [
+                "SELECT action_id, action, records_json, user_id, session_id, metadata_json, created_at",
+                "FROM pending_actions",
+            ]
+            params: list[object] = []
+            clauses: list[str] = []
+            if user_id is not None:
+                clauses.append("user_id = %s")
+                params.append(user_id)
+            if session_id:
+                clauses.append("session_id = %s")
+                params.append(session_id)
+            if clauses:
+                query.append("WHERE " + " AND ".join(clauses))
+            query.append("ORDER BY created_at DESC")
+
+            with connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute("\n".join(query), tuple(params))
+                rows = cursor.fetchall()
+
+        items = [self._dict_to_pending_action(row) for row in rows]
+        filtered = [
+            pending
+            for pending in items
+            if pending is not None
+            and _matches_diagnostic_filters(
+                pending=pending,
+                user_id=user_id,
+                session_id=session_id,
+                states=states,
+            )
+        ]
+        if limit is None:
+            return filtered
+        return filtered[: max(0, limit)]
+
     def _connect(self):
         return psycopg.connect(self._dsn)
 
@@ -525,3 +737,21 @@ class PostgresPendingActionStore:
             metadata=metadata,
             created_at=created_at,
         )
+
+
+def _matches_diagnostic_filters(
+    *,
+    pending: PendingAction,
+    user_id: int | None,
+    session_id: str | None,
+    states: set[str] | None,
+) -> bool:
+    if user_id is not None and pending.user_id != user_id:
+        return False
+    if session_id and pending.session_id != session_id:
+        return False
+    if states:
+        state = str((pending.metadata or {}).get("state") or "").strip()
+        if state not in states:
+            return False
+    return True

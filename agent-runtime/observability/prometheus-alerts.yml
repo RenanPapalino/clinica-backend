@@ -1,0 +1,42 @@
+groups:
+  - name: agent-runtime
+    rules:
+      - alert: AgentRuntimeCircuitBreakerTriggered
+        expr: increase(agent_runtime_counter{name="circuit_breaker_triggered"}[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: agent-runtime
+        annotations:
+          summary: "Agent runtime suspendeu rascunhos por loop"
+          description: "O runtime acionou o circuit breaker conversacional nos últimos 15 minutos."
+
+      - alert: AgentRuntimeConfirmationReplaySpike
+        expr: increase(agent_runtime_counter{name="confirmation_replayed"}[15m]) >= 5
+        for: 10m
+        labels:
+          severity: warning
+          service: agent-runtime
+        annotations:
+          summary: "Agent runtime está recebendo confirmações repetidas"
+          description: "Houve pelo menos 5 replays de confirmação nos últimos 15 minutos. Verifique frontend, retries ou reenvios de webhook."
+
+      - alert: AgentRuntimeDraftBacklogHigh
+        expr: agent_runtime_pending_entries_by_state{state="draft"} >= 10
+        for: 10m
+        labels:
+          severity: warning
+          service: agent-runtime
+        annotations:
+          summary: "Acúmulo alto de drafts no agent runtime"
+          description: "Existem 10 ou mais drafts pendentes. Isso pode indicar conversas travadas ou falha em complementação de dados."
+
+      - alert: AgentRuntimePendingConfirmationBacklogHigh
+        expr: agent_runtime_pending_entries_by_state{state="pending_confirmation"} >= 10
+        for: 10m
+        labels:
+          severity: warning
+          service: agent-runtime
+        annotations:
+          summary: "Acúmulo alto de confirmações pendentes no agent runtime"
+          description: "Existem 10 ou mais confirmações pendentes. Revise UX do chat, retries ou filas de confirmação."

@@ -18,6 +18,9 @@ Este servico recebe mensagens do Laravel, usa LangChain para:
 - `POST /chat`
 - `POST /chat/file`
 - `POST /chat/resume`
+- `GET /internal/diagnostics/pending-actions`
+- `GET /internal/diagnostics/metrics?format=json`
+- `GET /internal/diagnostics/metrics?format=prometheus`
 
 ## Variaveis principais
 
@@ -26,6 +29,11 @@ Este servico recebe mensagens do Laravel, usa LangChain para:
 - `RUNTIME_SERVICE_TOKEN`
 - `LARAVEL_BASE_URL`
 - `LARAVEL_AGENT_SECRET`
+- `PENDING_ACTIONS_BACKEND`
+- `PENDING_ACTIONS_DATABASE_URL`
+- `PENDING_ACTIONS_DB_PATH`
+- `PENDING_ACTIONS_TTL_MINUTES`
+- `PENDING_ACTIONS_MAX_REPEAT_COUNT`
 
 ## Execucao local
 
@@ -60,3 +68,32 @@ Confirmacao:
 - o runtime devolve `dados_estruturados.metadata.runtime_pending_action_id`;
 - o frontend ja envia `metadata` para `/api/chat/confirmar`;
 - o `ChatController` pode encaminhar a aprovacao para `/chat/resume`.
+
+## Observabilidade
+
+Endpoints internos autenticados:
+
+- `GET /internal/diagnostics/pending-actions`
+- `GET /internal/diagnostics/metrics?format=json`
+- `GET /internal/diagnostics/metrics?format=prometheus`
+
+Artefatos incluídos:
+
+- alertas Prometheus: [`observability/prometheus-alerts.yml`](/home/renan/workspace/medintelligence/clinica-backend/agent-runtime/observability/prometheus-alerts.yml)
+- dashboard Grafana: [`observability/grafana-dashboard.json`](/home/renan/workspace/medintelligence/clinica-backend/agent-runtime/observability/grafana-dashboard.json)
+
+## Smoke test pós-deploy
+
+Script incluído:
+
+- [`scripts/runtime_smoke_test.py`](/home/renan/workspace/medintelligence/clinica-backend/agent-runtime/scripts/runtime_smoke_test.py)
+
+Exemplo:
+
+```bash
+python3 agent-runtime/scripts/runtime_smoke_test.py \
+  --base-url http://127.0.0.1:8787 \
+  --api-base-url http://127.0.0.1:8000 \
+  --token "$CHATBOT_RUNTIME_SECRET" \
+  --require-auth-checks
+```

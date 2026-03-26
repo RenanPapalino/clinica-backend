@@ -34,6 +34,14 @@ DB_PASSWORD=SEU_SEGREDO
 CHATBOT_RUNTIME_DRIVER=langchain
 CHATBOT_RUNTIME_URL=http://langchain-runtime:8787
 CHATBOT_RUNTIME_SECRET=SEU_SEGREDO_RUNTIME
+CHATBOT_RUNTIME_PENDING_ACTIONS_BACKEND=postgres
+CHATBOT_RUNTIME_PENDING_ACTIONS_DATABASE_URL=postgres://postgres:SENHA@n8n_postgres:5432/database?sslmode=disable
+CHATBOT_RUNTIME_PENDING_ACTIONS_DB_PATH=.runtime/pending_actions.sqlite3
+CHATBOT_RUNTIME_PENDING_ACTIONS_TTL_MINUTES=30
+CHATBOT_RUNTIME_PENDING_ACTIONS_MAX_REPEAT_COUNT=2
+RUN_RUNTIME_SMOKE_TEST=true
+RUNTIME_SMOKE_TEST_TIMEOUT_SECONDS=15
+RUNTIME_SMOKE_TEST_REQUIRE_AUTH=true
 
 OPENAI_API_KEY=sk-...
 OPENAI_MODEL=gpt-4.1-mini
@@ -79,9 +87,34 @@ curl -fsS http://127.0.0.1:${API_PORT:-8000}/up
 curl -fsS http://127.0.0.1:${RUNTIME_PORT:-8787}/health
 ```
 
+Rodar smoke test manual do runtime:
+
+```bash
+python3 agent-runtime/scripts/runtime_smoke_test.py \
+  --base-url http://127.0.0.1:${RUNTIME_PORT:-8787} \
+  --api-base-url http://127.0.0.1:${API_PORT:-8000} \
+  --token "${CHATBOT_RUNTIME_SECRET}" \
+  --require-auth-checks
+```
+
+Validar métricas e diagnósticos:
+
+```bash
+curl -fsS -H "Authorization: Bearer ${CHATBOT_RUNTIME_SECRET}" \
+  "http://127.0.0.1:${RUNTIME_PORT:-8787}/internal/diagnostics/pending-actions?limit=5"
+
+curl -fsS -H "Authorization: Bearer ${CHATBOT_RUNTIME_SECRET}" \
+  "http://127.0.0.1:${RUNTIME_PORT:-8787}/internal/diagnostics/metrics?format=json"
+
+curl -fsS -H "Authorization: Bearer ${CHATBOT_RUNTIME_SECRET}" \
+  "http://127.0.0.1:${RUNTIME_PORT:-8787}/internal/diagnostics/metrics?format=prometheus"
+```
+
 ## Observações
 
 - O backend publica Apache na porta interna `80`.
 - O runtime LangChain publica FastAPI na porta interna `8787`.
+- O `deploy-prod.sh` agora pode executar automaticamente o smoke test do runtime após a subida.
+- Os arquivos de observabilidade do runtime ficam em `agent-runtime/observability/`.
 - O build do Laravel agora já inclui os assets do Vite.
 - Não suba `.env` real para o git.

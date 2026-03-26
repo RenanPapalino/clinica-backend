@@ -140,7 +140,7 @@ class ChatRuntimeServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.acao_sugerida, "gerar_fatura")
         self.assertIsNotNone(response.dados_estruturados)
         self.assertTrue(response.dados_estruturados.metadata["runtime_requires_more_info"])
-        self.assertIn("cliente", response.dados_estruturados.metadata["runtime_pending_fields"])
+        self.assertIn("cliente_missing", response.dados_estruturados.metadata["runtime_pending_fields"])
         draft_record = response.dados_estruturados.dados_mapeados[0]
         self.assertTrue(draft_record["gerar_boleto"])
         self.assertTrue(draft_record["emitir_nfse"])
@@ -224,7 +224,7 @@ class ChatRuntimeServiceTest(unittest.IsolatedAsyncioTestCase):
             session_id="sessao-fatura",
             metadata={
                 "state": "draft",
-                "pending_fields": ["cliente"],
+                "pending_fields": ["cliente_missing"],
                 "fonte": "langchain-runtime",
             },
         )
@@ -325,7 +325,9 @@ class ChatRuntimeServiceTest(unittest.IsolatedAsyncioTestCase):
         self.laravel_client.create_cliente.assert_awaited_once()
         self.laravel_client.upsert_cliente.assert_not_awaited()
         self.laravel_client.create_fatura.assert_not_awaited()
-        self.assertIsNone(self.service.pending_actions.get(pending.action_id))
+        completed = self.service.pending_actions.get(pending.action_id)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.metadata["state"], "completed")
 
     async def test_rejeicao_em_linguagem_natural_cancela_confirmacao_pendente(self) -> None:
         pending = self.service.pending_actions.save(
@@ -474,6 +476,406 @@ class ChatRuntimeServiceTest(unittest.IsolatedAsyncioTestCase):
         payload = self.laravel_client.create_fatura.await_args.kwargs["payload"]
         self.assertEqual(payload["data_vencimento"], "2026-04-20")
         self.assertFalse(payload["emitir_nfse"])
+
+    async def test_complemento_de_itens_em_rascunho_de_fatura_mapeia_item_por_linguagem_natural(self) -> None:
+        self.service.pending_actions.save(
+            action="gerar_fatura",
+            records=[
+                {
+                    "periodo_referencia": "2026-04",
+                    "data_vencimento": "2026-04-25",
+                }
+            ],
+            user_id=7,
+            session_id="sessao-itens-pendentes",
+            metadata={
+                "state": "draft",
+                "pending_fields": ["cliente_missing", "itens_missing"],
+                "fonte": "langchain-runtime",
+            },
+        )
+
+        self.service.router.route = AsyncMock(
+            return_value=RouteDecision(
+                tipo_interacao="acao_operacional",
+                dominio="faturamento",
+                acao_sugerida="gerar_fatura",
+                precisa_confirmacao=True,
+            )
+        )
+        self.service.action_planner.plan = AsyncMock(
+            return_value=ActionPlan(
+                mensagem="Complemento recebido.",
+                acao_sugerida="gerar_fatura",
+                dados_mapeados=[],
+            )
+        )
+
+        response = await self.service.process_chat(
+            ChatPayload(
+                mensagem="item: exame",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-itens-pendentes",
+            )
+        )
+
+        self.assertEqual(response.acao_sugerida, "gerar_fatura")
+        self.assertIsNotNone(response.dados_estruturados)
+        draft_record = response.dados_estruturados.dados_mapeados[0]
+        self.assertEqual(draft_record["_itens_payload"][0]["descricao"], "exame")
+        self.assertIn("cliente_missing", response.dados_estruturados.metadata["runtime_pending_fields"])
+
+    async def test_pergunta_nova_descarta_rascunho_de_fatura_em_vez_de_entrar_em_loop(self) -> None:
+        pending = self.service.pending_actions.save(
+            action="gerar_fatura",
+            records=[
+                {
+                    "cliente": "ALPHA SISTEMAS LTDA",
+                    "periodo_referencia": "2026-04",
+                    "data_vencimento": "2026-04-25",
+                }
+            ],
+            user_id=7,
+            session_id="sessao-loop-fatura",
+            metadata={
+                "state": "draft",
+                "pending_fields": ["cliente_missing", "itens_missing"],
+                "fonte": "langchain-runtime",
+            },
+        )
+
+        self.service.router.route = AsyncMock(
+            return_value=RouteDecision(
+                tipo_interacao="ambigua",
+                dominio="cadastros",
+                acao_sugerida="nenhuma",
+                mensagem_roteamento="Posso buscar os clientes fora de São Paulo na base.",
+            )
+        )
+
+        response = await self.service.process_chat(
+            ChatPayload(
+                mensagem="quero saber quais clientes não são da cidade de são paulo",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-loop-fatura",
+            )
+        )
+
+        self.assertEqual(response.mensagem, "Posso buscar os clientes fora de São Paulo na base.")
+        self.assertIsNone(response.acao_sugerida)
+        self.assertIsNone(self.service.pending_actions.get(pending.action_id))
+
+    async def test_repeticao_do_mesmo_rascunho_adiciona_alerta_anti_loop(self) -> None:
+        self.service.pending_actions.save(
+            action="gerar_fatura",
+            records=[
+                {
+                    "periodo_referencia": "2026-04",
+                    "data_vencimento": "2026-04-25",
+                }
+            ],
+            user_id=7,
+            session_id="sessao-anti-loop",
+            metadata={
+                "state": "draft",
+                "pending_fields": ["cliente_missing", "itens_missing"],
+                "fonte": "langchain-runtime",
+            },
+        )
+
+        self.service.router.route = AsyncMock(
+            return_value=RouteDecision(
+                tipo_interacao="acao_operacional",
+                dominio="faturamento",
+                acao_sugerida="gerar_fatura",
+                precisa_confirmacao=True,
+            )
+        )
+        self.service.action_planner.plan = AsyncMock(
+            return_value=ActionPlan(
+                mensagem="Complemento recebido.",
+                acao_sugerida="gerar_fatura",
+                dados_mapeados=[],
+            )
+        )
+
+        first = await self.service.process_chat(
+            ChatPayload(
+                mensagem="cliente: ALPHA SISTEMAS LTDA",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-anti-loop",
+            )
+        )
+        second = await self.service.process_chat(
+            ChatPayload(
+                mensagem="cliente: ALPHA SISTEMAS LTDA",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-anti-loop",
+            )
+        )
+
+        self.assertIn("Me informe", first.mensagem)
+        self.assertIn("Ainda nao consegui avançar esse rascunho", second.mensagem)
+
+    async def test_circuit_breaker_suspende_rascunho_sem_progresso_repetido(self) -> None:
+        self.service.pending_actions.save(
+            action="gerar_fatura",
+            records=[
+                {
+                    "periodo_referencia": "2026-04",
+                    "data_vencimento": "2026-04-25",
+                }
+            ],
+            user_id=7,
+            session_id="sessao-circuit-breaker",
+            metadata={
+                "state": "draft",
+                "pending_fields": ["cliente_missing", "itens_missing"],
+                "fonte": "langchain-runtime",
+            },
+        )
+
+        self.service.router.route = AsyncMock(
+            return_value=RouteDecision(
+                tipo_interacao="acao_operacional",
+                dominio="faturamento",
+                acao_sugerida="gerar_fatura",
+                precisa_confirmacao=True,
+            )
+        )
+        self.service.action_planner.plan = AsyncMock(
+            return_value=ActionPlan(
+                mensagem="Complemento recebido.",
+                acao_sugerida="gerar_fatura",
+                dados_mapeados=[],
+            )
+        )
+
+        for _ in range(2):
+            await self.service.process_chat(
+                ChatPayload(
+                    mensagem="cliente: ALPHA SISTEMAS LTDA",
+                    user_id=7,
+                    user_name="Renan",
+                    user_email="renan@example.com",
+                    session_id="sessao-circuit-breaker",
+                )
+            )
+
+        with self.assertLogs("agent_runtime.audit", level="INFO") as captured:
+            third = await self.service.process_chat(
+                ChatPayload(
+                    mensagem="cliente: ALPHA SISTEMAS LTDA",
+                    user_id=7,
+                    user_name="Renan",
+                    user_email="renan@example.com",
+                    session_id="sessao-circuit-breaker",
+                )
+            )
+
+        self.assertIn("Suspendi este rascunho de fatura", third.mensagem)
+        self.assertIsNone(third.acao_sugerida)
+        self.assertIsNone(third.dados_estruturados)
+        self.assertIsNone(
+            self.service.pending_actions.latest_for_session(
+                user_id=7,
+                session_id="sessao-circuit-breaker",
+                states={"draft", "pending_confirmation"},
+            )
+        )
+        suspended = self.service.pending_actions.latest_for_session(
+            user_id=7,
+            session_id="sessao-circuit-breaker",
+            states={"suspended"},
+        )
+        self.assertIsNotNone(suspended)
+        self.assertEqual(suspended.metadata["suspend_reason"], "max_repeat_count")
+
+        joined = "\n".join(captured.output)
+        self.assertIn('"event": "circuit_breaker_triggered"', joined)
+        self.assertIn('"decision": "max_repeat_count"', joined)
+        self.assertIn('"state_to": "suspended"', joined)
+
+    def test_classificador_local_impede_router_de_reabrir_fatura_em_pergunta_nova(self) -> None:
+        local_intent = self.service._classify_local_intent(
+            message="quantos clientes tenho na base?",
+            has_pending=True,
+        )
+        overridden = self.service._apply_local_intent_override(
+            route=RouteDecision(
+                tipo_interacao="acao_operacional",
+                dominio="faturamento",
+                acao_sugerida="gerar_fatura",
+                precisa_confirmacao=True,
+            ),
+            local_intent=local_intent,
+        )
+
+        self.assertEqual(local_intent, "new_query")
+        self.assertEqual(overridden.tipo_interacao, "consulta_operacional")
+        self.assertEqual(overridden.acao_sugerida, "nenhuma")
+
+    async def test_confirmacao_duplicada_reutiliza_resultado_sem_reexecutar(self) -> None:
+        pending = self.service.pending_actions.save(
+            action="gerar_fatura",
+            records=[
+                {
+                    "cliente_id": 101,
+                    "periodo_referencia": "2026-03",
+                    "data_vencimento": "2026-04-10",
+                    "gerar_boleto": True,
+                    "emitir_nfse": True,
+                    "codigo_servico": "17.01",
+                    "_itens_payload": [
+                        {
+                            "descricao": "PCMSO mensal",
+                            "quantidade": 1,
+                            "valor_unitario": 1500.0,
+                        }
+                    ],
+                }
+            ],
+            user_id=7,
+            session_id="sessao-idempotencia",
+            metadata={
+                "state": "pending_confirmation",
+                "fonte": "langchain-runtime",
+            },
+        )
+
+        payload = ResumePayload(
+            acao="gerar_fatura",
+            metadata={
+                "runtime_pending_action_id": pending.action_id,
+                "runtime_requires_confirmation": True,
+            },
+            decision="approve",
+            session_id="sessao-idempotencia",
+            user_id=7,
+            user_name="Renan",
+            user_email="renan@example.com",
+        )
+
+        first = await self.service.confirm_action(payload)
+        second = await self.service.confirm_action(payload)
+
+        self.assertTrue(first["success"])
+        self.assertEqual(first, second)
+        self.laravel_client.create_fatura.assert_awaited_once()
+        completed = self.service.pending_actions.get(pending.action_id)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.metadata["state"], "completed")
+        self.assertEqual(
+            completed.metadata["completed_result"]["message"],
+            first["message"],
+        )
+
+    async def test_auditoria_registra_supersede_quando_usuario_muda_de_assunto(self) -> None:
+        self.service.pending_actions.save(
+            action="gerar_fatura",
+            records=[
+                {
+                    "cliente": "ALPHA SISTEMAS LTDA",
+                    "periodo_referencia": "2026-04",
+                    "data_vencimento": "2026-04-25",
+                }
+            ],
+            user_id=7,
+            session_id="sessao-auditoria-supersede",
+            metadata={
+                "state": "draft",
+                "pending_fields": ["cliente_missing", "itens_missing"],
+                "fonte": "langchain-runtime",
+            },
+        )
+
+        self.service.router.route = AsyncMock(
+            return_value=RouteDecision(
+                tipo_interacao="ambigua",
+                dominio="cadastros",
+                acao_sugerida="nenhuma",
+                mensagem_roteamento="Posso buscar os clientes fora de São Paulo na base.",
+            )
+        )
+
+        with self.assertLogs("agent_runtime.audit", level="INFO") as captured:
+            await self.service.process_chat(
+                ChatPayload(
+                    mensagem="quero saber quais clientes não são da cidade de são paulo",
+                    user_id=7,
+                    user_name="Renan",
+                    user_email="renan@example.com",
+                    session_id="sessao-auditoria-supersede",
+                )
+            )
+
+        joined = "\n".join(captured.output)
+        self.assertIn('"event": "draft_resolution"', joined)
+        self.assertIn('"decision": "supersede"', joined)
+        self.assertIn('"session_id": "sessao-auditoria-supersede"', joined)
+        self.assertIn('"state_from": "draft"', joined)
+        self.assertIn('"state_to": "superseded"', joined)
+
+    async def test_auditoria_registra_replay_de_confirmacao_concluida(self) -> None:
+        pending = self.service.pending_actions.save(
+            action="gerar_fatura",
+            records=[
+                {
+                    "cliente_id": 101,
+                    "periodo_referencia": "2026-03",
+                    "data_vencimento": "2026-04-10",
+                    "gerar_boleto": True,
+                    "emitir_nfse": True,
+                    "codigo_servico": "17.01",
+                    "_itens_payload": [
+                        {
+                            "descricao": "PCMSO mensal",
+                            "quantidade": 1,
+                            "valor_unitario": 1500.0,
+                        }
+                    ],
+                }
+            ],
+            user_id=7,
+            session_id="sessao-auditoria-replay",
+            metadata={
+                "state": "pending_confirmation",
+                "fonte": "langchain-runtime",
+            },
+        )
+
+        payload = ResumePayload(
+            acao="gerar_fatura",
+            metadata={
+                "runtime_pending_action_id": pending.action_id,
+                "runtime_requires_confirmation": True,
+            },
+            decision="approve",
+            session_id="sessao-auditoria-replay",
+            user_id=7,
+            user_name="Renan",
+            user_email="renan@example.com",
+        )
+
+        await self.service.confirm_action(payload)
+
+        with self.assertLogs("agent_runtime.audit", level="INFO") as captured:
+            replay = await self.service.confirm_action(payload)
+
+        joined = "\n".join(captured.output)
+        self.assertTrue(replay["success"])
+        self.assertIn('"event": "confirmation_replayed"', joined)
+        self.assertIn('"decision": "reuse_completed_result"', joined)
+        self.assertIn('"session_id": "sessao-auditoria-replay"', joined)
+        self.assertIn('"state_to": "completed"', joined)
 
 
 if __name__ == "__main__":

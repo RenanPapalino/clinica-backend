@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from fastapi import Depends, FastAPI, Header
+from fastapi import Depends, FastAPI, Header, Query
+from fastapi.responses import PlainTextResponse
 
 from .auth import authorize_request
 from .laravel_client import LaravelInternalClient
@@ -96,3 +97,46 @@ async def chat_resume(
     service: ChatRuntimeService = Depends(get_runtime_service),
 ) -> dict:
     return await service.confirm_action(payload)
+
+
+@app.get("/internal/diagnostics/pending-actions", dependencies=[Depends(auth_dependency)])
+async def pending_actions_diagnostics(
+    user_id: int | None = Query(default=None),
+    session_id: str | None = Query(default=None),
+    states: str | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=200),
+    service: ChatRuntimeService = Depends(get_runtime_service),
+) -> dict[str, object]:
+    state_filters = {
+        normalized
+        for normalized in [
+            str(value or "").strip()
+            for value in (states.split(",") if states else [])
+        ]
+        if normalized
+    }
+    return service.get_pending_action_diagnostics(
+        user_id=user_id,
+        session_id=session_id,
+        states=state_filters or None,
+        limit=limit,
+    )
+
+
+@app.get(
+    "/internal/diagnostics/metrics",
+    dependencies=[Depends(auth_dependency)],
+    response_model=None,
+)
+async def runtime_metrics_diagnostics(
+    format: str = Query(default="json"),
+    service: ChatRuntimeService = Depends(get_runtime_service),
+) -> object:
+    normalized_format = str(format or "json").strip().lower()
+    if normalized_format == "prometheus":
+        return PlainTextResponse(
+            service.render_runtime_metrics_prometheus(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
+    return service.get_runtime_metrics()

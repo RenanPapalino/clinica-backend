@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     debug: bool = False
     pending_actions_backend: str = Field(default="auto")
     pending_actions_ttl_minutes: int = Field(default=30)
+    pending_actions_max_repeat_count: int = Field(default=2)
     pending_actions_db_path: str = Field(default=".runtime/pending_actions.sqlite3")
     pending_actions_database_url: str = Field(default="")
 
@@ -59,6 +60,15 @@ class Settings(BaseSettings):
         if normalized in {"auto", "memory", "sqlite", "postgres"}:
             return normalized
         return "auto"
+
+    @field_validator("pending_actions_max_repeat_count", mode="before")
+    @classmethod
+    def normalize_pending_actions_max_repeat_count(cls, value):
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            return 2
+        return max(1, normalized)
 
 
 @lru_cache

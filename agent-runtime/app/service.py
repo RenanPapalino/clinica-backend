@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import logging
 import re
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from threading import Lock
 from typing import Any
 
 from langchain.agents import create_agent
@@ -30,6 +32,7 @@ from .settings import Settings
 from .tools import build_read_tools
 
 logger = logging.getLogger(__name__)
+audit_logger = logging.getLogger("agent_runtime.audit")
 
 
 class ChatRuntimeService:
@@ -51,6 +54,19 @@ class ChatRuntimeService:
         self.openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
         self.router = ConversationRouter(self.chat_model)
         self.action_planner = ActionPlanner(self.chat_model)
+        self._metrics_started_at = datetime.now(timezone.utc)
+        self._metrics_lock = Lock()
+        self._metrics_counters: dict[str, int] = {
+            "audit_events_total": 0,
+            "draft_superseded": 0,
+            "draft_cancelled": 0,
+            "pending_rejected": 0,
+            "confirmation_executed": 0,
+            "confirmation_replayed": 0,
+            "circuit_breaker_triggered": 0,
+            "repeated_pending_saved": 0,
+        }
+        self._metrics_event_counts: dict[str, int] = {}
 
     async def process_chat(self, payload: ChatPayload) -> ChatbotResponse:
         if not self.settings.openai_api_key:
@@ -74,6 +90,20 @@ class ChatRuntimeService:
                 message=payload.mensagem or "",
                 parsed_file=parsed_file,
             ):
+                self._audit_session_decision(
+                    event="pending_resolution",
+                    user_id=payload.user_id,
+                    session_id=payload.session_id,
+                    action=self._canonical_action(session_draft.action) if session_draft else None,
+                    state_from=self._pending_state(session_draft),
+                    state_to="cancelled",
+                    decision="reject",
+                    pending_action_id=session_draft.action_id if session_draft else None,
+                    pending_fields=list((session_draft.metadata or {}).get("pending_fields") or [])
+                    if session_draft
+                    else None,
+                    message=payload.mensagem or "",
+                )
                 confirmation = await self.confirm_action(
                     ResumePayload(
                         acao=session_draft.action,
@@ -96,6 +126,18 @@ class ChatRuntimeService:
                 message=payload.mensagem or "",
             )
             if draft_resolution == "cancel" and session_draft is not None:
+                self._audit_session_decision(
+                    event="draft_resolution",
+                    user_id=payload.user_id,
+                    session_id=payload.session_id,
+                    action=self._canonical_action(session_draft.action),
+                    state_from=self._pending_state(session_draft),
+                    state_to="cancelled",
+                    decision="cancel",
+                    pending_action_id=session_draft.action_id,
+                    pending_fields=list((session_draft.metadata or {}).get("pending_fields") or []),
+                    message=payload.mensagem or "",
+                )
                 self.pending_actions.pop(session_draft.action_id)
                 return ChatbotResponse(
                     mensagem="Tudo bem. Cancelei a pendencia desta sessao. Como posso ajudar agora?",
@@ -131,7 +173,36 @@ class ChatRuntimeService:
             )
             if updated_pending_preview is not None:
                 return updated_pending_preview
+            if draft_resolution == "supersede" and session_draft is not None:
+                self._audit_session_decision(
+                    event="draft_resolution",
+                    user_id=payload.user_id,
+                    session_id=payload.session_id,
+                    action=self._canonical_action(session_draft.action),
+                    state_from=self._pending_state(session_draft),
+                    state_to="superseded",
+                    decision="supersede",
+                    pending_action_id=session_draft.action_id,
+                    pending_fields=list((session_draft.metadata or {}).get("pending_fields") or []),
+                    message=payload.mensagem or "",
+                )
+                self.pending_actions.pop(session_draft.action_id)
+                session_draft = None
             if draft_resolution == "ignore":
+                self._audit_session_decision(
+                    event="draft_resolution",
+                    user_id=payload.user_id,
+                    session_id=payload.session_id,
+                    action=self._canonical_action(session_draft.action) if session_draft else None,
+                    state_from=self._pending_state(session_draft),
+                    state_to=self._pending_state(session_draft),
+                    decision="ignore",
+                    pending_action_id=session_draft.action_id if session_draft else None,
+                    pending_fields=list((session_draft.metadata or {}).get("pending_fields") or [])
+                    if session_draft
+                    else None,
+                    message=payload.mensagem or "",
+                )
                 session_draft = None
 
             current_message = build_current_message(
@@ -157,9 +228,24 @@ class ChatRuntimeService:
             if cnpj_lookup_response is not None:
                 return cnpj_lookup_response
 
+            local_intent = self._classify_local_intent(
+                message=payload.mensagem or "",
+                has_pending=session_draft is not None,
+            )
             route = await self.router.route(
                 session_context=session_context,
                 current_message=current_message,
+            )
+            route = self._apply_local_intent_override(route=route, local_intent=local_intent)
+            self._audit_session_decision(
+                event="route_decision",
+                user_id=payload.user_id,
+                session_id=payload.session_id,
+                action=route.acao_sugerida,
+                state_from=self._pending_state(session_draft),
+                decision=local_intent,
+                route=route,
+                message=payload.mensagem or "",
             )
 
             logger.info(
@@ -242,6 +328,18 @@ class ChatRuntimeService:
         decision = (payload.decision or "approve").lower().strip()
         if decision != "approve":
             action_id = str(payload.metadata.get("runtime_pending_action_id") or "").strip()
+            pending = self.pending_actions.get(action_id) if action_id else None
+            self._audit_session_decision(
+                event="confirmation_rejected",
+                user_id=payload.user_id,
+                session_id=payload.session_id,
+                action=self._canonical_action(payload.acao),
+                state_from=self._pending_state(pending),
+                state_to="cancelled",
+                decision=decision or "reject",
+                pending_action_id=action_id or None,
+                pending_fields=list((pending.metadata or {}).get("pending_fields") or []) if pending else None,
+            )
             if action_id:
                 self.pending_actions.pop(action_id)
             return {
@@ -261,8 +359,38 @@ class ChatRuntimeService:
                 "detalhes": None,
             }
 
+        action_id = str(payload.metadata.get("runtime_pending_action_id") or "").strip()
+        pending = self.pending_actions.get(action_id) if action_id else None
+        completed_result = self._load_completed_confirmation_result(
+            action_id=action_id,
+            user_id=payload.user_id,
+        )
+        if completed_result is not None:
+            self._audit_session_decision(
+                event="confirmation_replayed",
+                user_id=payload.user_id,
+                session_id=payload.session_id,
+                action=action,
+                state_from=self._pending_state(pending) or "completed",
+                state_to="completed",
+                decision="reuse_completed_result",
+                pending_action_id=action_id or None,
+            )
+            return completed_result
+
         pending_fields = list(payload.metadata.get("runtime_pending_fields") or [])
         if payload.metadata.get("runtime_requires_more_info") or payload.metadata.get("runtime_draft_action_id"):
+            self._audit_session_decision(
+                event="confirmation_blocked",
+                user_id=payload.user_id,
+                session_id=payload.session_id,
+                action=action,
+                state_from=self._pending_state(pending),
+                state_to=self._pending_state(pending),
+                decision="missing_info",
+                pending_action_id=action_id or None,
+                pending_fields=pending_fields,
+            )
             return {
                 "success": False,
                 "message": self._build_pending_message(action, pending_fields, records=list(payload.dados or [])),
@@ -275,13 +403,22 @@ class ChatRuntimeService:
             }
 
         records = list(payload.dados or [])
-        action_id = str(payload.metadata.get("runtime_pending_action_id") or "").strip()
         if not records and action_id:
             pending = self.pending_actions.get(action_id)
             if pending is not None and pending.user_id == payload.user_id:
                 records = list(pending.records)
 
         if not records:
+            self._audit_session_decision(
+                event="confirmation_blocked",
+                user_id=payload.user_id,
+                session_id=payload.session_id,
+                action=action,
+                state_from=self._pending_state(pending),
+                state_to=self._pending_state(pending),
+                decision="empty_records",
+                pending_action_id=action_id or None,
+            )
             return {
                 "success": False,
                 "message": "Nenhum registro disponivel para confirmar.",
@@ -320,9 +457,6 @@ class ChatRuntimeService:
             except Exception as exc:
                 errors.append(f"Linha {index}: {exc}")
 
-        if action_id:
-            self.pending_actions.pop(action_id)
-
         total_created = len(created)
         total_errors = len(errors)
         success = total_created > 0 and total_errors == 0
@@ -352,7 +486,7 @@ class ChatRuntimeService:
             errors=errors,
         )
 
-        return {
+        result = {
             "success": success or total_created > 0,
             "message": message,
             "detalhes": {
@@ -362,6 +496,383 @@ class ChatRuntimeService:
                 "erros_lista": errors[:5],
             },
         }
+
+        if action_id and total_created > 0:
+            self.pending_actions.mark_completed(action_id, result)
+
+        self._audit_session_decision(
+            event="confirmation_executed",
+            user_id=payload.user_id,
+            session_id=payload.session_id,
+            action=action,
+            state_from=self._pending_state(pending),
+            state_to="completed" if action_id and total_created > 0 else self._pending_state(pending),
+            decision="approve",
+            pending_action_id=action_id or None,
+            total_created=total_created,
+            total_errors=total_errors,
+        )
+
+        return result
+
+    def _load_completed_confirmation_result(
+        self,
+        *,
+        action_id: str,
+        user_id: int,
+    ) -> dict[str, Any] | None:
+        if not action_id:
+            return None
+
+        pending = self.pending_actions.get(action_id)
+        if pending is None or pending.user_id != user_id:
+            return None
+
+        metadata = dict(pending.metadata or {})
+        if str(metadata.get("state") or "").strip() != "completed":
+            return None
+
+        completed_result = metadata.get("completed_result")
+        if not isinstance(completed_result, dict):
+            return None
+
+        return completed_result
+
+    def get_pending_action_diagnostics(
+        self,
+        *,
+        user_id: int | None = None,
+        session_id: str | None = None,
+        states: set[str] | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        normalized_limit = max(1, min(int(limit), 200))
+        all_items = self.pending_actions.list_for_diagnostics(
+            user_id=user_id,
+            session_id=session_id,
+            states=states,
+            limit=None,
+        )
+        recent_items = all_items[:normalized_limit]
+        summary = self._pending_action_summary(all_items)
+
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "filters": {
+                "user_id": user_id,
+                "session_id": session_id,
+                "states": sorted(states) if states else [],
+                "limit": normalized_limit,
+            },
+            "summary": summary,
+            "pending_actions": [
+                self._serialize_pending_for_diagnostics(pending) for pending in recent_items
+            ],
+            "metrics": self._runtime_metrics_snapshot(),
+        }
+
+    def get_runtime_metrics(self) -> dict[str, Any]:
+        all_items = self.pending_actions.list_for_diagnostics(limit=None)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "app_name": self.settings.app_name,
+            "pending_actions_backend": self._pending_actions_backend_label(),
+            "runtime": self._runtime_metrics_snapshot(),
+            "pending_actions": self._pending_action_summary(all_items),
+        }
+
+    def render_runtime_metrics_prometheus(self) -> str:
+        metrics = self.get_runtime_metrics()
+        runtime = metrics["runtime"] if isinstance(metrics.get("runtime"), dict) else {}
+        counters = runtime.get("counters") if isinstance(runtime.get("counters"), dict) else {}
+        event_counts = runtime.get("event_counts") if isinstance(runtime.get("event_counts"), dict) else {}
+        pending_summary = (
+            metrics.get("pending_actions") if isinstance(metrics.get("pending_actions"), dict) else {}
+        )
+        counts_by_state = (
+            pending_summary.get("counts_by_state")
+            if isinstance(pending_summary.get("counts_by_state"), dict)
+            else {}
+        )
+        counts_by_action = (
+            pending_summary.get("counts_by_action")
+            if isinstance(pending_summary.get("counts_by_action"), dict)
+            else {}
+        )
+
+        lines = [
+            "# HELP agent_runtime_info Runtime metadata.",
+            "# TYPE agent_runtime_info gauge",
+            (
+                "agent_runtime_info"
+                f'{{app_name="{self._prometheus_escape_label_value(self.settings.app_name)}",'
+                f'pending_backend="{self._prometheus_escape_label_value(self._pending_actions_backend_label())}"}} 1'
+            ),
+            "# HELP agent_runtime_uptime_seconds Runtime uptime in seconds.",
+            "# TYPE agent_runtime_uptime_seconds gauge",
+            f'agent_runtime_uptime_seconds {self._prometheus_number(runtime.get("uptime_seconds"))}',
+            "# HELP agent_runtime_pending_entries Total pending action entries stored.",
+            "# TYPE agent_runtime_pending_entries gauge",
+            f'agent_runtime_pending_entries {self._prometheus_number(pending_summary.get("total_entries"))}',
+            "# HELP agent_runtime_pending_active_entries Total active draft or pending confirmation entries.",
+            "# TYPE agent_runtime_pending_active_entries gauge",
+            f'agent_runtime_pending_active_entries {self._prometheus_number(pending_summary.get("active_entries"))}',
+            "# HELP agent_runtime_pending_active_sessions Total sessions with active pending actions.",
+            "# TYPE agent_runtime_pending_active_sessions gauge",
+            f'agent_runtime_pending_active_sessions {self._prometheus_number(pending_summary.get("active_sessions"))}',
+            "# HELP agent_runtime_pending_entries_by_state Pending entries grouped by state.",
+            "# TYPE agent_runtime_pending_entries_by_state gauge",
+        ]
+
+        for state, value in sorted(counts_by_state.items()):
+            lines.append(
+                'agent_runtime_pending_entries_by_state{state="%s"} %s'
+                % (
+                    self._prometheus_escape_label_value(str(state)),
+                    self._prometheus_number(value),
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP agent_runtime_pending_entries_by_action Pending entries grouped by action.",
+                "# TYPE agent_runtime_pending_entries_by_action gauge",
+            ]
+        )
+        for action, value in sorted(counts_by_action.items()):
+            lines.append(
+                'agent_runtime_pending_entries_by_action{action="%s"} %s'
+                % (
+                    self._prometheus_escape_label_value(str(action)),
+                    self._prometheus_number(value),
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP agent_runtime_counter Runtime counters derived from audit decisions.",
+                "# TYPE agent_runtime_counter counter",
+            ]
+        )
+        for name, value in sorted(counters.items()):
+            lines.append(
+                'agent_runtime_counter{name="%s"} %s'
+                % (
+                    self._prometheus_escape_label_value(str(name)),
+                    self._prometheus_number(value),
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP agent_runtime_audit_event_total Audit events emitted by event type.",
+                "# TYPE agent_runtime_audit_event_total counter",
+            ]
+        )
+        for event, value in sorted(event_counts.items()):
+            lines.append(
+                'agent_runtime_audit_event_total{event="%s"} %s'
+                % (
+                    self._prometheus_escape_label_value(str(event)),
+                    self._prometheus_number(value),
+                )
+            )
+
+        return "\n".join(lines) + "\n"
+
+    def _audit_session_decision(
+        self,
+        *,
+        event: str,
+        user_id: int | None = None,
+        session_id: str | None = None,
+        action: str | None = None,
+        state_from: str | None = None,
+        state_to: str | None = None,
+        decision: str | None = None,
+        pending_action_id: str | None = None,
+        pending_fields: list[str] | None = None,
+        repeat_count: int | None = None,
+        total_created: int | None = None,
+        total_errors: int | None = None,
+        route: RouteDecision | None = None,
+        message: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {"event": event}
+
+        if user_id is not None:
+            payload["user_id"] = user_id
+        if session_id:
+            payload["session_id"] = session_id
+        if action:
+            payload["action"] = action
+        if state_from:
+            payload["state_from"] = state_from
+        if state_to:
+            payload["state_to"] = state_to
+        if decision:
+            payload["decision"] = decision
+        if pending_action_id:
+            payload["pending_action_id"] = pending_action_id
+        if pending_fields:
+            payload["pending_fields"] = sorted({field for field in pending_fields if field})
+        if repeat_count is not None:
+            payload["repeat_count"] = repeat_count
+        if total_created is not None:
+            payload["total_created"] = total_created
+        if total_errors is not None:
+            payload["total_errors"] = total_errors
+        if route is not None:
+            payload.update(
+                {
+                    "route_tipo_interacao": route.tipo_interacao,
+                    "route_dominio": route.dominio,
+                    "route_acao_sugerida": route.acao_sugerida,
+                }
+            )
+        if message:
+            payload["message_excerpt"] = self._audit_message_excerpt(message)
+
+        audit_logger.info("chat_audit %s", json.dumps(payload, ensure_ascii=True, sort_keys=True))
+        self._record_runtime_metric(
+            event=event,
+            decision=decision,
+            repeat_count=repeat_count,
+        )
+
+    def _record_runtime_metric(
+        self,
+        *,
+        event: str,
+        decision: str | None,
+        repeat_count: int | None,
+    ) -> None:
+        with self._metrics_lock:
+            self._metrics_counters["audit_events_total"] = (
+                self._metrics_counters.get("audit_events_total", 0) + 1
+            )
+            self._metrics_event_counts[event] = self._metrics_event_counts.get(event, 0) + 1
+
+            if event == "draft_resolution" and decision == "supersede":
+                self._metrics_counters["draft_superseded"] += 1
+            if event == "draft_resolution" and decision == "cancel":
+                self._metrics_counters["draft_cancelled"] += 1
+            if event in {"pending_resolution", "confirmation_rejected"}:
+                self._metrics_counters["pending_rejected"] += 1
+            if event == "confirmation_executed":
+                self._metrics_counters["confirmation_executed"] += 1
+            if event == "confirmation_replayed":
+                self._metrics_counters["confirmation_replayed"] += 1
+            if event == "circuit_breaker_triggered":
+                self._metrics_counters["circuit_breaker_triggered"] += 1
+            if event == "pending_saved" and int(repeat_count or 0) > 0:
+                self._metrics_counters["repeated_pending_saved"] += 1
+
+    def _runtime_metrics_snapshot(self) -> dict[str, Any]:
+        uptime_seconds = max(
+            0.0,
+            (datetime.now(timezone.utc) - self._metrics_started_at).total_seconds(),
+        )
+        with self._metrics_lock:
+            return {
+                "started_at": self._metrics_started_at.isoformat(),
+                "uptime_seconds": round(uptime_seconds, 3),
+                "counters": dict(self._metrics_counters),
+                "event_counts": dict(self._metrics_event_counts),
+            }
+
+    def _pending_action_summary(self, items: list[Any]) -> dict[str, Any]:
+        counts_by_state: dict[str, int] = {}
+        counts_by_action: dict[str, int] = {}
+        active_sessions: set[str] = set()
+
+        for pending in items:
+            state = self._pending_state(pending) or "unknown"
+            counts_by_state[state] = counts_by_state.get(state, 0) + 1
+            action = self._canonical_action(getattr(pending, "action", None)) or self._as_string(
+                getattr(pending, "action", None)
+            )
+            if action:
+                counts_by_action[action] = counts_by_action.get(action, 0) + 1
+            if state in {"draft", "pending_confirmation"} and getattr(pending, "session_id", None):
+                active_sessions.add(str(getattr(pending, "session_id")))
+
+        return {
+            "total_entries": len(items),
+            "active_entries": sum(
+                1
+                for pending in items
+                if (self._pending_state(pending) or "") in {"draft", "pending_confirmation"}
+            ),
+            "active_sessions": len(active_sessions),
+            "counts_by_state": counts_by_state,
+            "counts_by_action": counts_by_action,
+        }
+
+    def _serialize_pending_for_diagnostics(self, pending: Any) -> dict[str, Any]:
+        metadata = dict((pending.metadata or {}) if pending is not None else {})
+        state = self._pending_state(pending) or "unknown"
+        sanitized_metadata = {
+            key: value
+            for key, value in metadata.items()
+            if key not in {"completed_result"}
+        }
+        if "completed_result" in metadata:
+            sanitized_metadata["has_completed_result"] = True
+
+        return {
+            "action_id": self._as_string(getattr(pending, "action_id", None)),
+            "action": self._canonical_action(getattr(pending, "action", None))
+            or self._as_string(getattr(pending, "action", None)),
+            "user_id": self._to_int(getattr(pending, "user_id", None)),
+            "session_id": self._as_string(getattr(pending, "session_id", None)),
+            "state": state,
+            "pending_fields": list(metadata.get("pending_fields") or []),
+            "repeat_count": int(metadata.get("repeat_count") or 0),
+            "record_count": len(list(getattr(pending, "records", []) or [])),
+            "created_at": getattr(pending, "created_at", None).isoformat()
+            if getattr(pending, "created_at", None) is not None
+            else None,
+            "metadata": sanitized_metadata,
+        }
+
+    def _pending_actions_backend_label(self) -> str:
+        name = self.pending_actions.__class__.__name__.lower()
+        if "postgres" in name:
+            return "postgres"
+        if "sqlite" in name:
+            return "sqlite"
+        if "pendingactionstore" in name:
+            return "memory"
+        return name or "unknown"
+
+    def _prometheus_escape_label_value(self, value: str) -> str:
+        return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+    def _prometheus_number(self, value: Any) -> str:
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float):
+            return f"{value:.3f}".rstrip("0").rstrip(".") or "0"
+        parsed = self._parse_decimal(value)
+        if parsed is not None:
+            return f"{parsed:.3f}".rstrip("0").rstrip(".") or "0"
+        return "0"
+
+    def _audit_message_excerpt(self, message: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(message or "").strip())
+        if len(normalized) <= 160:
+            return normalized
+        return normalized[:157] + "..."
+
+    def _pending_state(self, pending: Any | None) -> str | None:
+        if pending is None:
+            return None
+
+        state = str((pending.metadata or {}).get("state") or "").strip()
+        return state or None
 
     async def _load_session_context(self, payload: ChatPayload) -> dict[str, Any]:
         try:
@@ -785,7 +1296,7 @@ class ChatRuntimeService:
         if not records:
             message = plan.mensagem or "Nao encontrei dados suficientes para preparar a acao."
             if pending_hints:
-                draft = self.pending_actions.save(
+                draft = self._save_pending_action(
                     action=action,
                     records=[],
                     user_id=payload.user_id,
@@ -796,8 +1307,19 @@ class ChatRuntimeService:
                         "pending_fields": pending_hints,
                     },
                 )
+                suspended_response = self._build_suspended_pending_response(
+                    action=action,
+                    pending=draft,
+                )
+                if suspended_response is not None:
+                    return suspended_response
                 return ChatbotResponse(
-                    mensagem=self._build_pending_message(action, pending_hints, records=[]),
+                    mensagem=self._build_pending_message(
+                        action,
+                        pending_hints,
+                        records=[],
+                        repeat_count=int((draft.metadata or {}).get("repeat_count") or 0),
+                    ),
                     acao_sugerida=action,
                     dados_estruturados=StructuredData(
                         tipo=self._action_type(action),
@@ -847,7 +1369,7 @@ class ChatRuntimeService:
             if auto_cliente_preview is not None:
                 return auto_cliente_preview
 
-            draft = self.pending_actions.save(
+            draft = self._save_pending_action(
                 action=action,
                 records=normalized_records,
                 user_id=payload.user_id,
@@ -858,7 +1380,18 @@ class ChatRuntimeService:
                     "pending_fields": pending_fields,
                 },
             )
-            message = self._build_pending_message(action, pending_fields, records=normalized_records)
+            suspended_response = self._build_suspended_pending_response(
+                action=action,
+                pending=draft,
+            )
+            if suspended_response is not None:
+                return suspended_response
+            message = self._build_pending_message(
+                action,
+                pending_fields,
+                records=normalized_records,
+                repeat_count=int((draft.metadata or {}).get("repeat_count") or 0),
+            )
             return ChatbotResponse(
                 mensagem=message,
                 acao_sugerida=action,
@@ -879,7 +1412,7 @@ class ChatRuntimeService:
                 ),
             )
 
-        pending = self.pending_actions.save(
+        pending = self._save_pending_action(
             action=action,
             records=normalized_records,
             user_id=payload.user_id,
@@ -929,7 +1462,7 @@ class ChatRuntimeService:
             return None
 
         unique_pending_fields = sorted({field for field in pending_fields if field})
-        if unique_pending_fields != ["cliente"]:
+        if unique_pending_fields not in (["cliente"], ["cliente_missing"]):
             return None
 
         if any(self._cliente_candidate_labels([record]) for record in normalized_records):
@@ -944,7 +1477,7 @@ class ChatRuntimeService:
         if cliente_missing_fields:
             return None
 
-        draft = self.pending_actions.save(
+        draft = self._save_pending_action(
             action="gerar_fatura",
             records=normalized_records,
             user_id=payload.user_id,
@@ -956,13 +1489,19 @@ class ChatRuntimeService:
                 "auto_cliente_creation": True,
             },
         )
+        suspended_response = self._build_suspended_pending_response(
+            action="gerar_fatura",
+            pending=draft,
+        )
+        if suspended_response is not None:
+            return suspended_response
 
         cliente_preview_record = {
             **cliente_record,
             "_resume_fatura_draft_action_id": draft.action_id,
         }
 
-        pending = self.pending_actions.save(
+        pending = self._save_pending_action(
             action="criar_cliente",
             records=[cliente_preview_record],
             user_id=payload.user_id,
@@ -1029,7 +1568,8 @@ class ChatRuntimeService:
         if action == "criar_conta_pagar":
             return await self._normalize_conta_pagar_record(record, user_id), self._missing_pagar_fields(record)
         if action == "gerar_fatura":
-            return await self._normalize_fatura_record(record, user_id), self._missing_fatura_fields(record)
+            normalized = await self._normalize_fatura_record(record, user_id)
+            return normalized, self._missing_fatura_fields(normalized)
         return record, []
 
     async def _normalize_cliente_sync_record(
@@ -2094,7 +2634,10 @@ class ChatRuntimeService:
     def _missing_fatura_fields(self, record: dict[str, Any]) -> list[str]:
         missing: list[str] = []
         if not self._to_int(record.get("cliente_id")) and not isinstance(record.get("_auto_cliente_record"), dict):
-            missing.append("cliente")
+            if isinstance(record.get("_cliente_candidates"), list) and record.get("_cliente_candidates"):
+                missing.append("cliente_ambiguous")
+            else:
+                missing.append("cliente_missing")
         if not self._normalize_periodo_referencia(record.get("periodo_referencia")):
             missing.append("periodo_referencia")
         if not self._normalize_date(record.get("data_vencimento")):
@@ -2102,7 +2645,7 @@ class ChatRuntimeService:
 
         items = self._extract_fatura_items(record)
         if not items:
-            missing.append("itens")
+            missing.append("itens_missing")
             return missing
 
         for index, item in enumerate(items, start=1):
@@ -2297,6 +2840,7 @@ class ChatRuntimeService:
         action: str,
         pending_fields: list[str],
         records: list[dict[str, Any]] | None = None,
+        repeat_count: int = 0,
     ) -> str:
         humanized = [self._humanize_pending_field(field) for field in pending_fields if field]
         humanized = [field for field in humanized if field]
@@ -2317,16 +2861,57 @@ class ChatRuntimeService:
 
         message = f"{intro} Me informe {requested}."
 
-        if "cliente" in pending_fields:
+        if "cliente" in pending_fields or "cliente_missing" in pending_fields or "cliente_ambiguous" in pending_fields:
             candidate_labels = self._cliente_candidate_labels(records or [])
             if candidate_labels:
-                message += f" Encontrei estes clientes no cadastro: {self._join_human_values(candidate_labels)}. Responda com o ID ou CNPJ correto."
+                message += f" Encontrei estes clientes no cadastro: {self._join_human_values(candidate_labels)}. Responda apenas com o ID ou CNPJ correto."
             else:
                 cliente_referencia = self._pending_cliente_reference(records or [])
                 if cliente_referencia:
                     message += f" Recebi do arquivo: {cliente_referencia}. Se esse cliente ja existir, responda com o ID ou CNPJ cadastrado. Se nao existir, me diga para cadastrar primeiro."
 
+        if "itens_missing" in pending_fields:
+            message += " Informe pelo menos um item, por exemplo: item: exame admissional."
+
+        if repeat_count >= 1:
+            message += " Ainda nao consegui avançar esse rascunho com a ultima resposta. Se quiser mudar de assunto, envie a nova pergunta diretamente ou diga cancelar."
+
         return message
+
+    def _build_suspended_pending_response(
+        self,
+        *,
+        action: str,
+        pending: Any | None,
+    ) -> ChatbotResponse | None:
+        if pending is None:
+            return None
+
+        metadata = dict(pending.metadata or {})
+        if str(metadata.get("state") or "").strip() != "suspended":
+            return None
+
+        pending_fields = list(metadata.get("pending_fields") or [])
+        missing = [self._humanize_pending_field(field) for field in pending_fields if field]
+        missing = [field for field in missing if field]
+        missing = list(dict.fromkeys(missing))
+
+        intro = {
+            "gerar_fatura": "Suspendi este rascunho de fatura",
+            "criar_cliente": "Suspendi este rascunho de cadastro",
+            "emitir_nfse": "Suspendi este rascunho de emissao da NFS-e",
+        }.get(action, "Suspendi este rascunho")
+
+        message = f"{intro} porque ele nao avancou apos varias tentativas."
+        if missing:
+            message += f" Ainda faltavam {self._join_human_values(missing[:3])}."
+        message += " Para continuar, envie o pedido novamente com os dados principais em uma unica mensagem ou siga com outro assunto."
+
+        return ChatbotResponse(
+            mensagem=message,
+            acao_sugerida=None,
+            dados_estruturados=None,
+        )
 
     def _cliente_candidate_labels(self, records: list[dict[str, Any]]) -> list[str]:
         labels: list[str] = []
@@ -2904,6 +3489,8 @@ class ChatRuntimeService:
             "cnpj": "o CNPJ",
             "razao_social": "a razao social",
             "cliente": "o cliente",
+            "cliente_missing": "o cliente",
+            "cliente_ambiguous": "o cliente correto",
             "fatura": "a fatura",
             "titulo": "o titulo",
             "despesa": "a despesa",
@@ -2912,6 +3499,7 @@ class ChatRuntimeService:
             "data_vencimento": "a data de vencimento",
             "periodo_referencia": "o periodo de referencia",
             "itens": "os itens da fatura",
+            "itens_missing": "os itens da fatura",
             "codigo_servico": "o codigo do servico",
         }
 
@@ -2969,6 +3557,111 @@ class ChatRuntimeService:
             "pendencias": list((pending.metadata or {}).get("pending_fields") or []),
             "dados_parciais": list(pending.records or []),
         }
+
+    def _save_pending_action(
+        self,
+        *,
+        action: str,
+        records: list[dict[str, Any]],
+        user_id: int,
+        session_id: str,
+        metadata: dict[str, Any],
+    ):
+        previous = self.pending_actions.latest_for_session(
+            user_id=user_id,
+            session_id=session_id,
+            states={str(metadata.get("state") or "").strip()} if metadata.get("state") else None,
+        )
+
+        repeat_count = 0
+        if (
+            previous is not None
+            and self._canonical_action(previous.action) == action
+            and list(previous.records or []) == list(records or [])
+            and list((previous.metadata or {}).get("pending_fields") or [])
+            == list(metadata.get("pending_fields") or [])
+        ):
+            repeat_count = int((previous.metadata or {}).get("repeat_count") or 0) + 1
+            self.pending_actions.pop(previous.action_id)
+
+        state = str(metadata.get("state") or "").strip() or None
+        should_suspend = (
+            state == "draft"
+            and repeat_count >= self.settings.pending_actions_max_repeat_count
+        )
+        final_metadata = {
+            **metadata,
+            "repeat_count": repeat_count,
+        }
+        if should_suspend:
+            final_metadata.update(
+                {
+                    "state": "suspended",
+                    "suspend_reason": "max_repeat_count",
+                    "suspended_from_state": state,
+                    "suspended_at_repeat_count": repeat_count,
+                }
+            )
+        if state in {"draft", "pending_confirmation"} or should_suspend:
+            self._clear_active_pending_for_action(
+                action=action,
+                user_id=user_id,
+                session_id=session_id,
+            )
+
+        pending = self.pending_actions.save(
+            action=action,
+            records=records,
+            user_id=user_id,
+            session_id=session_id,
+            metadata=final_metadata,
+        )
+        self._audit_session_decision(
+            event="pending_saved",
+            user_id=user_id,
+            session_id=session_id,
+            action=action,
+            state_to=str(final_metadata.get("state") or "").strip() or None,
+            decision="save_pending",
+            pending_action_id=pending.action_id,
+            pending_fields=list(final_metadata.get("pending_fields") or []),
+            repeat_count=repeat_count,
+        )
+        if should_suspend:
+            self._audit_session_decision(
+                event="circuit_breaker_triggered",
+                user_id=user_id,
+                session_id=session_id,
+                action=action,
+                state_from=state,
+                state_to="suspended",
+                decision="max_repeat_count",
+                pending_action_id=pending.action_id,
+                pending_fields=list(final_metadata.get("pending_fields") or []),
+                repeat_count=repeat_count,
+            )
+        return pending
+
+    def _clear_active_pending_for_action(
+        self,
+        *,
+        action: str,
+        user_id: int,
+        session_id: str,
+    ) -> None:
+        while True:
+            active = self.pending_actions.latest_for_session(
+                user_id=user_id,
+                session_id=session_id,
+                states={"draft", "pending_confirmation"},
+            )
+            if active is None:
+                return
+
+            if self._canonical_action(active.action) != action:
+                return
+
+            self.pending_actions.pop(active.action_id)
 
     def _should_auto_confirm_pending_action(
         self,
@@ -3178,7 +3871,7 @@ class ChatRuntimeService:
         self.pending_actions.pop(pending.action_id)
 
         next_state = "draft" if pending_fields else "pending_confirmation"
-        next_pending = self.pending_actions.save(
+        next_pending = self._save_pending_action(
             action=action,
             records=normalized_records,
             user_id=payload.user_id,
@@ -3190,10 +3883,33 @@ class ChatRuntimeService:
                 "pending_fields": pending_fields,
             },
         )
+        self._audit_session_decision(
+            event="pending_confirmation_updated",
+            user_id=payload.user_id,
+            session_id=payload.session_id,
+            action=action,
+            state_from=state,
+            state_to=next_state,
+            decision="update_preview",
+            pending_action_id=next_pending.action_id,
+            pending_fields=pending_fields,
+            message=payload.mensagem or "",
+        )
+        suspended_response = self._build_suspended_pending_response(
+            action=action,
+            pending=next_pending,
+        )
+        if suspended_response is not None:
+            return suspended_response
 
         if pending_fields:
             return ChatbotResponse(
-                mensagem=self._build_pending_message(action, pending_fields, records=normalized_records),
+                mensagem=self._build_pending_message(
+                    action,
+                    pending_fields,
+                    records=normalized_records,
+                    repeat_count=int((next_pending.metadata or {}).get("repeat_count") or 0),
+                ),
                 acao_sugerida=action,
                 dados_estruturados=StructuredData(
                     tipo=self._action_type(action),
@@ -3302,7 +4018,7 @@ class ChatRuntimeService:
         draft_action = self._canonical_action(pending.action) or ""
         draft_records = list(pending.records or [])
 
-        if draft_action == "gerar_fatura" and "cliente" in pending_fields:
+        if draft_action == "gerar_fatura" and any(field in pending_fields for field in ["cliente", "cliente_missing", "cliente_ambiguous"]):
             if self._message_requests_client_creation(message):
                 return "continue"
 
@@ -3314,6 +4030,12 @@ class ChatRuntimeService:
         )
         if extracted_updates:
             return "continue"
+
+        if self._message_starts_new_request_outside_pending(
+            normalized_message=normalized,
+            action=draft_action,
+        ):
+            return "supersede"
 
         if self._message_mentions_pending_topics(
             normalized_message=normalized,
@@ -3464,7 +4186,7 @@ class ChatRuntimeService:
             return plan
 
         pending_fields = list((session_draft.metadata or {}).get("pending_fields") or [])
-        if "cliente" not in pending_fields:
+        if not any(field in pending_fields for field in ["cliente", "cliente_missing", "cliente_ambiguous"]):
             return plan
 
         if not self._message_requests_client_creation(payload.mensagem or ""):
@@ -3549,7 +4271,7 @@ class ChatRuntimeService:
             if self._message_mentions_period_update(text) and (periodo := self._extract_period_from_text(text)):
                 updates["periodo_referencia"] = periodo
 
-        if "cliente" in pending_fields:
+        if any(field in pending_fields for field in ["cliente", "cliente_missing", "cliente_ambiguous"]):
             if cliente_id := self._extract_named_id(text, label="id"):
                 updates["cliente_id"] = cliente_id
             if cliente_cnpj := self._extract_document_from_text(text, required_length=14):
@@ -3557,6 +4279,21 @@ class ChatRuntimeService:
             cliente_nome = self._extract_cliente_name_from_text(text)
             if cliente_nome and "cliente_id" not in updates and "cliente_cnpj" not in updates:
                 updates["cliente"] = cliente_nome
+
+        if any(field in pending_fields for field in ["itens", "itens_missing"]):
+            item_descricao = self._extract_fatura_item_description_from_message(text)
+            item_valores = self._extract_contextual_currency_values_from_text(text)
+            if item_descricao or item_valores:
+                for record in base_records:
+                    items = [dict(item) for item in self._extract_fatura_items(record)]
+                    if not items:
+                        items = [{"quantidade": 1}]
+                    if item_descricao:
+                        items[0]["descricao"] = item_descricao
+                    if item_valores:
+                        items[0]["valor_unitario"] = item_valores[0]
+                    record["_itens_payload"] = items
+                    mutated_records = True
 
         if "cnpj" in pending_fields:
             if cnpj := self._extract_document_from_text(text, required_length=14):
@@ -3775,10 +4512,12 @@ class ChatRuntimeService:
                 if self._extract_period_from_text(normalized_message):
                     return True
                 terms.update({"periodo", "período", "competencia", "competência", "mes", "mês"})
-            elif field == "cliente":
+            elif field in {"cliente", "cliente_missing", "cliente_ambiguous"}:
                 if self._extract_document_from_text(normalized_message, required_length=14):
                     return True
-                terms.update({"cliente", "empresa", "cnpj", "id", "cadastre"})
+                if self._extract_cliente_name_from_text(normalized_message):
+                    return True
+                terms.update({"cnpj", "id", "cadastre"})
             elif field == "cnpj":
                 if self._extract_document_from_text(normalized_message, required_length=14):
                     return True
@@ -3791,12 +4530,126 @@ class ChatRuntimeService:
                 terms.update({"valor", "preco", "preço", "r$"})
             elif field == "descricao":
                 terms.update({"descricao", "descrição", "historico", "histórico"})
+            elif field in {"itens", "itens_missing"}:
+                if self._extract_fatura_item_description_from_message(normalized_message):
+                    return True
+                terms.update({"item", "itens", "exame", "exames", "servico", "serviço"})
             elif field.startswith("item_") and field.endswith(".valor_unitario"):
                 if self._extract_currency_values_from_text(normalized_message):
                     return True
                 terms.update({"item", "itens", "valor", "valores", "exame", "exames", "r$"})
 
         return any(term in normalized_message for term in terms)
+
+    def _message_starts_new_request_outside_pending(
+        self,
+        *,
+        normalized_message: str,
+        action: str,
+    ) -> bool:
+        if not normalized_message:
+            return False
+
+        if self._is_plain_greeting(normalized_message) or self._is_low_signal_message(normalized_message):
+            return False
+
+        if normalized_message.endswith("?"):
+            return True
+
+        if normalized_message.startswith(
+            (
+                "quantos ",
+                "quais ",
+                "qual ",
+                "quem ",
+                "onde ",
+                "quando ",
+                "quanto ",
+                "quero saber ",
+                "me mostre ",
+                "listar ",
+                "liste ",
+                "busque ",
+                "buscar ",
+                "procure ",
+                "pesquise ",
+            )
+        ):
+            return True
+
+        if action == "gerar_fatura" and any(
+            term in normalized_message
+            for term in [
+                "gere a nfse",
+                "gerar nfse",
+                "emitir nfse",
+                "nfs-e do cliente",
+                "nfse do cliente",
+                "quantos clientes",
+                "quais cliente",
+                "quais clientes",
+            ]
+        ):
+            return True
+
+        return False
+
+    def _classify_local_intent(self, *, message: str, has_pending: bool) -> str:
+        normalized = self._normalize_free_text(message)
+        if not normalized:
+            return "empty"
+
+        if self._message_approves_pending_action(message):
+            return "confirm"
+
+        if self._message_rejects_pending_action(message) or self._message_cancels_pending_draft(normalized):
+            return "reject"
+
+        if has_pending and self._message_starts_new_request_outside_pending(
+            normalized_message=normalized,
+            action="gerar_fatura",
+        ):
+            return "new_query"
+
+        if normalized.endswith("?") or normalized.startswith(
+            (
+                "quantos ",
+                "quais ",
+                "qual ",
+                "quem ",
+                "onde ",
+                "quando ",
+                "quanto ",
+                "quero saber ",
+                "me mostre ",
+                "listar ",
+                "liste ",
+                "busque ",
+                "buscar ",
+                "procure ",
+                "pesquise ",
+            )
+        ):
+            return "query"
+
+        return "operational"
+
+    def _apply_local_intent_override(self, *, route: RouteDecision, local_intent: str) -> RouteDecision:
+        if local_intent not in {"query", "new_query"}:
+            return route
+
+        if route.tipo_interacao == "ambigua" and route.mensagem_roteamento.strip():
+            return route
+
+        normalized_domain = "cadastros" if route.dominio == "cadastros" else "geral"
+        return RouteDecision(
+            tipo_interacao="consulta_operacional",
+            dominio=normalized_domain,
+            acao_sugerida="nenhuma",
+            precisa_confirmacao=False,
+            mensagem_roteamento=route.mensagem_roteamento,
+            pendencias=[],
+        )
 
     def _resolve_auto_cliente_record_for_fatura(
         self,
@@ -4111,6 +4964,24 @@ class ChatRuntimeService:
         if self._extract_date_from_text(candidate) or self._extract_document_from_text(candidate):
             return None
 
+        lowered = self._normalize_free_text(candidate)
+        if any(
+            term in lowered
+            for term in [
+                "quantos",
+                "quais",
+                "qual",
+                "quero saber",
+                "nao sao",
+                "não são",
+                "cidade de",
+                "gere a nfse",
+                "emitir nfse",
+                "nfs-e",
+            ]
+        ):
+            return None
+
         return candidate
 
     def _extract_cliente_business_name_from_message(self, message: str) -> str | None:
@@ -4138,7 +5009,7 @@ class ChatRuntimeService:
             return None
 
         patterns = [
-            r"item\s+(.+?)(?:\s+no valor|\s*,\s*valor|,\s*ger[ea]|,\s*emit[ia]|\.|$)",
+            r"item\s*[:\-]?\s*(.+?)(?:\s+no valor|\s*,\s*valor|,\s*ger[ea]|,\s*emit[ia]|\.|$)",
             r"itens?\s+realizados?\s*[:\-]?\s*(.+?)(?:\s+no valor|\.|$)",
         ]
 
