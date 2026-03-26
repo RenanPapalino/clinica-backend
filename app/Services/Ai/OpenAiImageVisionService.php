@@ -18,7 +18,7 @@ class OpenAiImageVisionService
         $imagemBase64 = base64_encode(file_get_contents($caminhoArquivo));
         $promptUsuario = trim($mensagem);
         $prompt = trim(implode("\n", array_filter([
-            'Analise a imagem enviada pelo usuário para um copiloto financeiro e operacional.',
+            'Analise a imagem enviada pelo usuário para a MedIA financeira e operacional.',
             'Retorne JSON estrito com os campos: resumo, texto_extraido, itens_relevantes, proxima_acao_sugerida.',
             'texto_extraido deve conter o texto visível mais importante na imagem.',
             'itens_relevantes deve ser um array de strings curtas com os pontos mais úteis.',

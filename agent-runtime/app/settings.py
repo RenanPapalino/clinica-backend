@@ -9,6 +9,10 @@ class Settings(BaseSettings):
     app_name: str = "medintelligence-agent-runtime"
     app_port: int = 8787
     debug: bool = False
+    pending_actions_backend: str = Field(default="auto")
+    pending_actions_ttl_minutes: int = Field(default=30)
+    pending_actions_db_path: str = Field(default=".runtime/pending_actions.sqlite3")
+    pending_actions_database_url: str = Field(default="")
 
     openai_api_key: str = Field(default="")
     openai_model: str = Field(default="gpt-4.1-mini")
@@ -47,6 +51,14 @@ class Settings(BaseSettings):
                 return False
 
         return bool(value)
+
+    @field_validator("pending_actions_backend", mode="before")
+    @classmethod
+    def normalize_pending_actions_backend(cls, value):
+        normalized = str(value or "auto").strip().lower()
+        if normalized in {"auto", "memory", "sqlite", "postgres"}:
+            return normalized
+        return "auto"
 
 
 @lru_cache

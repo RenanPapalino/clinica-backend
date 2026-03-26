@@ -6,15 +6,37 @@ from fastapi import Depends, FastAPI, Header
 
 from .auth import authorize_request
 from .laravel_client import LaravelInternalClient
-from .memory import PendingActionStore
+from .memory import (
+    PendingActionStore,
+    PendingActionStoreProtocol,
+    PostgresPendingActionStore,
+    SqlitePendingActionStore,
+)
 from .schemas import ChatPayload, ChatbotResponse, ResumePayload
 from .service import ChatRuntimeService
 from .settings import Settings, get_settings
 
 
 @lru_cache
-def get_pending_store() -> PendingActionStore:
-    return PendingActionStore()
+def get_pending_store() -> PendingActionStoreProtocol:
+    settings = get_settings()
+    backend = settings.pending_actions_backend
+    if backend == "auto":
+        backend = "postgres" if settings.pending_actions_database_url else "sqlite"
+
+    if backend == "memory":
+        return PendingActionStore(ttl_minutes=settings.pending_actions_ttl_minutes)
+
+    if backend == "postgres":
+        return PostgresPendingActionStore(
+            dsn=settings.pending_actions_database_url,
+            ttl_minutes=settings.pending_actions_ttl_minutes,
+        )
+
+    return SqlitePendingActionStore(
+        db_path=settings.pending_actions_db_path,
+        ttl_minutes=settings.pending_actions_ttl_minutes,
+    )
 
 
 @lru_cache

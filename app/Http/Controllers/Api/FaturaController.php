@@ -16,6 +16,7 @@ use App\Services\Bancos\ItauService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 use Maatwebsite\Excel\Facades\Excel;
 use App\Services\Fiscal\NfseDiretaService;
 
@@ -229,7 +230,9 @@ class FaturaController extends Controller
             'success' => $resultado['processadas'] > 0,
             'message' => $resultado['processadas'] > 0
                 ? "Processamento em lote concluído. {$resultado['processadas']} fatura(s) tratada(s)."
-                : 'Nenhuma fatura foi processada.',
+                : (!empty($resultado['erros'])
+                    ? 'Nenhuma fatura foi processada. ' . $resultado['erros'][0]
+                    : 'Nenhuma fatura foi processada.'),
             'data' => $resultado,
         ], !empty($resultado['erros']) && $resultado['processadas'] === 0 ? 422 : 200);
     }
@@ -555,19 +558,23 @@ class FaturaController extends Controller
             $mode = 'local';
             $dadosBancarios = [
                 'nosso_numero' => 'LOCAL' . str_pad((string) $titulo->id, 10, '0', STR_PAD_LEFT),
-                'codigo_barras' => $titulo->codigo_barras,
                 'linha_digitavel' => $titulo->linha_digitavel,
                 'url_boleto' => $titulo->url_boleto,
             ];
         }
 
-        $titulo->update([
+        $payload = [
             'nosso_numero' => $dadosBancarios['nosso_numero'] ?? $titulo->nosso_numero,
-            'codigo_barras' => $dadosBancarios['codigo_barras'] ?? $titulo->codigo_barras,
             'linha_digitavel' => $dadosBancarios['linha_digitavel'] ?? $titulo->linha_digitavel,
             'url_boleto' => $dadosBancarios['url_boleto'] ?? $titulo->url_boleto,
             'status' => $titulo->status === 'pago' ? 'pago' : 'aberto',
-        ]);
+        ];
+
+        if (Schema::hasColumn('titulos', 'codigo_barras')) {
+            $payload['codigo_barras'] = $dadosBancarios['codigo_barras'] ?? $titulo->codigo_barras;
+        }
+
+        $titulo->update($payload);
 
         if (in_array($fatura->status, ['emitida', 'nfse_emitida', 'aguardando_boleto'], true)) {
             $fatura->update(['status' => 'concluida']);

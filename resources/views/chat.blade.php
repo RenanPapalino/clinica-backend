@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Chat MedIntelligence</title>
+    <title>MedIA</title>
     @vite(['resources/css/app.css', 'resources/js/app.js'])
 </head>
 <body class="min-h-screen bg-stone-950 text-stone-100">
@@ -14,7 +14,7 @@
                     Chat Operacional
                 </span>
                 <h1 class="mt-3 text-3xl font-semibold tracking-tight text-white md:text-5xl">
-                    Texto, arquivo e áudio no mesmo fluxo do chatbot
+                    Texto, arquivo e áudio no mesmo fluxo da MedIA
                 </h1>
                 <p class="mt-3 text-sm leading-6 text-stone-300 md:text-base">
                     Esta tela usa as rotas reais do sistema para conversar com a IA, enviar planilhas e gravar áudio
@@ -99,7 +99,7 @@
                         <p data-chat-pending-summary class="text-sm leading-6 text-stone-200"></p>
                     </div>
                     <p data-chat-status class="text-sm leading-6 text-stone-400">
-                        Pronto para conversar com o chatbot.
+                        Pronto para conversar com a MedIA.
                     </p>
                 </div>
             </aside>
@@ -118,7 +118,7 @@
                 >
                     <article class="rounded-3xl border border-orange-400/15 bg-orange-500/8 p-4 text-sm leading-6 text-orange-50">
                         <div class="mb-2 flex items-center justify-between gap-3 text-[11px] uppercase tracking-[0.22em] text-white/45">
-                            <span>Chatbot</span>
+                            <span>MedIA</span>
                             <span>Agora</span>
                         </div>
                         <div class="whitespace-pre-wrap">
@@ -198,7 +198,7 @@
                                 data-chat-send
                                 class="rounded-full bg-emerald-400 px-6 py-3 text-sm font-semibold text-stone-950 transition hover:bg-emerald-300 disabled:cursor-not-allowed disabled:bg-stone-700 disabled:text-stone-500"
                             >
-                                Enviar para o chatbot
+                                Enviar para a MedIA
                             </button>
                         </div>
                     </div>

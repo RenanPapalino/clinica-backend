@@ -162,6 +162,8 @@ Regras:
 - Para gerar_fatura, cada registro representa uma fatura com cliente, periodo_referencia, data_vencimento e itens.
 - Para gerar_fatura, aceite cliente_id, cliente, cliente_nome, cliente_cnpj.
 - Para gerar_fatura, cada item deve ter descricao, quantidade e valor_unitario. Se vier apenas valor_total, use quantidade 1 e valor_unitario = valor_total.
+- Para gerar_fatura, aceite tambem os sinalizadores gerar_boleto e emitir_nfse quando o usuario pedir para concluir a cobranca e a nota fiscal no mesmo fluxo.
+- Para gerar_fatura, aceite codigo_servico e discriminacao quando o usuario detalhar a emissao da NFS-e.
 - Quando a planilha de fatura trouxer secoes analiticas com funcionarios, exames, unidade ou detalhes adicionais, preserve esse contexto em observacoes/metadata da fatura e use esse material para responder perguntas detalhadas depois.
 - Se a entrada tiver varias linhas do mesmo cliente no mesmo periodo, consolide em uma unica fatura com varios itens.
 - Para mensagens de preview, descreva o que sera criado e destaque valor total e vencimento quando disponiveis.

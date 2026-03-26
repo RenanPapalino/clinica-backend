@@ -16,7 +16,7 @@ from openai import APIConnectionError, AsyncOpenAI, AuthenticationError, RateLim
 
 from .file_parser import ParsedFile, is_audio_attachment, is_image_attachment, parse_attachment
 from .laravel_client import LaravelApiError, LaravelInternalClient
-from .memory import PendingActionStore
+from .memory import PendingActionStoreProtocol
 from .planner import ActionPlan, ActionPlanner
 from .prompts import (
     CHAT_SYSTEM_PROMPT,
@@ -38,7 +38,7 @@ class ChatRuntimeService:
         *,
         settings: Settings,
         laravel_client: LaravelInternalClient,
-        pending_actions: PendingActionStore,
+        pending_actions: PendingActionStoreProtocol,
     ) -> None:
         self.settings = settings
         self.laravel_client = laravel_client
@@ -69,6 +69,28 @@ class ChatRuntimeService:
                 session_id=payload.session_id,
                 states={"draft", "pending_confirmation"},
             )
+            if self._should_reject_pending_action(
+                pending=session_draft,
+                message=payload.mensagem or "",
+                parsed_file=parsed_file,
+            ):
+                confirmation = await self.confirm_action(
+                    ResumePayload(
+                        acao=session_draft.action,
+                        dados=list(session_draft.records or []),
+                        metadata={
+                            **dict(session_draft.metadata or {}),
+                            "runtime_pending_action_id": session_draft.action_id,
+                        },
+                        decision="reject",
+                        session_id=payload.session_id,
+                        user_id=payload.user_id,
+                        user_name=payload.user_name,
+                        user_email=payload.user_email,
+                        timestamp=payload.timestamp,
+                    )
+                )
+                return self._chat_response_from_confirmation(confirmation)
             draft_resolution = self._resolve_session_draft_resolution(
                 pending=session_draft,
                 message=payload.mensagem or "",
@@ -76,10 +98,39 @@ class ChatRuntimeService:
             if draft_resolution == "cancel" and session_draft is not None:
                 self.pending_actions.pop(session_draft.action_id)
                 return ChatbotResponse(
-                    mensagem="Tudo bem. Cancelei o rascunho pendente desta sessao. Como posso ajudar agora?",
+                    mensagem="Tudo bem. Cancelei a pendencia desta sessao. Como posso ajudar agora?",
                     acao_sugerida=None,
                     dados_estruturados=None,
                 )
+            if self._should_auto_confirm_pending_action(
+                pending=session_draft,
+                message=payload.mensagem or "",
+                parsed_file=parsed_file,
+            ):
+                confirmation = await self.confirm_action(
+                    ResumePayload(
+                        acao=session_draft.action,
+                        dados=list(session_draft.records or []),
+                        metadata={
+                            **dict(session_draft.metadata or {}),
+                            "runtime_pending_action_id": session_draft.action_id,
+                        },
+                        decision="approve",
+                        session_id=payload.session_id,
+                        user_id=payload.user_id,
+                        user_name=payload.user_name,
+                        user_email=payload.user_email,
+                        timestamp=payload.timestamp,
+                    )
+                )
+                return self._chat_response_from_confirmation(confirmation)
+            updated_pending_preview = await self._build_updated_pending_confirmation_preview(
+                pending=session_draft,
+                payload=payload,
+                parsed_file=parsed_file,
+            )
+            if updated_pending_preview is not None:
+                return updated_pending_preview
             if draft_resolution == "ignore":
                 session_draft = None
 
@@ -136,6 +187,11 @@ class ChatRuntimeService:
                     current_message=current_message,
                 )
                 action_plan = self._merge_route_into_action_plan(route, action_plan)
+                action_plan = self._merge_heuristic_action_plan(
+                    payload=payload,
+                    route=route,
+                    plan=action_plan,
+                )
                 action_plan = self._merge_attachment_candidates_into_action_plan(action_plan, parsed_file)
                 action_plan = self._merge_session_draft_into_action_plan(
                     action_plan,
@@ -185,9 +241,12 @@ class ChatRuntimeService:
     async def confirm_action(self, payload: ResumePayload) -> dict[str, Any]:
         decision = (payload.decision or "approve").lower().strip()
         if decision != "approve":
+            action_id = str(payload.metadata.get("runtime_pending_action_id") or "").strip()
+            if action_id:
+                self.pending_actions.pop(action_id)
             return {
                 "success": False,
-                "message": "Acao rejeitada pelo usuario.",
+                "message": "Tudo bem. Nao vou seguir com essa acao.",
                 "detalhes": {
                     "resumo": {"criados": 0, "erros": 0},
                     "erros_lista": [],
@@ -1231,14 +1290,11 @@ class ChatRuntimeService:
             record.get("cliente_cnpj") or record.get("cnpj_cliente") or record.get("cnpj")
         )
 
-        items = [
-            normalized_item
-            for normalized_item in (
-                self._normalize_fatura_item(item)
-                for item in self._extract_fatura_items(record)
-            )
-            if normalized_item
-        ]
+        items: list[dict[str, Any]] = []
+        for item in self._extract_fatura_items(record):
+            normalized_item = await self._normalize_fatura_item(item, user_id)
+            if normalized_item:
+                items.append(normalized_item)
         metadata = self._normalize_fatura_metadata(
             record.get("metadata") or record.get("_metadata_payload")
         )
@@ -1285,6 +1341,10 @@ class ChatRuntimeService:
             "exames_resumo": resumo_exames,
             "cliente_status_resumo": cliente_resumo_status,
             "gerar_titulo": bool(record.get("gerar_titulo", True)),
+            "gerar_boleto": self._to_bool(record.get("gerar_boleto") or record.get("boleto") or record.get("com_boleto")),
+            "emitir_nfse": self._to_bool(record.get("emitir_nfse") or record.get("gerar_nfse") or record.get("nfse")),
+            "codigo_servico": self._as_string(record.get("codigo_servico")),
+            "discriminacao": self._as_string(record.get("discriminacao")),
             "_metadata_payload": metadata,
             "_itens_payload": items,
         }
@@ -1314,16 +1374,20 @@ class ChatRuntimeService:
 
         return []
 
-    def _normalize_fatura_item(self, item: dict[str, Any]) -> dict[str, Any] | None:
+    async def _normalize_fatura_item(self, item: dict[str, Any], user_id: int) -> dict[str, Any] | None:
         quantidade = self._parse_decimal(item.get("quantidade")) or 1.0
         valor_unitario = self._parse_decimal(item.get("valor_unitario"))
         valor_total = self._parse_decimal(item.get("valor_total") or item.get("valor"))
+        servico_id = self._to_int(item.get("servico_id"))
+
+        if servico_id is None:
+            servico_id = await self._resolve_servico_id(item, user_id)
 
         if valor_unitario is None and valor_total is not None:
             valor_unitario = valor_total / quantidade if quantidade else valor_total
 
         normalized = {
-            "servico_id": self._to_int(item.get("servico_id")),
+            "servico_id": servico_id,
             "descricao": self._as_string(
                 item.get("descricao")
                 or item.get("servico")
@@ -1405,6 +1469,66 @@ class ChatRuntimeService:
             return None
 
         return exame
+
+    async def _resolve_servico_id(self, item: dict[str, Any], user_id: int) -> int | None:
+        rows = await self._search_servico_candidates(item, user_id)
+        return self._resolve_servico_id_from_rows(item, rows)
+
+    async def _search_servico_candidates(self, item: dict[str, Any], user_id: int) -> list[dict[str, Any]]:
+        query = self._as_string(
+            item.get("descricao")
+            or item.get("servico")
+            or item.get("nome_servico")
+            or item.get("historico")
+            or item.get("codigo")
+        )
+
+        if not query:
+            return []
+
+        return list(
+            await self.laravel_client.search_servicos(
+                user_id=user_id,
+                query=query,
+                ativo=True,
+                limit=self.settings.max_result_rows,
+            )
+        )
+
+    def _resolve_servico_id_from_rows(self, item: dict[str, Any], rows: list[dict[str, Any]]) -> int | None:
+        if not rows:
+            return None
+
+        descricao = self._upper(
+            item.get("descricao")
+            or item.get("servico")
+            or item.get("nome_servico")
+            or item.get("historico")
+        )
+        codigo = self._upper(item.get("codigo"))
+
+        exact_ids: list[int] = []
+        for row in rows:
+            row_id = self._to_int(row.get("id"))
+            if row_id is None:
+                continue
+
+            if descricao and self._upper(row.get("descricao")) == descricao:
+                exact_ids.append(row_id)
+                continue
+
+            if codigo and self._upper(row.get("codigo")) == codigo:
+                exact_ids.append(row_id)
+                continue
+
+        exact_ids = list(dict.fromkeys(exact_ids))
+        if len(exact_ids) == 1:
+            return exact_ids[0]
+
+        if len(rows) == 1:
+            return self._to_int(rows[0].get("id"))
+
+        return None
 
     def _compose_fatura_observacoes(self, raw_value: Any, *, metadata: dict[str, Any] | None) -> str | None:
         observacoes = self._as_string(raw_value)
@@ -1512,6 +1636,10 @@ class ChatRuntimeService:
         )
 
     def _resolve_cliente_id_from_rows(self, record: dict[str, Any], rows: list[dict[str, Any]]) -> int | None:
+        existing_cliente_id = self._to_int(record.get("cliente_id"))
+        if existing_cliente_id is not None:
+            return existing_cliente_id
+
         if not rows:
             return None
 
@@ -1842,11 +1970,19 @@ class ChatRuntimeService:
         }
 
     def _strip_internal_fields(self, record: dict[str, Any]) -> dict[str, Any]:
-        return {
+        public_record = {
             key: value
             for key, value in record.items()
             if not str(key).startswith("_")
         }
+
+        if isinstance(record.get("_itens_payload"), list):
+            public_record["itens"] = record["_itens_payload"]
+
+        if isinstance(record.get("_metadata_payload"), dict):
+            public_record["metadata"] = record["_metadata_payload"]
+
+        return public_record
 
     def _missing_cliente_fields(self, record: dict[str, Any]) -> list[str]:
         missing: list[str] = []
@@ -2072,6 +2208,8 @@ class ChatRuntimeService:
                 "periodos": periodos,
                 "vencimentos": vencimentos,
                 "clientes_pendentes_cadastro": clientes_pendentes_cadastro,
+                "boleto_solicitado": sum(1 for record in records if self._to_bool(record.get("gerar_boleto"))),
+                "nfse_solicitada": sum(1 for record in records if self._to_bool(record.get("emitir_nfse"))),
             },
         }
 
@@ -2351,6 +2489,8 @@ class ChatRuntimeService:
             exames: list[str] = []
             clientes: list[str] = []
             clientes_pendentes_cadastro = 0
+            boletos_solicitados = 0
+            nfse_solicitadas = 0
 
             for record in records:
                 cliente = self._as_string(record.get("cliente"))
@@ -2389,6 +2529,12 @@ class ChatRuntimeService:
                 if isinstance(record.get("_auto_cliente_record"), dict):
                     clientes_pendentes_cadastro += 1
 
+                if self._to_bool(record.get("gerar_boleto")):
+                    boletos_solicitados += 1
+
+                if self._to_bool(record.get("emitir_nfse")):
+                    nfse_solicitadas += 1
+
             message = f"Preparei {len(records)} fatura(s) somando {self._format_currency(total)}."
             if clientes:
                 message += f" Clientes: {self._join_human_values(list(dict.fromkeys(clientes))[:3])}."
@@ -2404,6 +2550,10 @@ class ChatRuntimeService:
                 message += f" Exames identificados: {self._join_human_values(list(dict.fromkeys(exames))[:6])}."
             if clientes_pendentes_cadastro > 0:
                 message += " O cliente desta fatura não está cadastrado e será sincronizado automaticamente ao confirmar."
+            if boletos_solicitados > 0:
+                message += " Também vou gerar o boleto após criar a fatura."
+            if nfse_solicitadas > 0:
+                message += " Também vou emitir a NFS-e após criar a fatura."
             message += " Posso confirmar a criacao?"
             return message
 
@@ -2636,6 +2786,8 @@ class ChatRuntimeService:
             cliente = self._cliente_result_label(record.get("cliente") or {}) or self._cliente_result_label(record)
             valor = self._parse_decimal(record.get("valor_total"))
             vencimento = self._format_date(record.get("data_vencimento"))
+            boleto_gerado = self._to_bool(record.get("boleto_gerado")) or isinstance(record.get("boleto"), dict)
+            nfse_emitida = self._to_bool(record.get("nfse_emitida")) or isinstance(record.get("nfse"), dict)
             parts = []
 
             if numero:
@@ -2662,12 +2814,26 @@ class ChatRuntimeService:
             if details:
                 message += " " + " ".join(details)
 
+            if boleto_gerado:
+                message += " com boleto gerado"
+            if nfse_emitida:
+                message += " e NFS-e emitida" if boleto_gerado else " com NFS-e emitida"
+
             return message.strip() + "."
 
         prefix = "Tambem gerei automaticamente" if chained else "Gerei"
         message = f"{prefix} {len(records)} fatura(s)"
         if total > 0:
             message += f" somando {self._format_currency(total)}"
+        boletos_gerados = sum(1 for record in records if self._to_bool(record.get("boleto_gerado")) or isinstance(record.get("boleto"), dict))
+        nfse_emitidas = sum(1 for record in records if self._to_bool(record.get("nfse_emitida")) or isinstance(record.get("nfse"), dict))
+        if boletos_gerados > 0 or nfse_emitidas > 0:
+            extras: list[str] = []
+            if boletos_gerados > 0:
+                extras.append(f"{boletos_gerados} com boleto")
+            if nfse_emitidas > 0:
+                extras.append(f"{nfse_emitidas} com NFS-e")
+            message += f" e concluí {self._join_human_values(extras)}"
         message += "."
         return message
 
@@ -2804,6 +2970,318 @@ class ChatRuntimeService:
             "dados_parciais": list(pending.records or []),
         }
 
+    def _should_auto_confirm_pending_action(
+        self,
+        *,
+        pending: Any | None,
+        message: str,
+        parsed_file: ParsedFile,
+    ) -> bool:
+        if pending is None:
+            return False
+
+        if parsed_file.text:
+            return False
+
+        if parsed_file.mode is not None and parsed_file.mode != "text":
+            return False
+
+        state = str((pending.metadata or {}).get("state") or "").strip()
+        if state != "pending_confirmation":
+            return False
+
+        action = self._canonical_action(pending.action)
+        if action is None:
+            return False
+
+        editable_fields = self._editable_fields_for_pending_confirmation(
+            action=action,
+            records=list(pending.records or []),
+        )
+        if self._extract_pending_updates_from_message(
+            action=action,
+            message=message,
+            pending_fields=editable_fields,
+            draft_records=list(pending.records or []),
+        ):
+            return False
+
+        return self._message_approves_pending_action(message)
+
+    def _should_reject_pending_action(
+        self,
+        *,
+        pending: Any | None,
+        message: str,
+        parsed_file: ParsedFile,
+    ) -> bool:
+        if pending is None:
+            return False
+
+        if parsed_file.text:
+            return False
+
+        if parsed_file.mode is not None and parsed_file.mode != "text":
+            return False
+
+        state = str((pending.metadata or {}).get("state") or "").strip()
+        if state != "pending_confirmation":
+            return False
+
+        return self._message_rejects_pending_action(message)
+
+    def _message_approves_pending_action(self, message: str) -> bool:
+        normalized = self._normalize_free_text(message)
+        if not normalized:
+            return False
+
+        direct_approvals = {
+            "sim",
+            "ok",
+            "okay",
+            "confirmo",
+            "confirmar",
+            "confirma",
+            "aprovado",
+            "aprovar",
+            "pode",
+            "pode seguir",
+            "pode prosseguir",
+            "prosseguir",
+            "seguir",
+            "continue",
+            "continuar",
+            "manda bala",
+            "pode gerar",
+            "gera",
+            "pode cadastrar",
+        }
+
+        if normalized in direct_approvals:
+            return True
+
+        approval_terms = [
+            "pode seguir",
+            "pode prosseguir",
+            "pode confirmar",
+            "pode cadastrar",
+            "pode gerar",
+            "pode emitir",
+            "pode criar",
+            "confirma",
+            "confirma isso",
+            "confirmar isso",
+            "pode ir",
+            "segue",
+            "prossegue",
+        ]
+
+        return any(term in normalized for term in approval_terms)
+
+    def _message_rejects_pending_action(self, message: str) -> bool:
+        normalized = self._normalize_free_text(message)
+        if not normalized:
+            return False
+
+        direct_rejections = {
+            "nao",
+            "não",
+            "cancelar",
+            "cancela",
+            "cancelado",
+            "rejeitar",
+            "rejeita",
+            "negar",
+            "nega",
+            "parar",
+            "para",
+        }
+
+        if normalized in direct_rejections:
+            return True
+
+        rejection_terms = [
+            "nao confirma",
+            "não confirma",
+            "nao confirmar",
+            "não confirmar",
+            "nao aprova",
+            "não aprova",
+            "nao seguir",
+            "não seguir",
+            "nao pode seguir",
+            "não pode seguir",
+            "nao pode prosseguir",
+            "não pode prosseguir",
+            "cancela isso",
+            "cancelar isso",
+            "deixa pra la",
+            "deixa pra lá",
+        ]
+
+        return any(term in normalized for term in rejection_terms)
+
+    async def _build_updated_pending_confirmation_preview(
+        self,
+        *,
+        pending: Any | None,
+        payload: ChatPayload,
+        parsed_file: ParsedFile,
+    ) -> ChatbotResponse | None:
+        if pending is None:
+            return None
+
+        if parsed_file.text:
+            return None
+
+        if parsed_file.mode is not None and parsed_file.mode != "text":
+            return None
+
+        state = str((pending.metadata or {}).get("state") or "").strip()
+        if state != "pending_confirmation":
+            return None
+
+        action = self._canonical_action(pending.action)
+        if action is None:
+            return None
+
+        current_records = list(pending.records or [])
+        editable_fields = self._editable_fields_for_pending_confirmation(
+            action=action,
+            records=current_records,
+        )
+        updated_records = self._extract_pending_updates_from_message(
+            action=action,
+            message=payload.mensagem or "",
+            pending_fields=editable_fields,
+            draft_records=current_records,
+        )
+        if not updated_records:
+            return None
+
+        normalized_records: list[dict[str, Any]] = []
+        pending_fields: list[str] = []
+        for record in updated_records:
+            normalized_record, missing = await self._normalize_record(
+                action=action,
+                record=record,
+                user_id=payload.user_id,
+            )
+            normalized_records.append(normalized_record)
+            pending_fields.extend(missing)
+
+        normalized_records = [record for record in normalized_records if record]
+        pending_fields = sorted({field for field in pending_fields if field})
+        if not normalized_records:
+            return None
+
+        self.pending_actions.pop(pending.action_id)
+
+        next_state = "draft" if pending_fields else "pending_confirmation"
+        next_pending = self.pending_actions.save(
+            action=action,
+            records=normalized_records,
+            user_id=payload.user_id,
+            session_id=payload.session_id,
+            metadata={
+                **dict(pending.metadata or {}),
+                "fonte": "langchain-runtime",
+                "state": next_state,
+                "pending_fields": pending_fields,
+            },
+        )
+
+        if pending_fields:
+            return ChatbotResponse(
+                mensagem=self._build_pending_message(action, pending_fields, records=normalized_records),
+                acao_sugerida=action,
+                dados_estruturados=StructuredData(
+                    tipo=self._action_type(action),
+                    dados_mapeados=normalized_records,
+                    colunas=self._build_columns_for_action(action, normalized_records),
+                    acao_sugerida=action,
+                    total_registros=len(normalized_records),
+                    confianca=0.9,
+                    metadata={
+                        "fonte": "langchain-runtime",
+                        "runtime_draft_action_id": next_pending.action_id,
+                        "runtime_pending_fields": pending_fields,
+                        "runtime_requires_more_info": True,
+                        **self._preview_metadata_for_action(action, normalized_records),
+                    },
+                ),
+            )
+
+        return ChatbotResponse(
+            mensagem=self._build_preview_message(
+                action=action,
+                records=normalized_records,
+                fallback="Atualizei a solicitacao pendente com os novos dados.",
+            ),
+            acao_sugerida=action,
+            dados_estruturados=StructuredData(
+                tipo=self._action_type(action),
+                dados_mapeados=normalized_records,
+                colunas=self._build_columns_for_action(action, normalized_records),
+                acao_sugerida=action,
+                total_registros=len(normalized_records),
+                confianca=0.9,
+                metadata={
+                    "fonte": "langchain-runtime",
+                    "runtime_pending_action_id": next_pending.action_id,
+                    "runtime_requires_confirmation": True,
+                    **self._preview_metadata_for_action(action, normalized_records),
+                },
+            ),
+        )
+
+    def _editable_fields_for_pending_confirmation(
+        self,
+        *,
+        action: str,
+        records: list[dict[str, Any]],
+    ) -> list[str]:
+        fields: list[str] = []
+
+        if action == "gerar_fatura":
+            fields.extend(
+                [
+                    "cliente",
+                    "data_vencimento",
+                    "periodo_referencia",
+                    "codigo_servico",
+                    "gerar_boleto",
+                    "emitir_nfse",
+                ]
+            )
+            max_items = max((len(self._extract_fatura_items(record)) for record in records), default=0)
+            for index in range(max_items):
+                fields.append(f"item_{index + 1}.valor_unitario")
+            return fields
+
+        if action == "criar_cliente":
+            return ["cnpj", "razao_social"]
+
+        return fields
+
+    def _chat_response_from_confirmation(self, confirmation: dict[str, Any]) -> ChatbotResponse:
+        success = bool(confirmation.get("success"))
+        detalhes = confirmation.get("detalhes") if isinstance(confirmation.get("detalhes"), dict) else {}
+        pendencias = list(detalhes.get("pendencias") or [])
+
+        if not success and pendencias:
+            return ChatbotResponse(
+                mensagem=self._as_string(confirmation.get("message")) or "Ainda faltam alguns dados para concluir a acao.",
+                acao_sugerida=None,
+                dados_estruturados=None,
+            )
+
+        return ChatbotResponse(
+            mensagem=self._as_string(confirmation.get("message")) or "Acao concluida.",
+            acao_sugerida=None,
+            dados_estruturados=None,
+        )
+
     def _resolve_session_draft_resolution(
         self,
         *,
@@ -2896,6 +3374,80 @@ class ChatRuntimeService:
 
         plan.dados_mapeados = self._merge_records(draft_records, current_records)
         return plan
+
+    def _merge_heuristic_action_plan(
+        self,
+        *,
+        payload: ChatPayload,
+        route: RouteDecision,
+        plan: ActionPlan,
+    ) -> ActionPlan:
+        canonical_action = self._canonical_action(plan.acao_sugerida or route.acao_sugerida)
+        if canonical_action not in {"gerar_fatura"}:
+            return plan
+
+        if list(plan.dados_mapeados or []):
+            return plan
+
+        heuristic = self._build_heuristic_fatura_plan(payload.mensagem or "")
+        if heuristic is None:
+            return plan
+
+        return heuristic
+
+    def _build_heuristic_fatura_plan(self, message: str) -> ActionPlan | None:
+        normalized = self._normalize_free_text(message)
+        if not normalized:
+            return None
+
+        if "fatura" not in normalized and "fature" not in normalized and "faturar" not in normalized:
+            return None
+
+        cliente = self._extract_cliente_business_name_from_message(message)
+        cliente_cnpj = self._extract_document_from_text(message, required_length=14)
+        data_vencimento = self._extract_date_from_text(message)
+        periodo_referencia = self._extract_period_from_text(message)
+        item_descricao = self._extract_fatura_item_description_from_message(message)
+        valor = self._extract_currency_from_text(message)
+        codigo_servico = self._extract_service_code_from_message(message)
+        gerar_boleto = "boleto" in normalized
+        emitir_nfse = "nfse" in normalized or "nfs-e" in normalized
+
+        if not any([cliente, cliente_cnpj, data_vencimento, periodo_referencia, item_descricao, valor]):
+            return None
+
+        record: dict[str, Any] = {}
+        if cliente:
+            record["cliente"] = cliente
+        if cliente_cnpj:
+            record["cliente_cnpj"] = cliente_cnpj
+        if data_vencimento:
+            record["data_vencimento"] = data_vencimento
+        if periodo_referencia:
+            record["periodo_referencia"] = periodo_referencia
+        if gerar_boleto:
+            record["gerar_boleto"] = True
+        if emitir_nfse:
+            record["emitir_nfse"] = True
+        if codigo_servico:
+            record["codigo_servico"] = codigo_servico
+
+        if item_descricao or valor is not None:
+            record["itens"] = [
+                {
+                    "descricao": item_descricao or "Serviço faturado via chatbot",
+                    "quantidade": 1,
+                    "valor_unitario": valor or 0.0,
+                }
+            ]
+
+        return ActionPlan(
+            mensagem="Identifiquei um pedido de geração de fatura com base na mensagem informada.",
+            acao_sugerida="gerar_fatura",
+            confianca=0.85,
+            dados_mapeados=[record],
+            pendencias=[],
+        )
 
     def _redirect_fatura_draft_to_cliente_creation(
         self,
@@ -2994,7 +3546,7 @@ class ChatRuntimeService:
                 updates["nova_data_vencimento"] = due_date
 
         if "periodo_referencia" in pending_fields:
-            if periodo := self._extract_period_from_text(text):
+            if self._message_mentions_period_update(text) and (periodo := self._extract_period_from_text(text)):
                 updates["periodo_referencia"] = periodo
 
         if "cliente" in pending_fields:
@@ -3022,6 +3574,28 @@ class ChatRuntimeService:
             if descricao := self._extract_named_value(text, labels=["descricao", "histórico", "historico"]):
                 updates["descricao"] = descricao
 
+        if "codigo_servico" in pending_fields:
+            if codigo_servico := self._extract_service_code_from_message(text):
+                updates["codigo_servico"] = codigo_servico
+
+        if "gerar_boleto" in pending_fields:
+            boleto_decision = self._extract_boolean_preference_from_text(
+                text,
+                positive_terms=["com boleto", "gere boleto", "gerar boleto", "emitir boleto", "boleto"],
+                negative_terms=["sem boleto", "nao gere boleto", "não gere boleto", "nao emitir boleto", "não emitir boleto"],
+            )
+            if boleto_decision is not None:
+                updates["gerar_boleto"] = boleto_decision
+
+        if "emitir_nfse" in pending_fields:
+            nfse_decision = self._extract_boolean_preference_from_text(
+                text,
+                positive_terms=["com nfse", "com nfs-e", "emita nfse", "emita nfs-e", "emitir nfse", "emitir nfs-e", "nfse", "nfs-e"],
+                negative_terms=["sem nfse", "sem nfs-e", "nao emitir nfse", "não emitir nfse", "nao emitir nfs-e", "não emitir nfs-e", "sem emitir nfse", "sem emitir nfs-e", "sem emitir a nfse", "sem emitir a nfs-e"],
+            )
+            if nfse_decision is not None:
+                updates["emitir_nfse"] = nfse_decision
+
         item_value_fields = sorted(
             [
                 field
@@ -3030,7 +3604,7 @@ class ChatRuntimeService:
             ],
             key=lambda field: self._to_int(field.split(".", 1)[0].replace("item_", "")) or 0,
         )
-        currency_values = self._extract_currency_values_from_text(text) if item_value_fields else []
+        currency_values = self._extract_contextual_currency_values_from_text(text) if item_value_fields else []
         if item_value_fields and currency_values:
             for record in base_records:
                 items = [dict(item) for item in self._extract_fatura_items(record)]
@@ -3058,6 +3632,42 @@ class ChatRuntimeService:
                 record.update(updates)
 
         return base_records
+
+    def _message_mentions_period_update(self, message: str) -> bool:
+        normalized = self._normalize_free_text(message)
+        if not normalized:
+            return False
+
+        return any(term in normalized for term in ["periodo", "período", "competencia", "competência", "referente"])
+
+    def _extract_contextual_currency_values_from_text(self, message: str) -> list[float]:
+        normalized = self._normalize_free_text(message)
+        if not normalized:
+            return []
+
+        if not any(term in normalized for term in ["r$", "valor", "reais", "real"]):
+            return []
+
+        return self._extract_currency_values_from_text(message)
+
+    def _extract_boolean_preference_from_text(
+        self,
+        text: str,
+        *,
+        positive_terms: list[str],
+        negative_terms: list[str],
+    ) -> bool | None:
+        normalized = self._normalize_free_text(text)
+        if not normalized:
+            return None
+
+        if any(term in normalized for term in negative_terms):
+            return False
+
+        if any(term in normalized for term in positive_terms):
+            return True
+
+        return None
 
     def _build_cliente_records_from_fatura_draft(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized_records: list[dict[str, Any]] = []
@@ -3375,6 +3985,18 @@ class ChatRuntimeService:
 
     def _extract_period_from_text(self, message: str) -> str | None:
         normalized = self._normalize_free_text(message)
+        contextual_patterns = (
+            r"(?:referente\s+a|compet[eê]ncia|periodo|período)\s+([a-zà-ÿ]+\s+de\s+\d{4})",
+            r"(?:referente\s+a|compet[eê]ncia|periodo|período)\s+([a-zà-ÿ]+\s+\d{4})",
+            r"(?:referente\s+a|compet[eê]ncia|periodo|período)\s+(\d{2}/\d{4})",
+            r"(?:referente\s+a|compet[eê]ncia|periodo|período)\s+(\d{4}-\d{2})",
+        )
+
+        for pattern in contextual_patterns:
+            match = re.search(pattern, normalized)
+            if match:
+                return self._normalize_periodo_referencia(match.group(1))
+
         for pattern in (
             r"(\d{2}/\d{4})",
             r"(\d{2}-\d{4})",
@@ -3417,15 +4039,27 @@ class ChatRuntimeService:
         return self._to_int(match.group(1))
 
     def _extract_currency_from_text(self, message: str) -> float | None:
-        match = re.search(r"(?:r\$\s*)?(\d{1,3}(?:\.\d{3})*,\d{2}|\d+(?:,\d{2})?)", message or "", re.IGNORECASE)
-        if not match:
-            return None
+        text = message or ""
+        contextual_patterns = (
+            r"(?:r\$\s*|valor\s+de\s+|no\s+valor\s+de\s+)(\d{1,3}(?:\.\d{3})*,\d{2}|\d+(?:,\d{2})?)",
+            r"(\d{1,3}(?:\.\d{3})*,\d{2}|\d+(?:,\d{2})?)\s*reais",
+        )
 
-        raw = match.group(1).replace(".", "").replace(",", ".")
-        try:
-            return float(raw)
-        except ValueError:
-            return None
+        for pattern in contextual_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                raw = match.group(1).replace(".", "").replace(",", ".")
+                try:
+                    return float(raw)
+                except ValueError:
+                    continue
+
+        values = self._extract_currency_values_from_text(text)
+        for value in values:
+            if value >= 100:
+                return value
+
+        return values[0] if values else None
 
     def _extract_currency_values_from_text(self, message: str) -> list[float]:
         matches = re.findall(
@@ -3438,7 +4072,9 @@ class ChatRuntimeService:
         for raw in matches:
             normalized = raw.replace(".", "").replace(",", ".")
             try:
-                values.append(float(normalized))
+                value = float(normalized)
+                if value > 0:
+                    values.append(value)
             except ValueError:
                 continue
 
@@ -3476,6 +4112,56 @@ class ChatRuntimeService:
             return None
 
         return candidate
+
+    def _extract_cliente_business_name_from_message(self, message: str) -> str | None:
+        raw = self._as_string(message)
+        if not raw:
+            return None
+
+        patterns = [
+            r"(?:cadastre\s+e\s+fature|fature|faturar|gere\s+uma\s+fatura\s+para|gerar\s+fatura\s+para)\s+a?\s+(.+?)(?:,\s*cnpj|\s+cnpj|,\s*referente|\s+referente|,\s*com\s+vencimento|\s+com\s+vencimento)",
+            r"cliente\s*[:\-]?\s*(.+?)(?:,\s*cnpj|\s+cnpj|,\s*referente|\s+referente|,\s*com\s+vencimento|\s+com\s+vencimento)",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, raw, re.IGNORECASE)
+            if match:
+                candidate = self._as_string(match.group(1))
+                if candidate:
+                    return self._upper(candidate)
+
+        return None
+
+    def _extract_fatura_item_description_from_message(self, message: str) -> str | None:
+        raw = self._as_string(message)
+        if not raw:
+            return None
+
+        patterns = [
+            r"item\s+(.+?)(?:\s+no valor|\s*,\s*valor|,\s*ger[ea]|,\s*emit[ia]|\.|$)",
+            r"itens?\s+realizados?\s*[:\-]?\s*(.+?)(?:\s+no valor|\.|$)",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, raw, re.IGNORECASE)
+            if match:
+                candidate = self._as_string(match.group(1))
+                if candidate:
+                    return candidate
+
+        return None
+
+    def _extract_service_code_from_message(self, message: str) -> str | None:
+        raw = self._as_string(message)
+        if not raw:
+            return None
+
+        match = re.search(r"c[oó]digo\s+de\s+servi[cç]o\s*[:\-]?\s*([\d\.]+)", raw, re.IGNORECASE)
+        if not match:
+            return None
+
+        value = self._as_string(match.group(1))
+        return value.rstrip(".") if value else None
 
     def _join_human_values(self, values: list[str]) -> str:
         cleaned = [value.strip() for value in values if isinstance(value, str) and value.strip()]
@@ -3586,6 +4272,19 @@ class ChatRuntimeService:
         except (TypeError, ValueError):
             return None
 
+    def _to_bool(self, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+
+        if value in (None, ""):
+            return False
+
+        if isinstance(value, (int, float)):
+            return value != 0
+
+        text = str(value).strip().lower()
+        return text in {"1", "true", "sim", "yes", "y", "on", "boleto", "nfse", "nfs-e"}
+
     def _parse_decimal(self, value: Any) -> float | None:
         if value in (None, ""):
             return None
@@ -3683,7 +4382,7 @@ class ChatRuntimeService:
         return datetime.strptime(normalized, "%Y-%m-%d").strftime("%Y-%m")
 
     def _today(self) -> str:
-        return datetime.utcnow().date().isoformat()
+        return datetime.now().date().isoformat()
 
     def _normalize_portuguese_date_text(self, value: str) -> str:
         text = self._normalize_free_text(value)

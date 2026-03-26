@@ -108,6 +108,21 @@ class LaravelInternalClient:
             body={"query": query, "limit": limit},
         )
 
+    async def search_servicos(
+        self,
+        *,
+        user_id: int,
+        query: str | None = None,
+        ativo: bool | None = True,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        return await self._request(
+            path="/api/internal/agent/servicos/search",
+            method="POST",
+            user_id=user_id,
+            body={"query": query, "ativo": ativo, "limit": limit},
+        )
+
     async def search_fornecedores(
         self,
         *,

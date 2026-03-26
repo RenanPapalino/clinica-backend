@@ -870,6 +870,222 @@ class ChatControllerTest extends TestCase
             ->assertJsonPath('detalhes.pendencias.0', 'cliente');
     }
 
+    public function test_chat_langchain_processa_fluxo_condicional_de_fatura_na_mesma_sessao(): void
+    {
+        config([
+            'chatbot.runtime.driver' => 'langchain',
+            'chatbot.runtime.base_url' => 'http://langchain-runtime.test',
+            'chatbot.runtime.secret' => 'runtime-secret',
+        ]);
+
+        $user = User::factory()->create([
+            'ativo' => true,
+        ]);
+
+        Sanctum::actingAs($user);
+
+        Http::fake([
+            'http://langchain-runtime.test/chat' => Http::sequence()
+                ->push([
+                    'mensagem' => 'Preparei a fatura para confirmacao.',
+                    'acao_sugerida' => 'gerar_fatura',
+                    'dados_estruturados' => [
+                        'tipo' => 'fatura',
+                        'acao_sugerida' => 'gerar_fatura',
+                        'dados_mapeados' => [[
+                            'cliente_id' => 3,
+                            'cliente' => 'DELTA MEDICINA OCUPACIONAL LTDA',
+                            'periodo_referencia' => '2026-03',
+                            'data_vencimento' => '2026-04-15',
+                            'valor_total' => 1500.0,
+                            'gerar_boleto' => true,
+                            'emitir_nfse' => true,
+                        ]],
+                        'metadata' => [
+                            'fonte' => 'langchain-runtime',
+                            'runtime_pending_action_id' => 'pending-fat-100',
+                            'runtime_requires_confirmation' => true,
+                        ],
+                    ],
+                ], 200)
+                ->push([
+                    'mensagem' => 'Atualizei a solicitacao pendente com os novos dados.',
+                    'acao_sugerida' => 'gerar_fatura',
+                    'dados_estruturados' => [
+                        'tipo' => 'fatura',
+                        'acao_sugerida' => 'gerar_fatura',
+                        'dados_mapeados' => [[
+                            'cliente_id' => 3,
+                            'cliente' => 'DELTA MEDICINA OCUPACIONAL LTDA',
+                            'periodo_referencia' => '2026-03',
+                            'data_vencimento' => '2026-04-20',
+                            'valor_total' => 1500.0,
+                            'gerar_boleto' => true,
+                            'emitir_nfse' => false,
+                        ]],
+                        'metadata' => [
+                            'fonte' => 'langchain-runtime',
+                            'runtime_pending_action_id' => 'pending-fat-101',
+                            'runtime_requires_confirmation' => true,
+                        ],
+                    ],
+                ], 200)
+                ->push([
+                    'mensagem' => 'Gerei a fatura FAT-202603-4375 para DELTA MEDICINA OCUPACIONAL LTDA no valor de R$ 1.500,00 com vencimento em 20/04/2026 com boleto gerado.',
+                    'acao_sugerida' => null,
+                    'dados_estruturados' => null,
+                ], 200),
+        ]);
+
+        $sessionId = 'sessao-condicional-http';
+
+        $this->postJson('/api/chat/enviar', [
+            'mensagem' => 'Gere uma fatura para DELTA MEDICINA OCUPACIONAL LTDA referente a março de 2026, com vencimento em 15/04/2026, item PCMSO mensal no valor de 1500 reais, com boleto e NFS-e.',
+            'session_id' => $sessionId,
+        ])->assertOk()
+            ->assertJsonPath('acao_sugerida', 'gerar_fatura')
+            ->assertJsonPath('dados_estruturados.metadata.runtime_requires_confirmation', true)
+            ->assertJsonPath('dados_estruturados.dados_mapeados.0.data_vencimento', '2026-04-15');
+
+        $this->postJson('/api/chat/enviar', [
+            'mensagem' => 'pode seguir, mas muda o vencimento para 20/04/2026 e sem emitir a NFS-e',
+            'session_id' => $sessionId,
+        ])->assertOk()
+            ->assertJsonPath('acao_sugerida', 'gerar_fatura')
+            ->assertJsonPath('dados_estruturados.metadata.runtime_requires_confirmation', true)
+            ->assertJsonPath('dados_estruturados.dados_mapeados.0.data_vencimento', '2026-04-20')
+            ->assertJsonPath('dados_estruturados.dados_mapeados.0.emitir_nfse', false);
+
+        $this->postJson('/api/chat/enviar', [
+            'mensagem' => 'agora sim, pode seguir',
+            'session_id' => $sessionId,
+        ])->assertOk()
+            ->assertJsonPath('acao_sugerida', null)
+            ->assertJsonPath('dados_estruturados', null)
+            ->assertJsonPath('content', 'Gerei a fatura FAT-202603-4375 para DELTA MEDICINA OCUPACIONAL LTDA no valor de R$ 1.500,00 com vencimento em 20/04/2026 com boleto gerado.');
+
+        $requests = collect(Http::recorded())
+            ->filter(fn (array $call) => $call[0]->url() === 'http://langchain-runtime.test/chat')
+            ->values();
+
+        $this->assertCount(3, $requests);
+
+        $firstPayload = $requests[0][0]->data();
+        $secondPayload = $requests[1][0]->data();
+        $thirdPayload = $requests[2][0]->data();
+
+        $this->assertSame($sessionId, $firstPayload['session_id']);
+        $this->assertSame($sessionId, $secondPayload['session_id']);
+        $this->assertSame($sessionId, $thirdPayload['session_id']);
+        $this->assertCount(1, $firstPayload['historico']);
+        $this->assertCount(3, $secondPayload['historico']);
+        $this->assertCount(5, $thirdPayload['historico']);
+        $this->assertSame('pode seguir, mas muda o vencimento para 20/04/2026 e sem emitir a NFS-e', $secondPayload['mensagem']);
+        $this->assertSame('agora sim, pode seguir', $thirdPayload['mensagem']);
+
+        $assistantMessages = ChatMessage::query()
+            ->where('user_id', $user->id)
+            ->where('session_id', $sessionId)
+            ->where('role', 'assistant')
+            ->orderBy('id')
+            ->get();
+
+        $this->assertCount(3, $assistantMessages);
+        $this->assertSame('Preparei a fatura para confirmacao.', $assistantMessages[0]->content);
+        $this->assertSame('Atualizei a solicitacao pendente com os novos dados.', $assistantMessages[1]->content);
+        $this->assertStringContainsString('FAT-202603-4375', $assistantMessages[2]->content);
+    }
+
+    public function test_chat_langchain_cadastra_cliente_e_retoma_fatura_automaticamente_na_mesma_sessao(): void
+    {
+        config([
+            'chatbot.runtime.driver' => 'langchain',
+            'chatbot.runtime.base_url' => 'http://langchain-runtime.test',
+            'chatbot.runtime.secret' => 'runtime-secret',
+        ]);
+
+        $user = User::factory()->create([
+            'ativo' => true,
+        ]);
+
+        Sanctum::actingAs($user);
+
+        Http::fake([
+            'http://langchain-runtime.test/chat' => Http::sequence()
+                ->push([
+                    'mensagem' => 'Nao encontrei esse cliente no cadastro. Preparei o cadastro do cliente extraido da planilha e, depois da confirmacao, continuo automaticamente a fatura.',
+                    'acao_sugerida' => 'criar_cliente',
+                    'dados_estruturados' => [
+                        'tipo' => 'cliente',
+                        'acao_sugerida' => 'criar_cliente',
+                        'dados_mapeados' => [[
+                            'cnpj' => '34567890000121',
+                            'razao_social' => 'GAMMA MEDICINA OCUPACIONAL LTDA',
+                            'nome_fantasia' => 'GAMMA MEDICINA OCUPACIONAL LTDA',
+                            'status' => 'ativo',
+                            '_resume_fatura_draft_action_id' => 'draft-fat-200',
+                        ]],
+                        'metadata' => [
+                            'fonte' => 'langchain-runtime',
+                            'runtime_pending_action_id' => 'pending-cli-200',
+                            'runtime_requires_confirmation' => true,
+                            'runtime_origin_action' => 'gerar_fatura',
+                        ],
+                    ],
+                ], 200)
+                ->push([
+                    'mensagem' => 'O cliente GAMMA MEDICINA OCUPACIONAL LTDA foi cadastrado com sucesso. Tambem gerei automaticamente a fatura FAT-202603-6551 para GAMMA MEDICINA OCUPACIONAL LTDA no valor de R$ 1.500,00 com vencimento em 15/04/2026 com boleto gerado e NFS-e emitida.',
+                    'acao_sugerida' => null,
+                    'dados_estruturados' => null,
+                ], 200),
+        ]);
+
+        $sessionId = 'sessao-cliente-retoma-fatura';
+
+        $this->postJson('/api/chat/enviar', [
+            'mensagem' => 'Cadastre e fature a Gamma Medicina Ocupacional LTDA, CNPJ 34.567.890/0001-21, referente a março de 2026, com vencimento em 15/04/2026, item PCMSO mensal no valor de 1500 reais. Gere também o boleto e emita a NFS-e.',
+            'session_id' => $sessionId,
+        ])->assertOk()
+            ->assertJsonPath('acao_sugerida', 'criar_cliente')
+            ->assertJsonPath('dados_estruturados.metadata.runtime_requires_confirmation', true)
+            ->assertJsonPath('dados_estruturados.metadata.runtime_origin_action', 'gerar_fatura')
+            ->assertJsonPath('dados_estruturados.dados_mapeados.0.razao_social', 'GAMMA MEDICINA OCUPACIONAL LTDA');
+
+        $this->postJson('/api/chat/enviar', [
+            'mensagem' => 'pode seguir',
+            'session_id' => $sessionId,
+        ])->assertOk()
+            ->assertJsonPath('acao_sugerida', null)
+            ->assertJsonPath('dados_estruturados', null)
+            ->assertJsonPath('content', 'O cliente GAMMA MEDICINA OCUPACIONAL LTDA foi cadastrado com sucesso. Tambem gerei automaticamente a fatura FAT-202603-6551 para GAMMA MEDICINA OCUPACIONAL LTDA no valor de R$ 1.500,00 com vencimento em 15/04/2026 com boleto gerado e NFS-e emitida.');
+
+        $requests = collect(Http::recorded())
+            ->filter(fn (array $call) => $call[0]->url() === 'http://langchain-runtime.test/chat')
+            ->values();
+
+        $this->assertCount(2, $requests);
+
+        $firstPayload = $requests[0][0]->data();
+        $secondPayload = $requests[1][0]->data();
+
+        $this->assertSame($sessionId, $firstPayload['session_id']);
+        $this->assertSame($sessionId, $secondPayload['session_id']);
+        $this->assertCount(1, $firstPayload['historico']);
+        $this->assertCount(3, $secondPayload['historico']);
+        $this->assertSame('pode seguir', $secondPayload['mensagem']);
+
+        $assistantMessages = ChatMessage::query()
+            ->where('user_id', $user->id)
+            ->where('session_id', $sessionId)
+            ->where('role', 'assistant')
+            ->orderBy('id')
+            ->get();
+
+        $this->assertCount(2, $assistantMessages);
+        $this->assertStringContainsString('continuo automaticamente a fatura', $assistantMessages[0]->content);
+        $this->assertStringContainsString('FAT-202603-6551', $assistantMessages[1]->content);
+    }
+
     private function googleDriveServiceAccountJson(): string
     {
         $resource = openssl_pkey_new([

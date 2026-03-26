@@ -171,8 +171,17 @@ class Fatura extends Model
      */
     public function gerarTituloPadrao(): ?Titulo
     {
-        if ($this->titulos()->exists()) {
-            return null; // já existem títulos, não gera de novo
+        $tituloExistente = Titulo::withTrashed()
+            ->where('fatura_id', $this->id)
+            ->orderByDesc('id')
+            ->first();
+
+        if ($tituloExistente) {
+            if (method_exists($tituloExistente, 'trashed') && $tituloExistente->trashed()) {
+                $tituloExistente->restore();
+            }
+
+            return $tituloExistente;
         }
 
         $valor = $this->valor_total ?? $this->valor_servicos ?? 0;
@@ -188,7 +197,7 @@ class Fatura extends Model
             'plano_conta_id'  => $this->cliente?->plano_conta_padrao_id,
             'centro_custo_id' => $this->cliente?->centro_custo_padrao_id,
             'competencia'     => $this->resolverCompetenciaTitulo(),
-            'numero_titulo'   => $this->numero_fatura ?? ('FT-' . $this->id),
+            'numero_titulo'   => $this->gerarNumeroTituloUnico(),
             'nosso_numero'    => null,
             'data_emissao'    => $this->data_emissao ?? now()->toDateString(),
             'data_vencimento' => $this->data_vencimento ?? now()->toDateString(),
@@ -209,6 +218,20 @@ class Fatura extends Model
         $tituloData = array_intersect_key($tituloData, array_flip(Schema::getColumnListing('titulos')));
 
         return $this->titulos()->create($tituloData);
+    }
+
+    private function gerarNumeroTituloUnico(): string
+    {
+        $base = (string) ($this->numero_fatura ?? ('FT-' . $this->id));
+        $numero = $base;
+        $suffix = 1;
+
+        while (Titulo::withTrashed()->where('numero_titulo', $numero)->exists()) {
+            $numero = mb_substr($base, 0, 42) . '-' . str_pad((string) $suffix, 2, '0', STR_PAD_LEFT);
+            $suffix++;
+        }
+
+        return $numero;
     }
 
     private function resolverCompetenciaTitulo(): ?string

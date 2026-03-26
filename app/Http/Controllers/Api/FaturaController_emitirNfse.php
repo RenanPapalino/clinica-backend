@@ -1,12 +1,18 @@
 <?php
 
-// ADICIONAR ESTE MÉTODO AO FaturaController.php
+namespace App\Http\Controllers\Api;
 
-/**
- * Emitir NFSe para uma fatura específica
- * Adicionar ao: app/Http/Controllers/Api/FaturaController.php
- */
-public function emitirNfse($id)
+use App\Http\Controllers\Controller;
+use App\Models\Fatura;
+use Illuminate\Support\Facades\DB;
+
+class FaturaController_emitirNfse extends Controller
+{
+    /**
+     * Emitir NFSe para uma fatura específica
+     * Adicionar ao: app/Http/Controllers/Api/FaturaController.php
+     */
+    public function emitirNfse($id)
 {
     try {
         $fatura = Fatura::with(['cliente', 'itens'])->find($id);
@@ -65,4 +71,5 @@ public function emitirNfse($id)
             'message' => 'Erro ao emitir NFSe: ' . $e->getMessage(),
         ], 500);
     }
+}
 }

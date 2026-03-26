@@ -14,6 +14,7 @@ use App\Models\RagDocument;
 use App\Models\Servico;
 use App\Models\Titulo;
 use App\Models\User;
+use App\Services\Bancos\ItauService;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
@@ -405,6 +406,41 @@ class AgentToolControllerTest extends TestCase
             ->assertJsonPath('data.0.descricao', 'Boleto exames complementares');
     }
 
+    public function test_agent_runtime_busca_servicos_por_descricao_ou_codigo(): void
+    {
+        config(['chatbot.runtime.secret' => 'agent-secret']);
+
+        $user = User::factory()->create([
+            'ativo' => true,
+        ]);
+
+        Servico::create([
+            'codigo' => 'PCMSO-001',
+            'descricao' => 'PCMSO mensal',
+            'valor_unitario' => 1200.00,
+            'tipo_servico' => 'consulta',
+            'ativo' => true,
+        ]);
+
+        Servico::create([
+            'codigo' => 'INATIVO-001',
+            'descricao' => 'Serviço inativo',
+            'valor_unitario' => 50.00,
+            'tipo_servico' => 'consulta',
+            'ativo' => false,
+        ]);
+
+        $this->postJson('/api/internal/agent/servicos/search', [
+            'query' => 'PCMSO',
+            'ativo' => true,
+        ], $this->headersFor($user))
+            ->assertOk()
+            ->assertJsonPath('success', true)
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.codigo', 'PCMSO-001')
+            ->assertJsonPath('data.0.descricao', 'PCMSO mensal');
+    }
+
     public function test_agent_runtime_busca_faturas_por_status_e_nfse(): void
     {
         config(['chatbot.runtime.secret' => 'agent-secret']);
@@ -623,6 +659,192 @@ class AgentToolControllerTest extends TestCase
             ->assertJsonPath('data.entradas_previstas', 2000)
             ->assertJsonPath('data.saidas_previstas', 650)
             ->assertJsonPath('data.saldo_previsto', 1350);
+    }
+
+    public function test_agent_runtime_cria_fatura_com_boleto_e_nfse_no_mesmo_fluxo(): void
+    {
+        config(['chatbot.runtime.secret' => 'agent-secret']);
+
+        $user = User::factory()->create([
+            'ativo' => true,
+        ]);
+
+        $cliente = Cliente::factory()->create([
+            'cnpj' => '55667788000144',
+            'razao_social' => 'CLINICA FLUXO COMPLETO LTDA',
+            'aliquota_iss' => 5.00,
+            'status' => 'ativo',
+        ]);
+        $servico = Servico::create([
+            'codigo' => 'PCMSO-MENSAL',
+            'descricao' => 'PCMSO mensal',
+            'valor_unitario' => 1200.00,
+            'ativo' => true,
+        ]);
+
+        $this->mock(ItauService::class, function ($mock) {
+            $mock->shouldReceive('registrarBoleto')
+                ->once()
+                ->andReturn([
+                    'nosso_numero' => '12345678901',
+                    'codigo_barras' => '34191790010104351004791020150008291070026000',
+                    'linha_digitavel' => '34191.79001 01043.510047 91020.150008 2 91070026000',
+                    'url_boleto' => 'https://boletos.test/12345678901',
+                ]);
+        });
+
+        $response = $this->postJson('/api/internal/agent/faturas', [
+            'cliente_id' => $cliente->id,
+            'periodo_referencia' => '2026-03',
+            'data_vencimento' => now()->addDays(7)->toDateString(),
+            'gerar_boleto' => true,
+            'emitir_nfse' => true,
+            'codigo_servico' => '17.01',
+            'discriminacao' => 'Serviços ocupacionais prestados em março/2026.',
+            'itens' => [
+                [
+                    'servico_id' => $servico->id,
+                    'descricao' => 'PCMSO mensal',
+                    'quantidade' => 1,
+                    'valor_unitario' => 1200.00,
+                ],
+            ],
+        ], $this->headersFor($user));
+
+        $response->assertStatus(201)
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.cliente_id', $cliente->id)
+            ->assertJsonPath('data.boleto_gerado', true)
+            ->assertJsonPath('data.boleto.mode', 'banco')
+            ->assertJsonPath('data.boleto.nosso_numero', '12345678901')
+            ->assertJsonPath('data.nfse.codigo_servico', '17.01')
+            ->assertJsonPath('data.nfse_emitida', true)
+            ->assertJsonPath('data.nfse_numero', $response->json('data.nfse.numero_nfse'))
+            ->assertJsonPath('data.link_boleto', 'https://boletos.test/12345678901');
+
+        $faturaId = $response->json('data.id');
+
+        $this->assertDatabaseHas('faturas', [
+            'id' => $faturaId,
+            'cliente_id' => $cliente->id,
+            'nfse_emitida' => 1,
+            'status' => 'emitida',
+        ]);
+
+        $this->assertDatabaseHas('titulos', [
+            'fatura_id' => $faturaId,
+            'tipo' => 'receber',
+            'nosso_numero' => '12345678901',
+            'url_boleto' => 'https://boletos.test/12345678901',
+        ]);
+
+        $this->assertDatabaseHas('nfse', [
+            'fatura_id' => $faturaId,
+            'cliente_id' => $cliente->id,
+            'codigo_servico' => '17.01',
+            'status' => 'emitida',
+        ]);
+    }
+
+    public function test_agent_runtime_encadeia_upsert_de_cliente_e_criacao_de_fatura_com_boleto_e_nfse(): void
+    {
+        config(['chatbot.runtime.secret' => 'agent-secret']);
+
+        $user = User::factory()->create([
+            'ativo' => true,
+        ]);
+
+        $servico = Servico::create([
+            'codigo' => 'PCMSO-CHATBOT',
+            'descricao' => 'PCMSO mensal',
+            'valor_unitario' => 1500.00,
+            'tipo_servico' => 'consulta',
+            'ativo' => true,
+        ]);
+
+        $this->mock(ItauService::class, function ($mock) {
+            $mock->shouldReceive('registrarBoleto')
+                ->once()
+                ->andReturn([
+                    'nosso_numero' => '99887766554',
+                    'codigo_barras' => '34191790010104351004791020150008291070026001',
+                    'linha_digitavel' => '34191.79001 01043.510047 91020.150008 2 91070026001',
+                    'url_boleto' => 'https://boletos.test/99887766554',
+                ]);
+        });
+
+        $clienteResponse = $this->postJson('/api/internal/agent/clientes/upsert', [
+            'cnpj' => '34.567.890/0001-21',
+            'razao_social' => 'GAMMA MEDICINA OCUPACIONAL LTDA',
+            'nome_fantasia' => 'GAMMA MEDICINA OCUPACIONAL',
+            'email' => 'financeiro@gamma.com.br',
+            'status' => 'ativo',
+        ], $this->headersFor($user));
+
+        $clienteResponse->assertStatus(201)
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.sync_operation', 'criar')
+            ->assertJsonPath('data.cliente.razao_social', 'GAMMA MEDICINA OCUPACIONAL LTDA');
+
+        $clienteId = $clienteResponse->json('data.cliente.id');
+
+        $faturaResponse = $this->postJson('/api/internal/agent/faturas', [
+            'cliente_id' => $clienteId,
+            'periodo_referencia' => '2026-03',
+            'data_vencimento' => now()->addDays(10)->toDateString(),
+            'gerar_boleto' => true,
+            'emitir_nfse' => true,
+            'codigo_servico' => '17.01',
+            'discriminacao' => 'Serviços ocupacionais prestados em março/2026 via chatbot.',
+            'itens' => [
+                [
+                    'servico_id' => $servico->id,
+                    'descricao' => 'PCMSO mensal',
+                    'quantidade' => 1,
+                    'valor_unitario' => 1500.00,
+                ],
+            ],
+        ], $this->headersFor($user));
+
+        $faturaResponse->assertStatus(201)
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('data.cliente_id', $clienteId)
+            ->assertJsonPath('data.valor_total', 1500)
+            ->assertJsonPath('data.boleto_gerado', true)
+            ->assertJsonPath('data.boleto.nosso_numero', '99887766554')
+            ->assertJsonPath('data.nfse_emitida', true)
+            ->assertJsonPath('data.nfse.codigo_servico', '17.01')
+            ->assertJsonPath('data.link_boleto', 'https://boletos.test/99887766554');
+
+        $faturaId = $faturaResponse->json('data.id');
+
+        $this->assertDatabaseHas('clientes', [
+            'id' => $clienteId,
+            'cnpj' => '34567890000121',
+            'razao_social' => 'GAMMA MEDICINA OCUPACIONAL LTDA',
+        ]);
+
+        $this->assertDatabaseHas('faturas', [
+            'id' => $faturaId,
+            'cliente_id' => $clienteId,
+            'valor_total' => 1500.00,
+            'nfse_emitida' => 1,
+            'status' => 'emitida',
+        ]);
+
+        $this->assertDatabaseHas('titulos', [
+            'fatura_id' => $faturaId,
+            'cliente_id' => $clienteId,
+            'nosso_numero' => '99887766554',
+            'url_boleto' => 'https://boletos.test/99887766554',
+        ]);
+
+        $this->assertDatabaseHas('nfse', [
+            'fatura_id' => $faturaId,
+            'cliente_id' => $clienteId,
+            'codigo_servico' => '17.01',
+            'status' => 'emitida',
+        ]);
     }
 
     public function test_agent_runtime_retorna_resumo_de_fechamento_diario(): void

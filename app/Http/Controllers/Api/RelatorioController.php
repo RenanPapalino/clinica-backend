@@ -3,14 +3,11 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\Despesa;
-use App\Models\Fatura;
-use App\Models\Titulo;
-use App\Models\Cliente;
 use Barryvdh\DomPDF\Facade\Pdf;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 class RelatorioController extends Controller
 {
@@ -25,17 +22,17 @@ class RelatorioController extends Controller
         $fimMes = $hoje->copy()->endOfMonth();
 
         // Total a receber (títulos em aberto)
-        $totalAReceber = (float) Titulo::query()
+        $totalAReceber = (float) $this->tableQuery('titulos')
             ->whereNotIn('status', ['pago', 'cancelado'])
             ->sum(DB::raw('COALESCE(valor_saldo, valor_original)'));
 
         // Faturamento do mês (faturas emitidas no mês)
-        $faturamentoMes = (float) Fatura::query()
+        $faturamentoMes = (float) $this->tableQuery('faturas')
             ->whereBetween('data_emissao', [$inicioMes, $fimMes])
             ->sum('valor_total');
 
         // Recebido no mês (títulos pagos no mês)
-        $recebidoMes = (float) Titulo::query()
+        $recebidoMes = (float) $this->tableQuery('titulos')
             ->whereNotNull('data_pagamento')
             ->whereBetween('data_pagamento', [$inicioMes, $fimMes])
             ->sum('valor_pago');
@@ -48,7 +45,7 @@ class RelatorioController extends Controller
         // Série de recebimentos últimos 30 dias (para gráfico)
         $inicioJanela = $hoje->copy()->subDays(29);
 
-        $recebimentos = Titulo::query()
+        $recebimentos = $this->tableQuery('titulos')
             ->selectRaw('DATE(data_pagamento) as data, SUM(valor_pago) as total')
             ->whereNotNull('data_pagamento')
             ->whereBetween('data_pagamento', [$inicioJanela, $hoje])
@@ -83,8 +80,9 @@ class RelatorioController extends Controller
         $inicio = $request->get('inicio');
         $fim = $request->get('fim');
         $agrupamento = $request->get('agrupamento', 'mensal'); // 'mensal' ou 'diario'
+        $periodoExpression = $this->periodExpression('data_emissao', $agrupamento);
 
-        $query = Fatura::query()
+        $query = $this->tableQuery('faturas')
             ->whereNotIn('status', ['cancelada']);
 
         if ($inicio) {
@@ -96,13 +94,12 @@ class RelatorioController extends Controller
         }
 
         if ($agrupamento === 'diario') {
-            $query->selectRaw('DATE(data_emissao) as periodo, SUM(valor_total) as total')
-                  ->groupBy(DB::raw('DATE(data_emissao)'))
+            $query->selectRaw($periodoExpression . ' as periodo, SUM(valor_total) as total')
+                  ->groupByRaw($periodoExpression)
                   ->orderBy('periodo');
         } else {
-            // mensal
-            $query->selectRaw("DATE_FORMAT(data_emissao, '%Y-%m') as periodo, SUM(valor_total) as total")
-                  ->groupBy(DB::raw("DATE_FORMAT(data_emissao, '%Y-%m')"))
+            $query->selectRaw($periodoExpression . ' as periodo, SUM(valor_total) as total')
+                  ->groupByRaw($periodoExpression)
                   ->orderBy('periodo');
         }
 
@@ -134,7 +131,7 @@ class RelatorioController extends Controller
     {
         $limit = (int) ($request->get('limit', 5));
 
-        $rows = Fatura::query()
+        $rows = $this->tableQuery('faturas')
             ->join('clientes', 'clientes.id', '=', 'faturas.cliente_id')
             ->selectRaw('clientes.id, clientes.razao_social, clientes.nome_fantasia, SUM(faturas.valor_total) as total')
             ->whereNotIn('faturas.status', ['cancelada'])
@@ -170,27 +167,31 @@ class RelatorioController extends Controller
             ? 'diario'
             : 'mensal';
 
-        $selectPeriodo = $agrupamento === 'diario'
-            ? "DATE(%s)"
-            : "DATE_FORMAT(%s, '%Y-%m')";
+        $periodoEntradasExpression = $this->periodExpression('data_pagamento', $agrupamento);
+        $periodoSaidasExpression = $this->periodExpression('data_pagamento', $agrupamento);
 
-        $entradas = Titulo::query()
-            ->selectRaw(sprintf($selectPeriodo, 'data_pagamento') . ' as periodo')
+        $entradasQuery = $this->tableQuery('titulos')
+            ->selectRaw($periodoEntradasExpression . ' as periodo')
             ->selectRaw('SUM(COALESCE(valor_pago, valor_original, 0)) as total')
-            ->where('tipo', 'receber')
             ->where('status', 'pago')
             ->whereNotNull('data_pagamento')
-            ->whereBetween('data_pagamento', [$inicio->toDateString(), $fim->toDateString()])
-            ->groupBy('periodo')
+            ->whereBetween('data_pagamento', [$inicio->toDateString(), $fim->toDateString()]);
+
+        if ($this->tableHasColumn('titulos', 'tipo')) {
+            $entradasQuery->where('tipo', 'receber');
+        }
+
+        $entradas = $entradasQuery
+            ->groupByRaw($periodoEntradasExpression)
             ->pluck('total', 'periodo');
 
-        $saidas = Despesa::query()
-            ->selectRaw(sprintf($selectPeriodo, 'data_pagamento') . ' as periodo')
+        $saidas = $this->tableQuery('despesas')
+            ->selectRaw($periodoSaidasExpression . ' as periodo')
             ->selectRaw('SUM(COALESCE(valor_pago, valor_original, valor, 0)) as total')
             ->where('status', 'pago')
             ->whereNotNull('data_pagamento')
             ->whereBetween('data_pagamento', [$inicio->toDateString(), $fim->toDateString()])
-            ->groupBy('periodo')
+            ->groupByRaw($periodoSaidasExpression)
             ->pluck('total', 'periodo');
 
         $cursor = $agrupamento === 'diario'
@@ -254,7 +255,7 @@ class RelatorioController extends Controller
             true
         );
 
-        $faturas = Fatura::query()
+        $faturas = $this->tableQuery('faturas')
             ->whereNotIn('status', ['cancelada'])
             ->whereBetween('data_emissao', [$inicio->toDateString(), $fim->toDateString()]);
 
@@ -263,7 +264,7 @@ class RelatorioController extends Controller
         $descontos = (float) (clone $faturas)->sum(DB::raw('COALESCE(valor_descontos, 0)'));
         $iss = (float) (clone $faturas)->sum(DB::raw('COALESCE(valor_iss, 0)'));
 
-        $despesasOperacionais = (float) Despesa::query()
+        $despesasOperacionais = (float) $this->tableQuery('despesas')
             ->where('status', '!=', 'cancelado')
             ->where(function ($query) use ($inicio, $fim) {
                 $query->whereBetween('data_emissao', [$inicio->toDateString(), $fim->toDateString()])
@@ -373,6 +374,51 @@ class RelatorioController extends Controller
         }
 
         return [$inicioCarbon, $fimCarbon];
+    }
+
+    private function tableQuery(string $table)
+    {
+        $query = DB::table($table);
+
+        if ($this->tableHasColumn($table, 'deleted_at')) {
+            $query->whereNull("{$table}.deleted_at");
+        }
+
+        return $query;
+    }
+
+    private function tableHasColumn(string $table, string $column): bool
+    {
+        static $cache = [];
+
+        $key = $table . '.' . $column;
+
+        if (!array_key_exists($key, $cache)) {
+            $cache[$key] = Schema::hasColumn($table, $column);
+        }
+
+        return $cache[$key];
+    }
+
+    private function periodExpression(string $column, string $agrupamento): string
+    {
+        $driver = DB::connection()->getDriverName();
+        $daily = $agrupamento === 'diario';
+
+        return match ($driver) {
+            'pgsql' => $daily
+                ? "DATE({$column})"
+                : "TO_CHAR({$column}, 'YYYY-MM')",
+            'sqlite' => $daily
+                ? "date({$column})"
+                : "strftime('%Y-%m', {$column})",
+            'sqlsrv' => $daily
+                ? "CONVERT(date, {$column})"
+                : "CONVERT(varchar(7), {$column}, 126)",
+            default => $daily
+                ? "DATE({$column})"
+                : "DATE_FORMAT({$column}, '%Y-%m')",
+        };
     }
 
     private function renderDrePdf(array $payload): string

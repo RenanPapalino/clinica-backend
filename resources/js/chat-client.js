@@ -77,7 +77,7 @@ class ChatClient {
         this.restoreState();
         this.bindEvents();
         this.updateControls();
-        this.setStatus('Pronto para conversar com o chatbot.');
+        this.setStatus('Pronto para conversar com a MedIA.');
     }
 
     restoreState() {
@@ -188,7 +188,7 @@ class ChatClient {
 
         this.isSending = true;
         this.updateControls();
-        this.setStatus('Enviando para o chatbot...');
+        this.setStatus('Enviando para a MedIA...');
 
         try {
             const formData = new FormData();
@@ -238,7 +238,7 @@ class ChatClient {
         } catch (error) {
             console.error(error);
             const payload = error?.response?.data || {};
-            const messageText = payload?.message || error?.message || 'Falha ao enviar mensagem para o chatbot.';
+            const messageText = payload?.message || error?.message || 'Falha ao enviar mensagem para a MedIA.';
             this.appendMessage('assistant', messageText);
             this.setStatus(messageText);
         } finally {
@@ -248,7 +248,7 @@ class ChatClient {
     }
 
     handleChatResponse(data) {
-        const content = data?.content || data?.mensagem || data?.message || 'Sem resposta do chatbot.';
+        const content = data?.content || data?.mensagem || data?.message || 'Sem resposta da MedIA.';
         this.appendMessage('assistant', content, {
             action: data?.acao_sugerida || data?.dados_estruturados?.acao_sugerida || null,
         });
@@ -371,7 +371,7 @@ class ChatClient {
         const header = document.createElement('div');
         header.className = 'mb-2 flex items-center justify-between gap-3 text-[11px] uppercase tracking-[0.22em] text-white/45';
         header.innerHTML = `
-            <span>${role === 'assistant' ? 'Chatbot' : 'Você'}</span>
+            <span>${role === 'assistant' ? 'MedIA' : 'Você'}</span>
             <span>${meta.timestamp || formatTimestamp()}</span>
         `;
 
@@ -500,7 +500,7 @@ class ChatClient {
         this.clearAudioPreview();
 
         if (!keepStatus) {
-            this.setStatus('Pronto para conversar com o chatbot.');
+            this.setStatus('Pronto para conversar com a MedIA.');
         }
 
         this.updateControls();

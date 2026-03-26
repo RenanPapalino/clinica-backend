@@ -4,6 +4,8 @@ namespace App\Http\Controllers\Api;
 
 use App\Actions\Cadastros\CriarClienteAction;
 use App\Http\Controllers\Controller;
+use App\Http\Requests\StoreClienteRequest;
+use App\Http\Requests\UpdateClienteRequest;
 use App\Models\Cliente;
 use App\Services\CpfCnpjService;
 use App\Services\CnpjaService;
@@ -35,29 +37,10 @@ class ClienteController extends Controller
         ]);
     }
 
-    public function store(Request $request, CriarClienteAction $criarClienteAction)
+    public function store(StoreClienteRequest $request, CriarClienteAction $criarClienteAction)
     {
         try {
-            $data = $request->validate([
-                'cnpj' => 'required|string',
-                'razao_social' => 'required|string|max:200',
-                'nome_fantasia' => 'nullable|string|max:200',
-                'inscricao_municipal' => 'nullable|string|max:50',
-                'inscricao_estadual' => 'nullable|string|max:50',
-                'email' => 'nullable|email|max:100',
-                'telefone' => 'nullable|string|max:20',
-                'celular' => 'nullable|string|max:20',
-                'site' => 'nullable|string|max:255',
-                'cep' => 'nullable|string|max:10',
-                'logradouro' => 'nullable|string|max:255',
-                'numero' => 'nullable|string|max:20',
-                'complemento' => 'nullable|string|max:255',
-                'bairro' => 'nullable|string|max:100',
-                'cidade' => 'nullable|string|max:100',
-                'uf' => 'nullable|string|max:2',
-                'status' => 'nullable|in:ativo,inativo',
-                'observacoes' => 'nullable|string|max:1000',
-            ]);
+            $data = $request->validated();
 
             $cliente = $criarClienteAction->execute($data);
 
@@ -78,30 +61,11 @@ class ClienteController extends Controller
         return response()->json(['success' => true, 'data' => $cliente]);
     }
 
-    public function update(Request $request, $id)
+    public function update(UpdateClienteRequest $request, $id)
     {
         try {
             $cliente = Cliente::findOrFail($id);
-            $data = $request->validate([
-                'cnpj' => 'sometimes|required|string',
-                'razao_social' => 'sometimes|required|string|max:200',
-                'nome_fantasia' => 'nullable|string|max:200',
-                'inscricao_municipal' => 'nullable|string|max:50',
-                'inscricao_estadual' => 'nullable|string|max:50',
-                'email' => 'nullable|email|max:100',
-                'telefone' => 'nullable|string|max:20',
-                'celular' => 'nullable|string|max:20',
-                'site' => 'nullable|string|max:255',
-                'cep' => 'nullable|string|max:10',
-                'logradouro' => 'nullable|string|max:255',
-                'numero' => 'nullable|string|max:20',
-                'complemento' => 'nullable|string|max:255',
-                'bairro' => 'nullable|string|max:100',
-                'cidade' => 'nullable|string|max:100',
-                'uf' => 'nullable|string|max:2',
-                'status' => 'nullable|in:ativo,inativo',
-                'observacoes' => 'nullable|string|max:1000',
-            ]);
+            $data = $request->validated();
 
             $cliente->update($data);
 

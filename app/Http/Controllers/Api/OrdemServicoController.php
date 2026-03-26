@@ -168,15 +168,34 @@ class OrdemServicoController extends Controller
 
     public function store(Request $request)
     {
-        $request->validate([
-            'cliente_id' => 'required|exists:clientes,id',
-            'competencia' => 'required|string|size:7', // Ex: 10/2023
-            'data_emissao' => 'required|date',
-            'itens' => 'required|array|min:1',
-            'itens.*.descricao' => 'required|string',
-            'itens.*.valor' => 'required|numeric|min:0',
-            'itens.*.quantidade' => 'required|integer|min:1'
-        ]);
+        $request->validate(
+            [
+                'cliente_id' => 'required|exists:clientes,id',
+                'competencia' => 'required|string|size:7', // Ex: 10/2023
+                'data_emissao' => 'required|date',
+                'itens' => 'required|array|min:1',
+                'itens.*.descricao' => 'required|string',
+                'itens.*.valor' => 'required|numeric|min:0',
+                'itens.*.quantidade' => 'required|integer|min:1'
+            ],
+            [
+                'cliente_id.required' => 'Selecione o cliente da ordem de serviço.',
+                'cliente_id.exists' => 'O cliente selecionado não é válido.',
+                'competencia.required' => 'Informe a competência da ordem de serviço.',
+                'competencia.size' => 'A competência deve estar no formato MM/AAAA.',
+                'data_emissao.required' => 'Informe a data de emissão.',
+                'data_emissao.date' => 'Informe uma data de emissão válida.',
+                'itens.required' => 'Adicione ao menos um item à ordem de serviço.',
+                'itens.array' => 'Os itens da ordem de serviço estão inválidos.',
+                'itens.min' => 'Adicione ao menos um item à ordem de serviço.',
+                'itens.*.descricao.required' => 'Preencha a descrição de todos os itens.',
+                'itens.*.valor.required' => 'Preencha o valor de todos os itens.',
+                'itens.*.valor.numeric' => 'O valor dos itens deve ser numérico.',
+                'itens.*.quantidade.required' => 'Preencha a quantidade de todos os itens.',
+                'itens.*.quantidade.integer' => 'A quantidade dos itens deve ser inteira.',
+                'itens.*.quantidade.min' => 'A quantidade mínima por item é 1.',
+            ]
+        );
 
         return DB::transaction(function () use ($request) {
             // 1. Cria o Cabeçalho
@@ -226,10 +245,28 @@ class OrdemServicoController extends Controller
             'itens.*.descricao' => 'required_with:itens|string',
             'itens.*.valor' => 'required_with:itens|numeric|min:0',
             'itens.*.quantidade' => 'required_with:itens|integer|min:1'
+        ], [
+            'cliente_id.exists' => 'O cliente informado não é válido.',
+            'competencia.size' => 'A competência deve estar no formato MM/AAAA.',
+            'data_emissao.date' => 'Informe uma data de emissão válida.',
+            'status.in' => 'O status informado para a OS é inválido.',
+            'itens.min' => 'Adicione ao menos um item à ordem de serviço.',
+            'itens.*.descricao.required_with' => 'Preencha a descrição de todos os itens.',
+            'itens.*.valor.required_with' => 'Preencha o valor de todos os itens.',
+            'itens.*.quantidade.required_with' => 'Preencha a quantidade de todos os itens.',
         ]);
 
         return DB::transaction(function () use ($request, $id) {
             $os = OrdemServico::with('itens')->findOrFail($id);
+
+            $possuiFaturamento = !empty($os->fatura_gerada_id) || in_array($os->status, ['faturada', 'faturado'], true);
+
+            if ($possuiFaturamento) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Esta ordem de serviço já possui faturamento e não pode ser editada ou cancelada.'
+                ], 422);
+            }
 
             if ($request->filled('cliente_id')) {
                 $os->cliente_id = $request->cliente_id;
@@ -278,6 +315,14 @@ class OrdemServicoController extends Controller
     public function destroy($id)
     {
         $os = OrdemServico::findOrFail($id);
+
+        if (!empty($os->fatura_gerada_id) || in_array($os->status, ['faturada', 'faturado'], true)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Esta ordem de serviço já possui faturamento e não pode ser excluída.'
+            ], 422);
+        }
+
         $os->delete();
 
         return response()->json([

@@ -131,25 +131,41 @@ class ConfiguracaoController extends Controller
      */
     public function storeUsuario(Request $request)
     {
-        $data = $request->validate([
-            'name' => 'required|string|max:255',
-            'email' => 'required|email|unique:users,email',
-            'password' => 'nullable|string|min:6',
-            'role' => 'required|in:admin,user,viewer',
-            'ativo' => 'nullable|boolean',
-            'send_credentials_email' => 'nullable|boolean',
-        ]);
+        $data = $request->validate(
+            [
+                'name' => 'required|string|max:255',
+                'email' => 'required|email|unique:users,email',
+                'password' => 'nullable|string|min:6',
+                'role' => 'required|in:admin,user,viewer',
+                'ativo' => 'nullable|boolean',
+                'generate_password' => 'nullable|boolean',
+                'send_credentials_email' => 'nullable|boolean',
+            ],
+            [
+                'name.required' => 'Informe o nome completo do usuário.',
+                'email.required' => 'Informe o e-mail do usuário.',
+                'email.email' => 'Informe um e-mail válido.',
+                'email.unique' => 'Já existe um usuário cadastrado com este e-mail.',
+                'password.min' => 'A senha inicial deve ter pelo menos 6 caracteres.',
+                'role.required' => 'Selecione o perfil do usuário.',
+                'role.in' => 'Selecione um perfil válido para o usuário.',
+            ]
+        );
 
-        $plainPassword = $data['password'] ?: Str::password(12);
+        $generatePassword = $data['generate_password'] ?? empty($data['password']);
         $sendCredentialsEmail = $data['send_credentials_email'] ?? true;
+        $plainPassword = $generatePassword ? Str::password(12) : $data['password'];
 
+        $data['email'] = mb_strtolower(trim($data['email']));
         unset($data['send_credentials_email']);
+        unset($data['generate_password']);
 
         $data['password'] = Hash::make($plainPassword);
         $data['ativo'] = $data['ativo'] ?? true;
 
         $usuario = User::create($data);
         $emailSent = false;
+        $emailError = null;
 
         if ($sendCredentialsEmail) {
             try {
@@ -164,15 +180,31 @@ class ConfiguracaoController extends Controller
                     'email' => $usuario->email,
                     'error' => $e->getMessage(),
                 ]);
+                $emailError = 'Nao foi possivel enviar o e-mail de acesso automaticamente.';
             }
+        }
+
+        $message = 'Usuário criado com sucesso.';
+
+        if ($sendCredentialsEmail && $emailSent) {
+            $message = 'Usuário criado e credenciais enviadas por e-mail.';
+        } elseif ($sendCredentialsEmail && !$emailSent) {
+            $message = 'Usuário criado, mas o envio do e-mail falhou. Use as credenciais exibidas em tela.';
+        } elseif (!$sendCredentialsEmail) {
+            $message = 'Usuário criado. Compartilhe as credenciais exibidas em tela com o usuário.';
         }
 
         return response()->json([
             'success' => true,
-            'message' => $emailSent
-                ? 'Usuário criado e credenciais enviadas por e-mail.'
-                : 'Usuário criado com sucesso.',
+            'message' => $message,
             'email_sent' => $emailSent,
+            'credentials' => [
+                'login' => $usuario->email,
+                'password' => $plainPassword,
+                'password_generated' => $generatePassword,
+                'sent_by_email' => $sendCredentialsEmail,
+            ],
+            'email_error' => $emailError,
             'data' => $this->serializeUser($usuario->fresh()),
         ]);
     }

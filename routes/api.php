@@ -78,6 +78,7 @@ Route::prefix('internal/agent')->middleware('agent.runtime')->group(function () 
     Route::post('/faturamento/summary', [AgentToolController::class, 'faturamentoSummary']);
     Route::post('/caixa/previsao', [AgentToolController::class, 'previsaoCaixa']);
     Route::post('/clientes/search', [AgentToolController::class, 'searchClientes']);
+    Route::post('/servicos/search', [AgentToolController::class, 'searchServicos']);
     Route::post('/clientes/status', [AgentToolController::class, 'updateClienteStatus']);
     Route::post('/clientes/upsert', [AgentToolController::class, 'upsertCliente']);
     Route::post('/cobrancas/inadimplentes', [AgentToolController::class, 'searchCobrancasInadimplentes']);

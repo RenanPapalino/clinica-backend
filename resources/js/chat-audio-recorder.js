@@ -184,7 +184,7 @@ class ChatAudioRecorder {
 
         this.isSending = true;
         this.updateControls();
-        this.setStatus('Enviando audio para o chatbot...');
+        this.setStatus('Enviando audio para a MedIA...');
 
         try {
             const mimeType = this.audioMimeType || this.audioBlob.type || 'audio/webm';
@@ -223,7 +223,7 @@ class ChatAudioRecorder {
             const message =
                 error?.response?.data?.message ||
                 error?.message ||
-                'Falha ao enviar o audio para o chatbot.';
+                'Falha ao enviar o audio para a MedIA.';
             this.setStatus(message);
             this.renderResponse(error?.response?.data || { success: false, message });
         } finally {

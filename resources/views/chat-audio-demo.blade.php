@@ -19,7 +19,7 @@
                     Demo de Gravação
                 </span>
                 <h1 class="max-w-3xl text-3xl font-semibold tracking-tight text-white md:text-5xl">
-                    Grave um áudio e envie direto para o chatbot financeiro
+                    Grave um áudio e envie direto para a MedIA financeira
                 </h1>
                 <p class="max-w-2xl text-sm leading-6 text-stone-300 md:text-base">
                     Esta tela grava com <code class="rounded bg-white/5 px-1.5 py-0.5 text-orange-200">MediaRecorder</code>,
@@ -120,7 +120,7 @@
                 </div>
 
                 <div class="rounded-[1.75rem] border border-white/10 bg-black/25 p-6">
-                    <h2 class="mb-4 text-lg font-semibold text-white">Resposta do chatbot</h2>
+                    <h2 class="mb-4 text-lg font-semibold text-white">Resposta da MedIA</h2>
                     <pre
                         data-chat-response
                         class="min-h-[20rem] whitespace-pre-wrap rounded-2xl border border-white/8 bg-black/30 p-4 text-sm leading-6 text-stone-200"

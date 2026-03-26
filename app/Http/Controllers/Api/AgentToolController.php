@@ -20,7 +20,9 @@ use App\Models\Despesa;
 use App\Models\Fatura;
 use App\Models\Fornecedor;
 use App\Models\Nfse;
+use App\Models\Servico;
 use App\Models\Titulo;
+use App\Services\Bancos\ItauService;
 use App\Services\CnpjaService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
@@ -297,6 +299,36 @@ class AgentToolController extends Controller
         ]);
     }
 
+    public function searchServicos(Request $request)
+    {
+        $data = $request->validate([
+            'query' => 'nullable|string|max:255',
+            'limit' => 'nullable|integer|min:1|max:50',
+            'ativo' => 'nullable|boolean',
+        ]);
+
+        $query = Servico::query()->orderBy('descricao');
+        $limit = $data['limit'] ?? 20;
+
+        if (array_key_exists('ativo', $data) && $data['ativo'] !== null) {
+            $query->where('ativo', (bool) $data['ativo']);
+        }
+
+        if (!empty($data['query'])) {
+            $termo = $data['query'];
+            $query->where(function ($builder) use ($termo) {
+                $builder->where('descricao', 'like', "%{$termo}%")
+                    ->orWhere('codigo', 'like', "%{$termo}%")
+                    ->orWhere('codigo_servico_municipal', 'like', "%{$termo}%");
+            });
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => $query->limit($limit)->get(),
+        ]);
+    }
+
     public function searchTitulos(Request $request)
     {
         $data = $request->validate([
@@ -538,7 +570,7 @@ class AgentToolController extends Controller
                 'valor_liquido' => $valorLiquido,
                 'status' => 'emitida',
                 'codigo_servico' => $data['codigo_servico'] ?? null,
-                'discriminacao' => $data['discriminacao'] ?? ($fatura->observacoes ?: 'NFS-e gerada via chatbot MedIntelligence.'),
+                'discriminacao' => $data['discriminacao'] ?? ($fatura->observacoes ?: 'NFS-e gerada via MedIA.'),
                 'xml_nfse' => null,
                 'pdf_url' => null,
                 'mensagem_erro' => null,
@@ -1162,7 +1194,11 @@ class AgentToolController extends Controller
         ], 201);
     }
 
-    public function createFatura(Request $request, CriarFaturaManualAction $criarFaturaManualAction)
+    public function createFatura(
+        Request $request,
+        CriarFaturaManualAction $criarFaturaManualAction,
+        ItauService $bancoService
+    )
     {
         $data = $request->validate([
             'cliente_id' => ['required', 'exists:clientes,id'],
@@ -1173,6 +1209,10 @@ class AgentToolController extends Controller
             'observacoes' => ['nullable', 'string'],
             'metadata' => ['nullable', 'array'],
             'gerar_titulo' => ['nullable', 'boolean'],
+            'gerar_boleto' => ['nullable', 'boolean'],
+            'emitir_nfse' => ['nullable', 'boolean'],
+            'codigo_servico' => ['nullable', 'string', 'max:50'],
+            'discriminacao' => ['nullable', 'string'],
             'itens' => ['required', 'array', 'min:1'],
             'itens.*.servico_id' => ['nullable', 'exists:servicos,id'],
             'itens.*.descricao' => ['required', 'string', 'max:255'],
@@ -1185,12 +1225,177 @@ class AgentToolController extends Controller
         $data['gerar_titulo'] = $data['gerar_titulo'] ?? true;
 
         $fatura = $criarFaturaManualAction->execute($data);
+        $fatura->loadMissing(['cliente', 'itens', 'titulos.cliente']);
+
+        $boleto = null;
+        if (($data['gerar_boleto'] ?? false) === true) {
+            $boleto = $this->registrarBoletoFaturaRuntime($fatura, $bancoService);
+            $fatura->refresh()->loadMissing(['cliente', 'itens', 'titulos.cliente']);
+        }
+
+        $nfse = null;
+        if (($data['emitir_nfse'] ?? false) === true) {
+            $nfseModel = $this->emitirNfseRuntime(
+                $fatura,
+                $data['codigo_servico'] ?? null,
+                $data['discriminacao'] ?? null,
+            );
+            $nfse = (new NfseResource($nfseModel))->resolve();
+            $fatura->refresh()->loadMissing(['cliente', 'itens', 'titulos.cliente']);
+        }
+
+        $payload = (new FaturaResource($fatura))->resolve();
+        $payload['boleto'] = $boleto;
+        $payload['boleto_gerado'] = $boleto !== null;
+        $payload['nfse'] = $nfse;
 
         return response()->json([
             'success' => true,
             'message' => 'Fatura criada com sucesso.',
-            'data' => (new FaturaResource($fatura))->resolve(),
+            'data' => $payload,
         ], 201);
+    }
+
+    private function registrarBoletoFaturaRuntime(Fatura $fatura, ItauService $bancoService): array
+    {
+        /** @var Titulo|null $titulo */
+        $titulo = $fatura->titulos->firstWhere('tipo', 'receber');
+
+        if (!$titulo) {
+            $titulo = $fatura->gerarTituloPadrao();
+
+            if (!$titulo) {
+                throw new \RuntimeException('Não foi possível gerar um título financeiro para esta fatura.');
+            }
+
+            $titulo->load('cliente');
+        } else {
+            $titulo->loadMissing('cliente');
+        }
+
+        if (!$titulo->cliente) {
+            throw new \RuntimeException('O título da fatura não possui cliente vinculado para registrar boleto.');
+        }
+
+        if (!empty($titulo->nosso_numero)) {
+            return [
+                'mode' => 'existing',
+                'titulo_id' => $titulo->id,
+                'nosso_numero' => $titulo->nosso_numero,
+                'codigo_barras' => Schema::hasColumn('titulos', 'codigo_barras') ? $titulo->codigo_barras : null,
+                'linha_digitavel' => $titulo->linha_digitavel,
+                'url_boleto' => $titulo->url_boleto,
+                'status' => $titulo->status,
+            ];
+        }
+
+        $mode = 'banco';
+
+        try {
+            $dadosBancarios = $bancoService->registrarBoleto($titulo);
+        } catch (\Throwable $exception) {
+            Log::warning('AGENT RUNTIME: falha ao registrar boleto no banco; aplicando fallback local.', [
+                'fatura_id' => $fatura->id,
+                'titulo_id' => $titulo->id,
+                'error' => $exception->getMessage(),
+            ]);
+
+            $mode = 'local';
+            $dadosBancarios = [
+                'nosso_numero' => 'LOCAL' . str_pad((string) $titulo->id, 10, '0', STR_PAD_LEFT),
+                'linha_digitavel' => $titulo->linha_digitavel,
+                'url_boleto' => $titulo->url_boleto,
+            ];
+        }
+
+        $payload = [
+            'nosso_numero' => $dadosBancarios['nosso_numero'] ?? $titulo->nosso_numero,
+            'linha_digitavel' => $dadosBancarios['linha_digitavel'] ?? $titulo->linha_digitavel,
+            'url_boleto' => $dadosBancarios['url_boleto'] ?? $titulo->url_boleto,
+            'status' => $titulo->status === 'pago' ? 'pago' : 'aberto',
+        ];
+
+        if (Schema::hasColumn('titulos', 'codigo_barras')) {
+            $payload['codigo_barras'] = $dadosBancarios['codigo_barras'] ?? $titulo->codigo_barras;
+        }
+
+        $titulo->update($payload);
+
+        if (in_array($fatura->status, ['emitida', 'nfse_emitida', 'aguardando_boleto'], true)) {
+            $fatura->update(['status' => 'concluida']);
+        }
+
+        $titulo = $titulo->fresh();
+
+        return [
+            'mode' => $mode,
+            'titulo_id' => $titulo->id,
+            'nosso_numero' => $titulo->nosso_numero,
+            'codigo_barras' => Schema::hasColumn('titulos', 'codigo_barras') ? $titulo->codigo_barras : null,
+            'linha_digitavel' => $titulo->linha_digitavel,
+            'url_boleto' => $titulo->url_boleto,
+            'status' => $titulo->status,
+        ];
+    }
+
+    private function emitirNfseRuntime(Fatura $fatura, ?string $codigoServico = null, ?string $discriminacao = null): Nfse
+    {
+        $fatura->loadMissing(['cliente', 'itens', 'titulos']);
+
+        if ($fatura->nfse_emitida) {
+            throw new \RuntimeException('A fatura informada já possui NFS-e registrada.');
+        }
+
+        $valorServicos = (float) ($fatura->valor_servicos ?? 0);
+        if ($valorServicos <= 0) {
+            $valorServicos = (float) $fatura->itens->sum(function ($item) {
+                return (float) ($item->valor_total ?? ((float) $item->quantidade * (float) $item->valor_unitario));
+            });
+        }
+
+        if ($valorServicos <= 0) {
+            $valorServicos = (float) ($fatura->valor_total ?? 0);
+        }
+
+        $aliquotaIss = (float) ($fatura->cliente->aliquota_iss ?? 0);
+        $valorIss = $aliquotaIss > 0 ? round($valorServicos * ($aliquotaIss / 100), 2) : (float) ($fatura->valor_iss ?? 0);
+        $valorLiquido = max(round($valorServicos - $valorIss, 2), 0);
+
+        $numeroGerado = 'NFSE-' . now()->format('YmdHis') . '-' . str_pad((string) $fatura->id, 4, '0', STR_PAD_LEFT);
+        $protocolo = 'CHAT-' . now()->format('YmdHis') . '-' . Str::upper(Str::random(6));
+
+        return DB::transaction(function () use ($fatura, $codigoServico, $discriminacao, $numeroGerado, $protocolo, $valorServicos, $valorIss, $aliquotaIss, $valorLiquido) {
+            $nfse = Nfse::create([
+                'fatura_id' => $fatura->id,
+                'cliente_id' => $fatura->cliente_id,
+                'numero_nfse' => $numeroGerado,
+                'codigo_verificacao' => Str::upper(Str::random(8)),
+                'protocolo' => $protocolo,
+                'data_envio' => now(),
+                'data_emissao' => now(),
+                'data_autorizacao' => now(),
+                'valor_servicos' => $valorServicos,
+                'valor_deducoes' => 0,
+                'valor_iss' => $valorIss,
+                'aliquota_iss' => $aliquotaIss,
+                'valor_liquido' => $valorLiquido,
+                'status' => 'emitida',
+                'codigo_servico' => $codigoServico,
+                'discriminacao' => $discriminacao ?: ($fatura->observacoes ?: 'NFS-e gerada via MedIA.'),
+                'xml_nfse' => null,
+                'pdf_url' => null,
+                'mensagem_erro' => null,
+                'detalhes_erro' => null,
+            ]);
+
+            $fatura->update([
+                'nfse_emitida' => true,
+                'nfse_numero' => $numeroGerado,
+                'status' => 'emitida',
+            ]);
+
+            return $nfse->fresh(['cliente', 'fatura']);
+        });
     }
 
     private function normalizeClientePayload(array $data): array
