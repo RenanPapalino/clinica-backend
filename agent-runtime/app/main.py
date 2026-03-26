@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import logging
 
 from fastapi import Depends, FastAPI, Header, Query
 from fastapi.responses import PlainTextResponse
@@ -17,6 +18,8 @@ from .schemas import ChatPayload, ChatbotResponse, ResumePayload
 from .service import ChatRuntimeService
 from .settings import Settings, get_settings
 
+logger = logging.getLogger(__name__)
+
 
 @lru_cache
 def get_pending_store() -> PendingActionStoreProtocol:
@@ -29,10 +32,19 @@ def get_pending_store() -> PendingActionStoreProtocol:
         return PendingActionStore(ttl_minutes=settings.pending_actions_ttl_minutes)
 
     if backend == "postgres":
-        return PostgresPendingActionStore(
-            dsn=settings.pending_actions_database_url,
-            ttl_minutes=settings.pending_actions_ttl_minutes,
-        )
+        try:
+            return PostgresPendingActionStore(
+                dsn=settings.pending_actions_database_url,
+                ttl_minutes=settings.pending_actions_ttl_minutes,
+            )
+        except Exception:
+            logger.exception(
+                "Falha ao inicializar o backend postgres de pending actions; aplicando fallback para sqlite.",
+                extra={
+                    "pending_actions_backend": backend,
+                    "pending_actions_db_path": settings.pending_actions_db_path,
+                },
+            )
 
     return SqlitePendingActionStore(
         db_path=settings.pending_actions_db_path,

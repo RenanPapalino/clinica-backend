@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from threading import Lock
+from time import perf_counter
 from typing import Any
 
 import httpx
@@ -15,6 +17,14 @@ class LaravelApiError(RuntimeError):
 class LaravelInternalClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._client: httpx.AsyncClient | None = None
+        self._client_lock = Lock()
+        self._metrics_lock = Lock()
+        self._request_counters: dict[str, int] = {
+            "total_requests": 0,
+            "failed_requests": 0,
+        }
+        self._request_metrics: dict[str, dict[str, Any]] = {}
 
     async def session_context(self, *, user_id: int, session_id: str, limit: int) -> dict[str, Any]:
         return await self._request(
@@ -370,7 +380,11 @@ class LaravelInternalClient:
             "X-Agent-User-Id": str(user_id),
         }
 
-        async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds) as client:
+        client = self._get_client()
+        started_at = perf_counter()
+        succeeded = False
+
+        try:
             response = await client.request(
                 method=method,
                 url=url,
@@ -378,21 +392,104 @@ class LaravelInternalClient:
                 headers=headers,
             )
 
-        payload = self._decode_payload(response)
+            payload = self._decode_payload(response)
 
-        if response.status_code >= 400:
-            raise LaravelApiError(
-                payload.get("message")
-                or f"Erro HTTP {response.status_code} ao chamar {path}."
+            if response.status_code >= 400:
+                raise LaravelApiError(
+                    payload.get("message")
+                    or f"Erro HTTP {response.status_code} ao chamar {path}."
+                )
+
+            if isinstance(payload, dict) and payload.get("success") is False:
+                raise LaravelApiError(payload.get("message") or f"Falha logica em {path}.")
+
+            succeeded = True
+
+            if isinstance(payload, dict) and "data" in payload:
+                return payload["data"]
+
+            return payload
+        finally:
+            self._record_request_metric(
+                method=method,
+                path=path,
+                elapsed_ms=(perf_counter() - started_at) * 1000.0,
+                succeeded=succeeded,
             )
 
-        if isinstance(payload, dict) and payload.get("success") is False:
-            raise LaravelApiError(payload.get("message") or f"Falha logica em {path}.")
+    def _get_client(self) -> httpx.AsyncClient:
+        with self._client_lock:
+            if self._client is None or self._client.is_closed:
+                self._client = httpx.AsyncClient(
+                    timeout=self.settings.request_timeout_seconds,
+                    limits=httpx.Limits(
+                        max_connections=100,
+                        max_keepalive_connections=20,
+                        keepalive_expiry=30.0,
+                    ),
+                )
+            return self._client
 
-        if isinstance(payload, dict) and "data" in payload:
-            return payload["data"]
+    def _record_request_metric(
+        self,
+        *,
+        method: str,
+        path: str,
+        elapsed_ms: float,
+        succeeded: bool,
+    ) -> None:
+        normalized_method = str(method or "").upper().strip() or "UNKNOWN"
+        normalized_path = str(path or "").strip() or "/"
+        metric_key = f"{normalized_method} {normalized_path}"
 
-        return payload
+        with self._metrics_lock:
+            self._request_counters["total_requests"] = self._request_counters.get("total_requests", 0) + 1
+            if not succeeded:
+                self._request_counters["failed_requests"] = self._request_counters.get("failed_requests", 0) + 1
+
+            bucket = self._request_metrics.setdefault(
+                metric_key,
+                {
+                    "method": normalized_method,
+                    "path": normalized_path,
+                    "count": 0,
+                    "failed_count": 0,
+                    "total_ms": 0.0,
+                    "last_ms": 0.0,
+                    "max_ms": 0.0,
+                },
+            )
+            bucket["count"] += 1
+            bucket["total_ms"] += float(elapsed_ms)
+            bucket["last_ms"] = float(elapsed_ms)
+            bucket["max_ms"] = max(float(bucket.get("max_ms") or 0.0), float(elapsed_ms))
+            if not succeeded:
+                bucket["failed_count"] += 1
+
+    def get_metrics_snapshot(self) -> dict[str, Any]:
+        with self._metrics_lock:
+            endpoints: dict[str, dict[str, Any]] = {}
+            for key, bucket in sorted(self._request_metrics.items()):
+                count = int(bucket.get("count") or 0)
+                total_ms = float(bucket.get("total_ms") or 0.0)
+                last_ms = float(bucket.get("last_ms") or 0.0)
+                max_ms = float(bucket.get("max_ms") or 0.0)
+                endpoints[key] = {
+                    "method": str(bucket.get("method") or ""),
+                    "path": str(bucket.get("path") or ""),
+                    "count": count,
+                    "failed_count": int(bucket.get("failed_count") or 0),
+                    "total_ms": round(total_ms, 3),
+                    "last_ms": round(last_ms, 3),
+                    "avg_ms": round(total_ms / count, 3) if count > 0 else 0.0,
+                    "max_ms": round(max_ms, 3),
+                }
+
+            return {
+                "total_requests": int(self._request_counters.get("total_requests") or 0),
+                "failed_requests": int(self._request_counters.get("failed_requests") or 0),
+                "endpoints": endpoints,
+            }
 
     def _decode_payload(self, response: httpx.Response) -> dict[str, Any] | list[Any]:
         try:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import closing, suppress
 import json
 import sqlite3
 from dataclasses import dataclass, field
@@ -194,6 +194,8 @@ class PendingActionStore:
 class SqlitePendingActionStore:
     def __init__(self, db_path: str, ttl_minutes: int = 30) -> None:
         self._ttl = timedelta(minutes=ttl_minutes)
+        self._cleanup_interval = timedelta(seconds=60)
+        self._last_cleanup_at: datetime | None = None
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = Lock()
@@ -420,12 +422,17 @@ class SqlitePendingActionStore:
             connection.commit()
 
     def _cleanup_locked(self, connection: sqlite3.Connection) -> None:
+        now = utcnow()
+        if self._last_cleanup_at and (now - self._last_cleanup_at) < self._cleanup_interval:
+            return
+
         expired_before = (utcnow() - self._ttl).isoformat()
         connection.execute(
             "DELETE FROM pending_actions WHERE created_at < ?",
             (expired_before,),
         )
         connection.commit()
+        self._last_cleanup_at = now
 
     def _row_to_pending_action(self, row: sqlite3.Row | None) -> PendingAction | None:
         if row is None:
@@ -470,6 +477,9 @@ class PostgresPendingActionStore:
 
         self._dsn = dsn
         self._ttl = timedelta(minutes=ttl_minutes)
+        self._cleanup_interval = timedelta(seconds=60)
+        self._last_cleanup_at: datetime | None = None
+        self._connection = None
         self._lock = Lock()
         self._init_db()
 
@@ -491,8 +501,7 @@ class PostgresPendingActionStore:
             metadata=metadata or {},
         )
 
-        with self._lock, self._connect() as connection:
-            self._cleanup_locked(connection)
+        def operation(connection):
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
@@ -517,13 +526,13 @@ class PostgresPendingActionStore:
                         pending.created_at.isoformat(),
                     ),
                 )
-            connection.commit()
+
+        self._run_locked(operation)
 
         return pending
 
     def get(self, action_id: str) -> PendingAction | None:
-        with self._lock, self._connect() as connection:
-            self._cleanup_locked(connection)
+        def operation(connection):
             with connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute(
                     """
@@ -533,13 +542,14 @@ class PostgresPendingActionStore:
                     """,
                     (action_id,),
                 )
-                row = cursor.fetchone()
+                return cursor.fetchone()
+
+        row = self._run_locked(operation)
 
         return self._dict_to_pending_action(row)
 
     def pop(self, action_id: str) -> PendingAction | None:
-        with self._lock, self._connect() as connection:
-            self._cleanup_locked(connection)
+        def operation(connection):
             with connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute(
                     """
@@ -557,7 +567,9 @@ class PostgresPendingActionStore:
                     "DELETE FROM pending_actions WHERE action_id = %s",
                     (action_id,),
                 )
-            connection.commit()
+                return row
+
+        row = self._run_locked(operation)
 
         return self._dict_to_pending_action(row)
 
@@ -568,8 +580,7 @@ class PostgresPendingActionStore:
         session_id: str,
         states: set[str] | None = None,
     ) -> PendingAction | None:
-        with self._lock, self._connect() as connection:
-            self._cleanup_locked(connection)
+        def operation(connection):
             with connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute(
                     """
@@ -581,7 +592,9 @@ class PostgresPendingActionStore:
                     """,
                     (user_id, session_id),
                 )
-                rows = cursor.fetchall()
+                return cursor.fetchall()
+
+        rows = self._run_locked(operation)
 
         for row in rows:
             pending = self._dict_to_pending_action(row)
@@ -596,8 +609,7 @@ class PostgresPendingActionStore:
         return None
 
     def mark_completed(self, action_id: str, result: dict) -> PendingAction | None:
-        with self._lock, self._connect() as connection:
-            self._cleanup_locked(connection)
+        def operation(connection):
             with connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute(
                     """
@@ -626,7 +638,11 @@ class PostgresPendingActionStore:
                     """,
                     (json.dumps(metadata, ensure_ascii=True), action_id),
                 )
-            connection.commit()
+                return row
+
+        row = self._run_locked(operation)
+        if row is None:
+            return None
 
         return self.get(action_id)
 
@@ -638,8 +654,7 @@ class PostgresPendingActionStore:
         states: set[str] | None = None,
         limit: int | None = 20,
     ) -> list[PendingAction]:
-        with self._lock, self._connect() as connection:
-            self._cleanup_locked(connection)
+        def operation(connection):
             query = [
                 "SELECT action_id, action, records_json, user_id, session_id, metadata_json, created_at",
                 "FROM pending_actions",
@@ -658,7 +673,9 @@ class PostgresPendingActionStore:
 
             with connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute("\n".join(query), tuple(params))
-                rows = cursor.fetchall()
+                return cursor.fetchall()
+
+        rows = self._run_locked(operation)
 
         items = [self._dict_to_pending_action(row) for row in rows]
         filtered = [
@@ -677,33 +694,67 @@ class PostgresPendingActionStore:
         return filtered[: max(0, limit)]
 
     def _connect(self):
-        return psycopg.connect(self._dsn)
+        if self._connection is None or getattr(self._connection, "closed", False):
+            self._connection = psycopg.connect(self._dsn)
+        return self._connection
+
+    def _reset_connection(self) -> None:
+        if self._connection is None:
+            return
+        with suppress(Exception):
+            self._connection.close()
+        self._connection = None
+
+    def _run_locked(self, operation):
+        with self._lock:
+            connection = self._connect()
+            try:
+                self._cleanup_locked(connection)
+                result = operation(connection)
+                connection.commit()
+                return result
+            except Exception:
+                with suppress(Exception):
+                    connection.rollback()
+                self._reset_connection()
+                raise
 
     def _init_db(self) -> None:
-        with self._lock, self._connect() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS pending_actions (
-                        action_id TEXT PRIMARY KEY,
-                        action TEXT NOT NULL,
-                        records_json JSONB NOT NULL,
-                        user_id BIGINT NOT NULL,
-                        session_id TEXT NOT NULL,
-                        metadata_json JSONB NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL
+        with self._lock:
+            connection = self._connect()
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS pending_actions (
+                            action_id TEXT PRIMARY KEY,
+                            action TEXT NOT NULL,
+                            records_json JSONB NOT NULL,
+                            user_id BIGINT NOT NULL,
+                            session_id TEXT NOT NULL,
+                            metadata_json JSONB NOT NULL,
+                            created_at TIMESTAMPTZ NOT NULL
+                        )
+                        """
                     )
-                    """
-                )
-                cursor.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_pending_actions_session
-                    ON pending_actions (user_id, session_id, created_at DESC)
-                    """
-                )
-            connection.commit()
+                    cursor.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_pending_actions_session
+                        ON pending_actions (user_id, session_id, created_at DESC)
+                        """
+                    )
+                connection.commit()
+            except Exception:
+                with suppress(Exception):
+                    connection.rollback()
+                self._reset_connection()
+                raise
 
     def _cleanup_locked(self, connection) -> None:
+        now = utcnow()
+        if self._last_cleanup_at and (now - self._last_cleanup_at) < self._cleanup_interval:
+            return
+
         expired_before = utcnow().isoformat()
         with connection.cursor() as cursor:
             cursor.execute(
@@ -713,7 +764,7 @@ class PostgresPendingActionStore:
                 """,
                 (expired_before, int(self._ttl.total_seconds() // 60)),
             )
-        connection.commit()
+        self._last_cleanup_at = now
 
     def _dict_to_pending_action(self, row: dict | None) -> PendingAction | None:
         if row is None:

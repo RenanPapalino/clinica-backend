@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import io
 import json
 import logging
@@ -9,6 +10,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from threading import Lock
+from time import perf_counter
 from typing import Any
 
 from langchain.agents import create_agent
@@ -67,8 +69,10 @@ class ChatRuntimeService:
             "repeated_pending_saved": 0,
         }
         self._metrics_event_counts: dict[str, int] = {}
+        self._metrics_stage_timings: dict[str, dict[str, float | int]] = {}
 
     async def process_chat(self, payload: ChatPayload) -> ChatbotResponse:
+        started_at = perf_counter()
         if not self.settings.openai_api_key:
             return ChatbotResponse(
                 mensagem="OPENAI_API_KEY nao configurada no runtime do chatbot.",
@@ -78,9 +82,15 @@ class ChatRuntimeService:
 
         try:
             parsed_file = parse_attachment(payload.arquivo)
-            parsed_file = await self._enrich_multimodal_attachment(payload, parsed_file)
-            session_context = await self._load_session_context(payload)
-            session_draft = self.pending_actions.latest_for_session(
+            parsed_file = await self._measure_stage_async(
+                "attachment_enrichment",
+                self._enrich_multimodal_attachment(payload, parsed_file),
+            )
+            session_context = await self._measure_stage_async(
+                "session_context_load",
+                self._load_session_context(payload),
+            )
+            session_draft = self._pending_latest_for_session(
                 user_id=payload.user_id,
                 session_id=payload.session_id,
                 states={"draft", "pending_confirmation"},
@@ -138,7 +148,7 @@ class ChatRuntimeService:
                     pending_fields=list((session_draft.metadata or {}).get("pending_fields") or []),
                     message=payload.mensagem or "",
                 )
-                self.pending_actions.pop(session_draft.action_id)
+                self._pending_pop(session_draft.action_id)
                 return ChatbotResponse(
                     mensagem="Tudo bem. Cancelei a pendencia desta sessao. Como posso ajudar agora?",
                     acao_sugerida=None,
@@ -175,10 +185,13 @@ class ChatRuntimeService:
             )
             if strong_confirmation_reminder is not None:
                 return strong_confirmation_reminder
-            updated_pending_preview = await self._build_updated_pending_confirmation_preview(
-                pending=session_draft,
-                payload=payload,
-                parsed_file=parsed_file,
+            updated_pending_preview = await self._measure_stage_async(
+                "pending_confirmation_update",
+                self._build_updated_pending_confirmation_preview(
+                    pending=session_draft,
+                    payload=payload,
+                    parsed_file=parsed_file,
+                ),
             )
             if updated_pending_preview is not None:
                 return updated_pending_preview
@@ -195,7 +208,7 @@ class ChatRuntimeService:
                     pending_fields=list((session_draft.metadata or {}).get("pending_fields") or []),
                     message=payload.mensagem or "",
                 )
-                self.pending_actions.pop(session_draft.action_id)
+                self._pending_pop(session_draft.action_id)
                 session_draft = None
             if draft_resolution == "ignore":
                 self._audit_session_decision(
@@ -229,10 +242,13 @@ class ChatRuntimeService:
             if greeting_response is not None:
                 return greeting_response
 
-            cnpj_lookup_response = await self._build_cnpj_lookup_response(
-                payload=payload,
-                parsed_file=parsed_file,
-                session_draft=session_draft,
+            cnpj_lookup_response = await self._measure_stage_async(
+                "cnpj_lookup",
+                self._build_cnpj_lookup_response(
+                    payload=payload,
+                    parsed_file=parsed_file,
+                    session_draft=session_draft,
+                ),
             )
             if cnpj_lookup_response is not None:
                 return cnpj_lookup_response
@@ -251,9 +267,24 @@ class ChatRuntimeService:
                 message=payload.mensagem or "",
                 has_pending=session_draft is not None,
             )
-            route = await self.router.route(
-                session_context=session_context,
-                current_message=current_message,
+            fast_path_preview = await self._measure_stage_async(
+                "fast_path_preview",
+                self._build_fast_path_heuristic_preview(
+                    payload=payload,
+                    heuristic_action=heuristic_action,
+                    local_intent=local_intent,
+                    parsed_file=parsed_file,
+                    session_draft=session_draft,
+                ),
+            )
+            if fast_path_preview is not None:
+                return fast_path_preview
+            route = await self._measure_stage_async(
+                "router_route",
+                self.router.route(
+                    session_context=session_context,
+                    current_message=current_message,
+                ),
             )
             route = self._apply_local_intent_override(route=route, local_intent=local_intent)
             self._audit_session_decision(
@@ -287,10 +318,13 @@ class ChatRuntimeService:
             )
 
             if should_attempt_action:
-                action_plan = await self.action_planner.plan(
-                    payload=payload,
-                    session_context=session_context,
-                    current_message=current_message,
+                action_plan = await self._measure_stage_async(
+                    "planner_plan",
+                    self.action_planner.plan(
+                        payload=payload,
+                        session_context=session_context,
+                        current_message=current_message,
+                    ),
                 )
                 action_plan = self._merge_route_into_action_plan(route, action_plan)
                 action_plan = self._merge_heuristic_action_plan(
@@ -310,9 +344,12 @@ class ChatRuntimeService:
                     session_draft=session_draft,
                 )
 
-                preview = await self._build_action_preview(
-                    payload=payload,
-                    plan=action_plan,
+                preview = await self._measure_stage_async(
+                    "action_preview",
+                    self._build_action_preview(
+                        payload=payload,
+                        plan=action_plan,
+                    ),
                 )
                 if preview is not None:
                     return preview
@@ -335,20 +372,28 @@ class ChatRuntimeService:
                 response_format=ProviderStrategy(ChatbotResponse),
             )
 
-            result = await agent.ainvoke(
-                {"messages": self._build_messages(session_context, payload, current_message)}
+            result = await self._measure_stage_async(
+                "read_agent_invoke",
+                agent.ainvoke(
+                    {"messages": self._build_messages(session_context, payload, current_message)}
+                ),
             )
 
             return self._normalize_agent_response(result)
         except Exception as exc:
             logger.exception("Falha ao processar chat no runtime", extra={"user_id": payload.user_id})
             return self._runtime_error_response(exc)
+        finally:
+            self._record_stage_timing(
+                "process_chat_total",
+                (perf_counter() - started_at) * 1000.0,
+            )
 
     async def confirm_action(self, payload: ResumePayload) -> dict[str, Any]:
         decision = (payload.decision or "approve").lower().strip()
         if decision != "approve":
             action_id = str(payload.metadata.get("runtime_pending_action_id") or "").strip()
-            pending = self.pending_actions.get(action_id) if action_id else None
+            pending = self._pending_get(action_id) if action_id else None
             self._audit_session_decision(
                 event="confirmation_rejected",
                 user_id=payload.user_id,
@@ -361,7 +406,7 @@ class ChatRuntimeService:
                 pending_fields=list((pending.metadata or {}).get("pending_fields") or []) if pending else None,
             )
             if action_id:
-                self.pending_actions.pop(action_id)
+                self._pending_pop(action_id)
             return {
                 "success": False,
                 "message": "Tudo bem. Nao vou seguir com essa acao.",
@@ -380,7 +425,7 @@ class ChatRuntimeService:
             }
 
         action_id = str(payload.metadata.get("runtime_pending_action_id") or "").strip()
-        pending = self.pending_actions.get(action_id) if action_id else None
+        pending = self._pending_get(action_id) if action_id else None
         completed_result = self._load_completed_confirmation_result(
             action_id=action_id,
             user_id=payload.user_id,
@@ -424,7 +469,7 @@ class ChatRuntimeService:
 
         records = list(payload.dados or [])
         if not records and action_id:
-            pending = self.pending_actions.get(action_id)
+            pending = self._pending_get(action_id)
             if pending is not None and pending.user_id == payload.user_id:
                 records = list(pending.records)
 
@@ -451,7 +496,7 @@ class ChatRuntimeService:
 
         for index, record in enumerate(records, start=1):
             try:
-                normalized_record, missing = await self._normalize_record(
+                normalized_record, missing = await self._normalize_record_with_metrics(
                     action=action,
                     record=record,
                     user_id=payload.user_id,
@@ -468,7 +513,7 @@ class ChatRuntimeService:
                         timestamp=payload.timestamp,
                     )
 
-                result = await self._execute_confirmed_record(
+                result = await self._execute_confirmed_record_with_metrics(
                     action=action,
                     record=normalized_record,
                     user_id=payload.user_id,
@@ -527,7 +572,7 @@ class ChatRuntimeService:
         }
 
         if action_id and total_created > 0:
-            self.pending_actions.mark_completed(action_id, result)
+            self._pending_mark_completed(action_id, result)
 
         self._audit_session_decision(
             event="confirmation_executed",
@@ -544,6 +589,56 @@ class ChatRuntimeService:
 
         return result
 
+    async def _build_fast_path_heuristic_preview(
+        self,
+        *,
+        payload: ChatPayload,
+        heuristic_action: str | None,
+        local_intent: str,
+        parsed_file: ParsedFile,
+        session_draft: Any | None,
+    ) -> ChatbotResponse | None:
+        if heuristic_action is None or session_draft is not None:
+            return None
+
+        if heuristic_action not in {
+            "gerar_boleto",
+            "excluir_boleto",
+            "excluir_fatura",
+            "renegociar_titulo",
+            "emitir_nfse",
+        }:
+            return None
+
+        if parsed_file.text:
+            return None
+
+        if parsed_file.mode is not None and parsed_file.mode != "text":
+            return None
+
+        if local_intent in {"query", "new_query"}:
+            return None
+
+        heuristic_plan = self._build_heuristic_action_plan(
+            action=heuristic_action,
+            message=payload.mensagem or "",
+        )
+        if heuristic_plan is None:
+            return None
+
+        self._audit_session_decision(
+            event="fast_path_heuristic",
+            user_id=payload.user_id,
+            session_id=payload.session_id,
+            action=heuristic_action,
+            decision="skip_router_and_planner",
+            message=payload.mensagem or "",
+        )
+        return await self._build_action_preview(
+            payload=payload,
+            plan=heuristic_plan,
+        )
+
     def _load_completed_confirmation_result(
         self,
         *,
@@ -553,7 +648,7 @@ class ChatRuntimeService:
         if not action_id:
             return None
 
-        pending = self.pending_actions.get(action_id)
+        pending = self._pending_get(action_id)
         if pending is None or pending.user_id != user_id:
             return None
 
@@ -608,6 +703,7 @@ class ChatRuntimeService:
             "pending_actions_backend": self._pending_actions_backend_label(),
             "runtime": self._runtime_metrics_snapshot(),
             "pending_actions": self._pending_action_summary(all_items),
+            "laravel_client": self._laravel_client_metrics_snapshot(),
         }
 
     def render_runtime_metrics_prometheus(self) -> str:
@@ -617,6 +713,21 @@ class ChatRuntimeService:
         event_counts = runtime.get("event_counts") if isinstance(runtime.get("event_counts"), dict) else {}
         pending_summary = (
             metrics.get("pending_actions") if isinstance(metrics.get("pending_actions"), dict) else {}
+        )
+        stage_timings = (
+            runtime.get("stage_timings")
+            if isinstance(runtime.get("stage_timings"), dict)
+            else {}
+        )
+        laravel_client = (
+            metrics.get("laravel_client")
+            if isinstance(metrics.get("laravel_client"), dict)
+            else {}
+        )
+        laravel_endpoints = (
+            laravel_client.get("endpoints")
+            if isinstance(laravel_client.get("endpoints"), dict)
+            else {}
         )
         counts_by_state = (
             pending_summary.get("counts_by_state")
@@ -674,6 +785,161 @@ class ChatRuntimeService:
                 % (
                     self._prometheus_escape_label_value(str(action)),
                     self._prometheus_number(value),
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP agent_runtime_stage_timing_count Total samples recorded per runtime stage.",
+                "# TYPE agent_runtime_stage_timing_count counter",
+            ]
+        )
+        for stage, values in sorted(stage_timings.items()):
+            values = values if isinstance(values, dict) else {}
+            lines.append(
+                'agent_runtime_stage_timing_count{stage="%s"} %s'
+                % (
+                    self._prometheus_escape_label_value(str(stage)),
+                    self._prometheus_number(values.get("count")),
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP agent_runtime_stage_timing_last_ms Last observed runtime stage latency in milliseconds.",
+                "# TYPE agent_runtime_stage_timing_last_ms gauge",
+            ]
+        )
+        for stage, values in sorted(stage_timings.items()):
+            values = values if isinstance(values, dict) else {}
+            lines.append(
+                'agent_runtime_stage_timing_last_ms{stage="%s"} %s'
+                % (
+                    self._prometheus_escape_label_value(str(stage)),
+                    self._prometheus_number(values.get("last_ms")),
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP agent_runtime_stage_timing_avg_ms Average runtime stage latency in milliseconds.",
+                "# TYPE agent_runtime_stage_timing_avg_ms gauge",
+            ]
+        )
+        for stage, values in sorted(stage_timings.items()):
+            values = values if isinstance(values, dict) else {}
+            lines.append(
+                'agent_runtime_stage_timing_avg_ms{stage="%s"} %s'
+                % (
+                    self._prometheus_escape_label_value(str(stage)),
+                    self._prometheus_number(values.get("avg_ms")),
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP agent_runtime_stage_timing_max_ms Maximum runtime stage latency in milliseconds.",
+                "# TYPE agent_runtime_stage_timing_max_ms gauge",
+            ]
+        )
+        for stage, values in sorted(stage_timings.items()):
+            values = values if isinstance(values, dict) else {}
+            lines.append(
+                'agent_runtime_stage_timing_max_ms{stage="%s"} %s'
+                % (
+                    self._prometheus_escape_label_value(str(stage)),
+                    self._prometheus_number(values.get("max_ms")),
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP agent_runtime_laravel_requests_total Total Laravel internal HTTP requests recorded.",
+                "# TYPE agent_runtime_laravel_requests_total counter",
+                f'agent_runtime_laravel_requests_total {self._prometheus_number(laravel_client.get("total_requests"))}',
+                "# HELP agent_runtime_laravel_request_failures_total Total failed Laravel internal HTTP requests recorded.",
+                "# TYPE agent_runtime_laravel_request_failures_total counter",
+                f'agent_runtime_laravel_request_failures_total {self._prometheus_number(laravel_client.get("failed_requests"))}',
+                "# HELP agent_runtime_laravel_request_count Total Laravel requests grouped by method and path.",
+                "# TYPE agent_runtime_laravel_request_count counter",
+            ]
+        )
+        for _, values in sorted(laravel_endpoints.items()):
+            values = values if isinstance(values, dict) else {}
+            lines.append(
+                'agent_runtime_laravel_request_count{method="%s",path="%s"} %s'
+                % (
+                    self._prometheus_escape_label_value(str(values.get("method") or "")),
+                    self._prometheus_escape_label_value(str(values.get("path") or "")),
+                    self._prometheus_number(values.get("count")),
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP agent_runtime_laravel_request_failed_count Failed Laravel requests grouped by method and path.",
+                "# TYPE agent_runtime_laravel_request_failed_count counter",
+            ]
+        )
+        for _, values in sorted(laravel_endpoints.items()):
+            values = values if isinstance(values, dict) else {}
+            lines.append(
+                'agent_runtime_laravel_request_failed_count{method="%s",path="%s"} %s'
+                % (
+                    self._prometheus_escape_label_value(str(values.get("method") or "")),
+                    self._prometheus_escape_label_value(str(values.get("path") or "")),
+                    self._prometheus_number(values.get("failed_count")),
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP agent_runtime_laravel_request_last_ms Last Laravel request latency in milliseconds.",
+                "# TYPE agent_runtime_laravel_request_last_ms gauge",
+            ]
+        )
+        for _, values in sorted(laravel_endpoints.items()):
+            values = values if isinstance(values, dict) else {}
+            lines.append(
+                'agent_runtime_laravel_request_last_ms{method="%s",path="%s"} %s'
+                % (
+                    self._prometheus_escape_label_value(str(values.get("method") or "")),
+                    self._prometheus_escape_label_value(str(values.get("path") or "")),
+                    self._prometheus_number(values.get("last_ms")),
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP agent_runtime_laravel_request_avg_ms Average Laravel request latency in milliseconds.",
+                "# TYPE agent_runtime_laravel_request_avg_ms gauge",
+            ]
+        )
+        for _, values in sorted(laravel_endpoints.items()):
+            values = values if isinstance(values, dict) else {}
+            lines.append(
+                'agent_runtime_laravel_request_avg_ms{method="%s",path="%s"} %s'
+                % (
+                    self._prometheus_escape_label_value(str(values.get("method") or "")),
+                    self._prometheus_escape_label_value(str(values.get("path") or "")),
+                    self._prometheus_number(values.get("avg_ms")),
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP agent_runtime_laravel_request_max_ms Maximum Laravel request latency in milliseconds.",
+                "# TYPE agent_runtime_laravel_request_max_ms gauge",
+            ]
+        )
+        for _, values in sorted(laravel_endpoints.items()):
+            values = values if isinstance(values, dict) else {}
+            lines.append(
+                'agent_runtime_laravel_request_max_ms{method="%s",path="%s"} %s'
+                % (
+                    self._prometheus_escape_label_value(str(values.get("method") or "")),
+                    self._prometheus_escape_label_value(str(values.get("path") or "")),
+                    self._prometheus_number(values.get("max_ms")),
                 )
             )
 
@@ -803,11 +1069,25 @@ class ChatRuntimeService:
             (datetime.now(timezone.utc) - self._metrics_started_at).total_seconds(),
         )
         with self._metrics_lock:
+            stage_timings: dict[str, dict[str, float | int]] = {}
+            for stage, bucket in sorted(self._metrics_stage_timings.items()):
+                count = int(bucket.get("count") or 0)
+                total_ms = float(bucket.get("total_ms") or 0.0)
+                last_ms = float(bucket.get("last_ms") or 0.0)
+                max_ms = float(bucket.get("max_ms") or 0.0)
+                stage_timings[stage] = {
+                    "count": count,
+                    "total_ms": round(total_ms, 3),
+                    "last_ms": round(last_ms, 3),
+                    "avg_ms": round(total_ms / count, 3) if count > 0 else 0.0,
+                    "max_ms": round(max_ms, 3),
+                }
             return {
                 "started_at": self._metrics_started_at.isoformat(),
                 "uptime_seconds": round(uptime_seconds, 3),
                 "counters": dict(self._metrics_counters),
                 "event_counts": dict(self._metrics_event_counts),
+                "stage_timings": stage_timings,
             }
 
     def _pending_action_summary(self, items: list[Any]) -> dict[str, Any]:
@@ -889,6 +1169,149 @@ class ChatRuntimeService:
         if parsed is not None:
             return f"{parsed:.3f}".rstrip("0").rstrip(".") or "0"
         return "0"
+
+    async def _measure_stage_async(self, stage: str, awaitable):
+        started_at = perf_counter()
+        try:
+            return await awaitable
+        finally:
+            self._record_stage_timing(stage, (perf_counter() - started_at) * 1000.0)
+
+    def _measure_stage_sync(self, stage: str, callback):
+        started_at = perf_counter()
+        try:
+            return callback()
+        finally:
+            self._record_stage_timing(stage, (perf_counter() - started_at) * 1000.0)
+
+    def _record_stage_timing(self, stage: str, elapsed_ms: float) -> None:
+        normalized_stage = str(stage or "").strip()
+        if not normalized_stage:
+            return
+
+        with self._metrics_lock:
+            bucket = self._metrics_stage_timings.setdefault(
+                normalized_stage,
+                {
+                    "count": 0,
+                    "total_ms": 0.0,
+                    "last_ms": 0.0,
+                    "max_ms": 0.0,
+                },
+            )
+            bucket["count"] = int(bucket.get("count") or 0) + 1
+            bucket["total_ms"] = float(bucket.get("total_ms") or 0.0) + float(elapsed_ms)
+            bucket["last_ms"] = float(elapsed_ms)
+            bucket["max_ms"] = max(float(bucket.get("max_ms") or 0.0), float(elapsed_ms))
+
+    def _stage_timings_snapshot(self) -> dict[str, dict[str, float | int]]:
+        with self._metrics_lock:
+            snapshot: dict[str, dict[str, float | int]] = {}
+            for stage, bucket in sorted(self._metrics_stage_timings.items()):
+                count = int(bucket.get("count") or 0)
+                total_ms = float(bucket.get("total_ms") or 0.0)
+                last_ms = float(bucket.get("last_ms") or 0.0)
+                max_ms = float(bucket.get("max_ms") or 0.0)
+                snapshot[stage] = {
+                    "count": count,
+                    "total_ms": round(total_ms, 3),
+                    "last_ms": round(last_ms, 3),
+                    "avg_ms": round(total_ms / count, 3) if count > 0 else 0.0,
+                    "max_ms": round(max_ms, 3),
+                }
+            return snapshot
+
+    def _laravel_client_metrics_snapshot(self) -> dict[str, Any]:
+        default_snapshot = {
+            "total_requests": 0,
+            "failed_requests": 0,
+            "endpoints": {},
+        }
+        snapshot_fn = getattr(self.laravel_client, "get_metrics_snapshot", None)
+        if snapshot_fn is None or not callable(snapshot_fn) or inspect.iscoroutinefunction(snapshot_fn):
+            return default_snapshot
+
+        try:
+            snapshot = snapshot_fn()
+        except Exception:
+            return default_snapshot
+
+        if not isinstance(snapshot, dict):
+            return default_snapshot
+
+        return {
+            "total_requests": int(snapshot.get("total_requests") or 0),
+            "failed_requests": int(snapshot.get("failed_requests") or 0),
+            "endpoints": dict(snapshot.get("endpoints") or {}),
+        }
+
+    def _pending_latest_for_session(self, **kwargs):
+        return self._measure_stage_sync(
+            "pending_latest_for_session",
+            lambda: self.pending_actions.latest_for_session(**kwargs),
+        )
+
+    def _pending_get(self, action_id: str):
+        return self._measure_stage_sync(
+            "pending_get",
+            lambda: self.pending_actions.get(action_id),
+        )
+
+    def _pending_pop(self, action_id: str):
+        return self._measure_stage_sync(
+            "pending_pop",
+            lambda: self.pending_actions.pop(action_id),
+        )
+
+    def _pending_save(self, *, action: str, records: list[dict[str, Any]], user_id: int, session_id: str, metadata: dict[str, Any]):
+        return self._measure_stage_sync(
+            "pending_save",
+            lambda: self.pending_actions.save(
+                action=action,
+                records=records,
+                user_id=user_id,
+                session_id=session_id,
+                metadata=metadata,
+            ),
+        )
+
+    def _pending_mark_completed(self, action_id: str, result: dict[str, Any]) -> None:
+        self._measure_stage_sync(
+            "pending_mark_completed",
+            lambda: self.pending_actions.mark_completed(action_id, result),
+        )
+
+    async def _normalize_record_with_metrics(
+        self,
+        *,
+        action: str,
+        record: dict[str, Any],
+        user_id: int,
+    ) -> tuple[dict[str, Any], list[str]]:
+        return await self._measure_stage_async(
+            "confirm_normalize_record",
+            self._normalize_record(
+                action=action,
+                record=record,
+                user_id=user_id,
+            ),
+        )
+
+    async def _execute_confirmed_record_with_metrics(
+        self,
+        *,
+        action: str,
+        record: dict[str, Any],
+        user_id: int,
+    ) -> dict[str, Any]:
+        return await self._measure_stage_async(
+            "confirm_execute_record",
+            self._execute_confirmed_record(
+                action=action,
+                record=record,
+                user_id=user_id,
+            ),
+        )
 
     def _audit_message_excerpt(self, message: str) -> str:
         normalized = re.sub(r"\s+", " ", str(message or "").strip())
@@ -1440,7 +1863,7 @@ class ChatRuntimeService:
         pending_fields: list[str] = []
 
         for record in records:
-            normalized_record, missing = await self._normalize_record(
+            normalized_record, missing = await self._normalize_record_with_metrics(
                 action=action,
                 record=record,
                 user_id=payload.user_id,
@@ -2644,7 +3067,7 @@ class ChatRuntimeService:
         if not draft_action_id:
             return None
 
-        pending = self.pending_actions.get(draft_action_id)
+        pending = self._pending_get(draft_action_id)
         if pending is None or pending.user_id != user_id:
             return None
 
@@ -2668,7 +3091,7 @@ class ChatRuntimeService:
                     **(draft_record if isinstance(draft_record, dict) else {}),
                     "cliente_id": cliente_id,
                 }
-                normalized_fatura, missing = await self._normalize_record(
+                normalized_fatura, missing = await self._normalize_record_with_metrics(
                     action="gerar_fatura",
                     record=updated_record,
                     user_id=user_id,
@@ -2677,7 +3100,7 @@ class ChatRuntimeService:
                     raise ValueError("Faltam campos obrigatorios: " + ", ".join(missing))
 
                 created_faturas.append(
-                    await self._execute_confirmed_record(
+                    await self._execute_confirmed_record_with_metrics(
                         action="gerar_fatura",
                         record=normalized_fatura,
                         user_id=user_id,
@@ -2686,7 +3109,7 @@ class ChatRuntimeService:
             except Exception as exc:
                 errors.append(f"Linha {index}: {exc}")
 
-        self.pending_actions.pop(draft_action_id)
+        self._pending_pop(draft_action_id)
 
         return {
             "acao": "gerar_fatura",
@@ -3920,7 +4343,7 @@ class ChatRuntimeService:
         session_id: str,
         metadata: dict[str, Any],
     ):
-        previous = self.pending_actions.latest_for_session(
+        previous = self._pending_latest_for_session(
             user_id=user_id,
             session_id=session_id,
             states={str(metadata.get("state") or "").strip()} if metadata.get("state") else None,
@@ -3935,7 +4358,7 @@ class ChatRuntimeService:
             == list(metadata.get("pending_fields") or [])
         ):
             repeat_count = int((previous.metadata or {}).get("repeat_count") or 0) + 1
-            self.pending_actions.pop(previous.action_id)
+            self._pending_pop(previous.action_id)
 
         state = str(metadata.get("state") or "").strip() or None
         should_suspend = (
@@ -3962,7 +4385,7 @@ class ChatRuntimeService:
                 session_id=session_id,
             )
 
-        pending = self.pending_actions.save(
+        pending = self._pending_save(
             action=action,
             records=records,
             user_id=user_id,
@@ -4003,7 +4426,7 @@ class ChatRuntimeService:
         session_id: str,
     ) -> None:
         while True:
-            active = self.pending_actions.latest_for_session(
+            active = self._pending_latest_for_session(
                 user_id=user_id,
                 session_id=session_id,
                 states={"draft", "pending_confirmation"},
@@ -4014,7 +4437,7 @@ class ChatRuntimeService:
             if self._canonical_action(active.action) != action:
                 return
 
-            self.pending_actions.pop(active.action_id)
+            self._pending_pop(active.action_id)
 
     def _should_auto_confirm_pending_action(
         self,
@@ -4354,7 +4777,7 @@ class ChatRuntimeService:
         normalized_records: list[dict[str, Any]] = []
         pending_fields: list[str] = []
         for record in updated_records:
-            normalized_record, missing = await self._normalize_record(
+            normalized_record, missing = await self._normalize_record_with_metrics(
                 action=action,
                 record=record,
                 user_id=payload.user_id,
@@ -4367,7 +4790,7 @@ class ChatRuntimeService:
         if not normalized_records:
             return None
 
-        self.pending_actions.pop(pending.action_id)
+        self._pending_pop(pending.action_id)
 
         next_state = "draft" if pending_fields else "pending_confirmation"
         next_pending = self._save_pending_action(

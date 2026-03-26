@@ -804,6 +804,24 @@ class ChatRuntimeServiceTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(preview.dados_estruturados.dados_mapeados[0]["fatura_id"], 900)
 
+    async def test_fast_path_heuristico_pula_router_e_planner_para_acao_clara(self) -> None:
+        self.service.router.route = AsyncMock(side_effect=AssertionError("router nao deveria ser chamado"))
+        self.service.action_planner.plan = AsyncMock(side_effect=AssertionError("planner nao deveria ser chamado"))
+
+        preview = await self.service.process_chat(
+            ChatPayload(
+                mensagem="gere o boleto da fatura FAT-202603-5937",
+                user_id=7,
+                user_name="Renan",
+                user_email="renan@example.com",
+                session_id="sessao-fast-path-boleto",
+            )
+        )
+
+        self.assertEqual(preview.acao_sugerida, "gerar_boleto")
+        self.assertTrue(preview.dados_estruturados.metadata["runtime_requires_confirmation"])
+        self.assertEqual(preview.dados_estruturados.dados_mapeados[0]["fatura_id"], 900)
+
     async def test_confirmacao_fraca_nao_executa_exclusao_boleto(self) -> None:
         self.service.pending_actions.save(
             action="excluir_boleto",

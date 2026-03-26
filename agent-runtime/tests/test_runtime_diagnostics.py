@@ -168,6 +168,24 @@ class RuntimeDiagnosticsEndpointTest(unittest.TestCase):
             total_created=1,
             total_errors=0,
         )
+        self.service._record_stage_timing("process_chat_total", 123.456)
+        self.service._record_stage_timing("router_route", 15.25)
+        self.laravel_client.get_metrics_snapshot = lambda: {
+            "total_requests": 3,
+            "failed_requests": 1,
+            "endpoints": {
+                "POST /api/internal/agent/faturas/search": {
+                    "method": "POST",
+                    "path": "/api/internal/agent/faturas/search",
+                    "count": 2,
+                    "failed_count": 1,
+                    "total_ms": 88.0,
+                    "last_ms": 45.5,
+                    "avg_ms": 44.0,
+                    "max_ms": 45.5,
+                }
+            },
+        }
 
         payload = asyncio.run(
             runtime_metrics_diagnostics(
@@ -180,10 +198,19 @@ class RuntimeDiagnosticsEndpointTest(unittest.TestCase):
         self.assertEqual(payload["pending_actions_backend"], "memory")
         self.assertGreaterEqual(payload["runtime"]["uptime_seconds"], 0)
         self.assertEqual(payload["runtime"]["counters"]["confirmation_executed"], 1)
+        self.assertEqual(payload["runtime"]["stage_timings"]["process_chat_total"]["count"], 1)
+        self.assertEqual(payload["runtime"]["stage_timings"]["process_chat_total"]["last_ms"], 123.456)
+        self.assertEqual(payload["runtime"]["stage_timings"]["router_route"]["avg_ms"], 15.25)
         self.assertEqual(payload["pending_actions"]["total_entries"], 2)
         self.assertEqual(payload["pending_actions"]["active_entries"], 2)
         self.assertEqual(payload["pending_actions"]["counts_by_state"]["draft"], 1)
         self.assertEqual(payload["pending_actions"]["counts_by_state"]["pending_confirmation"], 1)
+        self.assertEqual(payload["laravel_client"]["total_requests"], 3)
+        self.assertEqual(payload["laravel_client"]["failed_requests"], 1)
+        self.assertEqual(
+            payload["laravel_client"]["endpoints"]["POST /api/internal/agent/faturas/search"]["count"],
+            2,
+        )
 
     def test_metrics_endpoint_prometheus_retorna_payload_textual(self) -> None:
         self.service.pending_actions.save(
@@ -202,6 +229,23 @@ class RuntimeDiagnosticsEndpointTest(unittest.TestCase):
             state_to="completed",
             decision="reuse_completed_result",
         )
+        self.service._record_stage_timing("process_chat_total", 123.456)
+        self.laravel_client.get_metrics_snapshot = lambda: {
+            "total_requests": 1,
+            "failed_requests": 0,
+            "endpoints": {
+                "POST /api/internal/agent/faturas/search": {
+                    "method": "POST",
+                    "path": "/api/internal/agent/faturas/search",
+                    "count": 1,
+                    "failed_count": 0,
+                    "total_ms": 45.5,
+                    "last_ms": 45.5,
+                    "avg_ms": 45.5,
+                    "max_ms": 45.5,
+                }
+            },
+        }
 
         response = asyncio.run(
             runtime_metrics_diagnostics(
@@ -216,6 +260,12 @@ class RuntimeDiagnosticsEndpointTest(unittest.TestCase):
         self.assertIn("agent_runtime_uptime_seconds", body)
         self.assertIn("agent_runtime_pending_entries", body)
         self.assertIn('agent_runtime_pending_entries_by_state{state="draft"} 1', body)
+        self.assertIn('agent_runtime_stage_timing_last_ms{stage="process_chat_total"} 123.456', body)
+        self.assertIn("agent_runtime_laravel_requests_total 1", body)
+        self.assertIn(
+            'agent_runtime_laravel_request_count{method="POST",path="/api/internal/agent/faturas/search"} 1',
+            body,
+        )
         self.assertIn(
             'agent_runtime_counter{name="confirmation_replayed"} 1',
             body,
