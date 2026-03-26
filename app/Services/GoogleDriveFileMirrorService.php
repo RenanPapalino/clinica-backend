@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use RuntimeException;
@@ -11,6 +12,7 @@ class GoogleDriveFileMirrorService
 {
     private const JWT_GRANT_TYPE = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
     private const OAUTH_REFRESH_GRANT_TYPE = 'refresh_token';
+    private const OAUTH_TOKEN_TTL_SKEW_SECONDS = 120;
 
     public function isConfigured(): bool
     {
@@ -26,15 +28,25 @@ class GoogleDriveFileMirrorService
             throw new RuntimeException('GOOGLE_DRIVE_FOLDER_ID não configurado.');
         }
 
-        $accessToken = $this->fetchAccessToken();
-        $metadata = $this->buildMetadata($file, $context, $folderId);
-        $createdFile = $this->createRemoteFile($accessToken, $metadata);
+        for ($attempt = 1; $attempt <= 2; $attempt++) {
+            $accessToken = $this->fetchAccessToken();
+            $metadata = $this->buildMetadata($file, $context, $folderId);
+            $createdFile = null;
 
-        try {
-            $uploadedFile = $this->uploadRemoteFileContent($accessToken, (string) $createdFile['id'], $file);
-        } catch (\Throwable $exception) {
-            $this->deleteRemoteFileQuietly($accessToken, (string) ($createdFile['id'] ?? ''));
-            throw $exception;
+            try {
+                $createdFile = $this->createRemoteFile($accessToken, $metadata);
+                $uploadedFile = $this->uploadRemoteFileContent($accessToken, (string) $createdFile['id'], $file);
+                break;
+            } catch (\Throwable $exception) {
+                $this->deleteRemoteFileQuietly($accessToken, (string) ($createdFile['id'] ?? ''));
+
+                if ($attempt < 2 && $this->shouldRetryWithFreshOauthToken($exception)) {
+                    $this->clearCachedOauthAccessToken();
+                    continue;
+                }
+
+                throw $exception;
+            }
         }
 
         return [
@@ -55,11 +67,11 @@ class GoogleDriveFileMirrorService
 
     private function hasCredentialSource(): bool
     {
-        if ($this->hasOauthAccessTokenCredential()) {
+        if ($this->hasOauthRefreshTokenCredentials()) {
             return true;
         }
 
-        if ($this->hasOauthRefreshTokenCredentials()) {
+        if ($this->hasOauthAccessTokenCredential()) {
             return true;
         }
 
@@ -83,13 +95,15 @@ class GoogleDriveFileMirrorService
 
     private function resolveAuthMode(): string
     {
+        if ($this->hasOauthRefreshTokenCredentials()) {
+            return 'oauth_refresh_token';
+        }
+
         if ($this->hasOauthAccessTokenCredential()) {
             return 'oauth_access_token';
         }
 
-        return $this->hasOauthRefreshTokenCredentials()
-            ? 'oauth_refresh_token'
-            : 'service_account';
+        return 'service_account';
     }
 
     private function loadServiceAccountCredentials(): array
@@ -177,6 +191,11 @@ class GoogleDriveFileMirrorService
 
     private function fetchOauthAccessToken(): string
     {
+        $cachedToken = $this->getCachedOauthAccessToken();
+        if ($cachedToken !== null) {
+            return $cachedToken;
+        }
+
         $clientId = trim((string) config('services.google_drive.oauth_client_id'));
         $clientSecret = trim((string) config('services.google_drive.oauth_client_secret'));
         $refreshToken = trim((string) config('services.google_drive.oauth_refresh_token'));
@@ -205,7 +224,50 @@ class GoogleDriveFileMirrorService
             throw new RuntimeException('Resposta de autenticação OAuth do Google Drive sem access_token.');
         }
 
+        $this->cacheOauthAccessToken($token, (int) $response->json('expires_in', 3600));
+
         return $token;
+    }
+
+    private function getCachedOauthAccessToken(): ?string
+    {
+        if (!$this->hasOauthRefreshTokenCredentials()) {
+            return null;
+        }
+
+        $token = Cache::get($this->oauthTokenCacheKey());
+
+        return is_string($token) && trim($token) !== '' ? $token : null;
+    }
+
+    private function cacheOauthAccessToken(string $token, int $expiresInSeconds): void
+    {
+        $ttlSeconds = max(60, $expiresInSeconds - self::OAUTH_TOKEN_TTL_SKEW_SECONDS);
+        Cache::put($this->oauthTokenCacheKey(), $token, now()->addSeconds($ttlSeconds));
+    }
+
+    private function clearCachedOauthAccessToken(): void
+    {
+        Cache::forget($this->oauthTokenCacheKey());
+    }
+
+    private function oauthTokenCacheKey(): string
+    {
+        $prefix = trim((string) config('services.google_drive.oauth_token_cache_prefix', 'google_drive_oauth_access_token'));
+        $clientId = trim((string) config('services.google_drive.oauth_client_id'));
+
+        return $prefix . ':' . sha1($clientId);
+    }
+
+    private function shouldRetryWithFreshOauthToken(\Throwable $exception): bool
+    {
+        if (!$this->hasOauthRefreshTokenCredentials()) {
+            return false;
+        }
+
+        $message = $exception->getMessage();
+
+        return str_contains($message, 'HTTP 401') || str_contains($message, 'HTTP 403');
     }
 
     private function buildJwtAssertion(string $clientEmail, string $privateKey, string $audience, string $scope): string

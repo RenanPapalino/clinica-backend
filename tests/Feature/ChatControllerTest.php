@@ -8,6 +8,7 @@ use App\Models\RagDocument;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Laravel\Sanctum\Sanctum;
 use Tests\TestCase;
@@ -354,6 +355,237 @@ class ChatControllerTest extends TestCase
         Http::assertSent(fn ($request) => str_starts_with($request->url(), 'https://www.googleapis.com/drive/v3/files'));
         Http::assertSent(fn ($request) => str_starts_with($request->url(), 'https://www.googleapis.com/upload/drive/v3/files/drive-file-001'));
         Http::assertSent(fn ($request) => $request->url() === 'http://langchain-runtime.test/chat/file');
+    }
+
+    public function test_upload_do_chat_prefere_refresh_token_quando_refresh_e_access_token_estao_configurados(): void
+    {
+        Cache::flush();
+
+        config([
+            'chatbot.runtime.driver' => 'langchain',
+            'chatbot.runtime.base_url' => 'http://langchain-runtime.test',
+            'chatbot.runtime.secret' => 'runtime-secret',
+            'chatbot.chat_upload.mirror_to_drive' => true,
+            'chatbot.chat_upload.mirror_to_drive_required' => true,
+            'chatbot.chat_upload.drive_name_prefix' => 'chat-upload',
+            'services.google_drive.folder_id' => 'folder-drive-123',
+            'services.google_drive.oauth_access_token' => 'oauth-access-token-antigo',
+            'services.google_drive.oauth_client_id' => 'oauth-client-id',
+            'services.google_drive.oauth_client_secret' => 'oauth-client-secret',
+            'services.google_drive.oauth_refresh_token' => 'oauth-refresh-token',
+            'services.google_drive.service_account_json' => null,
+            'services.google_drive.service_account_path' => null,
+            'services.google_drive.timeout' => 10,
+        ]);
+
+        Sanctum::actingAs(User::factory()->create([
+            'ativo' => true,
+        ]));
+
+        Http::fake([
+            'https://oauth2.googleapis.com/token' => Http::response([
+                'access_token' => 'google-access-token-novo',
+                'expires_in' => 3600,
+            ], 200),
+            'https://www.googleapis.com/drive/v3/files*' => Http::response([
+                'id' => 'drive-file-001',
+                'name' => 'chat-upload_u1_sessao_arquivo_clientes.xlsx',
+            ], 200),
+            'https://www.googleapis.com/upload/drive/v3/files/drive-file-001*' => Http::response([
+                'id' => 'drive-file-001',
+                'name' => 'chat-upload_u1_sessao_arquivo_clientes.xlsx',
+                'mimeType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'parents' => ['folder-drive-123'],
+                'webViewLink' => 'https://drive.google.com/file/d/drive-file-001/view',
+                'createdTime' => now()->toISOString(),
+                'modifiedTime' => now()->toISOString(),
+            ], 200),
+            'http://langchain-runtime.test/chat/file' => Http::response([
+                'mensagem' => 'Arquivo recebido e pronto para analise.',
+            ], 200),
+        ]);
+
+        $response = $this->post('/api/chat/enviar', [
+            'mensagem' => 'Processe a planilha em anexo.',
+            'tipo_processamento' => 'financeiro',
+            'espelhar_no_drive' => '1',
+            'drive_required' => '1',
+            'arquivo' => UploadedFile::fake()->create(
+                'clientes.xlsx',
+                16,
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            ),
+        ], [
+            'Accept' => 'application/json',
+        ]);
+
+        $response->assertOk()
+            ->assertJsonPath('success', true)
+            ->assertJsonPath('arquivo_ingestao.success', true)
+            ->assertJsonPath('arquivo_ingestao.auth_mode', 'oauth_refresh_token');
+
+        Http::assertSent(fn ($request) => $request->url() === 'https://oauth2.googleapis.com/token'
+            && $request['grant_type'] === 'refresh_token'
+            && $request['client_id'] === 'oauth-client-id'
+            && $request['client_secret'] === 'oauth-client-secret'
+            && $request['refresh_token'] === 'oauth-refresh-token');
+    }
+
+    public function test_upload_do_chat_reutiliza_access_token_cacheado_gerado_por_refresh_token(): void
+    {
+        Cache::flush();
+
+        config([
+            'chatbot.runtime.driver' => 'langchain',
+            'chatbot.runtime.base_url' => 'http://langchain-runtime.test',
+            'chatbot.runtime.secret' => 'runtime-secret',
+            'chatbot.chat_upload.mirror_to_drive' => true,
+            'chatbot.chat_upload.mirror_to_drive_required' => true,
+            'chatbot.chat_upload.drive_name_prefix' => 'chat-upload',
+            'services.google_drive.folder_id' => 'folder-drive-123',
+            'services.google_drive.oauth_access_token' => null,
+            'services.google_drive.oauth_client_id' => 'oauth-client-id',
+            'services.google_drive.oauth_client_secret' => 'oauth-client-secret',
+            'services.google_drive.oauth_refresh_token' => 'oauth-refresh-token',
+            'services.google_drive.service_account_json' => null,
+            'services.google_drive.service_account_path' => null,
+            'services.google_drive.timeout' => 10,
+        ]);
+
+        Sanctum::actingAs(User::factory()->create([
+            'ativo' => true,
+        ]));
+
+        Http::fake([
+            'https://oauth2.googleapis.com/token' => Http::response([
+                'access_token' => 'google-access-token-cacheado',
+                'expires_in' => 3600,
+            ], 200),
+            'https://www.googleapis.com/drive/v3/files*' => Http::sequence()
+                ->push([
+                    'id' => 'drive-file-001',
+                    'name' => 'primeiro.xlsx',
+                ], 200)
+                ->push([
+                    'id' => 'drive-file-002',
+                    'name' => 'segundo.xlsx',
+                ], 200),
+            'https://www.googleapis.com/upload/drive/v3/files/drive-file-001*' => Http::response([
+                'id' => 'drive-file-001',
+                'name' => 'primeiro.xlsx',
+                'mimeType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'parents' => ['folder-drive-123'],
+            ], 200),
+            'https://www.googleapis.com/upload/drive/v3/files/drive-file-002*' => Http::response([
+                'id' => 'drive-file-002',
+                'name' => 'segundo.xlsx',
+                'mimeType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'parents' => ['folder-drive-123'],
+            ], 200),
+            'http://langchain-runtime.test/chat/file' => Http::response([
+                'mensagem' => 'Arquivo recebido e pronto para analise.',
+            ], 200),
+        ]);
+
+        $payload = [
+            'mensagem' => 'Processe a planilha em anexo.',
+            'tipo_processamento' => 'financeiro',
+            'espelhar_no_drive' => '1',
+            'drive_required' => '1',
+        ];
+
+        $this->post('/api/chat/enviar', $payload + [
+            'arquivo' => UploadedFile::fake()->create('clientes-1.xlsx', 16, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+        ], ['Accept' => 'application/json'])->assertOk();
+
+        $this->post('/api/chat/enviar', $payload + [
+            'arquivo' => UploadedFile::fake()->create('clientes-2.xlsx', 16, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+        ], ['Accept' => 'application/json'])->assertOk();
+
+        $tokenRequests = collect(Http::recorded())->filter(
+            fn (array $call) => $call[0]->url() === 'https://oauth2.googleapis.com/token'
+        );
+
+        $this->assertCount(1, $tokenRequests);
+    }
+
+    public function test_upload_do_chat_renova_access_token_cacheado_quando_google_retorna_401(): void
+    {
+        Cache::flush();
+
+        config([
+            'chatbot.runtime.driver' => 'langchain',
+            'chatbot.runtime.base_url' => 'http://langchain-runtime.test',
+            'chatbot.runtime.secret' => 'runtime-secret',
+            'chatbot.chat_upload.mirror_to_drive' => true,
+            'chatbot.chat_upload.mirror_to_drive_required' => true,
+            'chatbot.chat_upload.drive_name_prefix' => 'chat-upload',
+            'services.google_drive.folder_id' => 'folder-drive-123',
+            'services.google_drive.oauth_access_token' => null,
+            'services.google_drive.oauth_client_id' => 'oauth-client-id',
+            'services.google_drive.oauth_client_secret' => 'oauth-client-secret',
+            'services.google_drive.oauth_refresh_token' => 'oauth-refresh-token',
+            'services.google_drive.service_account_json' => null,
+            'services.google_drive.service_account_path' => null,
+            'services.google_drive.timeout' => 10,
+        ]);
+
+        Sanctum::actingAs(User::factory()->create([
+            'ativo' => true,
+        ]));
+
+        Http::fake([
+            'https://oauth2.googleapis.com/token' => Http::sequence()
+                ->push([
+                    'access_token' => 'google-access-token-expirado',
+                    'expires_in' => 3600,
+                ], 200)
+                ->push([
+                    'access_token' => 'google-access-token-renovado',
+                    'expires_in' => 3600,
+                ], 200),
+            'https://www.googleapis.com/drive/v3/files*' => Http::sequence()
+                ->push(['error' => ['message' => 'Unauthorized']], 401)
+                ->push([
+                    'id' => 'drive-file-001',
+                    'name' => 'clientes.xlsx',
+                ], 200),
+            'https://www.googleapis.com/upload/drive/v3/files/drive-file-001*' => Http::response([
+                'id' => 'drive-file-001',
+                'name' => 'clientes.xlsx',
+                'mimeType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'parents' => ['folder-drive-123'],
+            ], 200),
+            'http://langchain-runtime.test/chat/file' => Http::response([
+                'mensagem' => 'Arquivo recebido e pronto para analise.',
+            ], 200),
+        ]);
+
+        $this->post('/api/chat/enviar', [
+            'mensagem' => 'Processe a planilha em anexo.',
+            'tipo_processamento' => 'financeiro',
+            'espelhar_no_drive' => '1',
+            'drive_required' => '1',
+            'arquivo' => UploadedFile::fake()->create(
+                'clientes.xlsx',
+                16,
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            ),
+        ], [
+            'Accept' => 'application/json',
+        ])->assertOk()
+            ->assertJsonPath('arquivo_ingestao.success', true)
+            ->assertJsonPath('arquivo_ingestao.auth_mode', 'oauth_refresh_token');
+
+        $tokenRequests = collect(Http::recorded())->filter(
+            fn (array $call) => $call[0]->url() === 'https://oauth2.googleapis.com/token'
+        );
+        $createRequests = collect(Http::recorded())->filter(
+            fn (array $call) => str_starts_with($call[0]->url(), 'https://www.googleapis.com/drive/v3/files')
+        );
+
+        $this->assertCount(2, $tokenRequests);
+        $this->assertCount(2, $createRequests);
     }
 
     public function test_upload_com_anexo_nao_usa_resposta_local_rapida(): void

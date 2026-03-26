@@ -69,6 +69,20 @@ class ChatRuntimeService:
                 session_id=payload.session_id,
                 states={"draft", "pending_confirmation"},
             )
+            draft_resolution = self._resolve_session_draft_resolution(
+                pending=session_draft,
+                message=payload.mensagem or "",
+            )
+            if draft_resolution == "cancel" and session_draft is not None:
+                self.pending_actions.pop(session_draft.action_id)
+                return ChatbotResponse(
+                    mensagem="Tudo bem. Cancelei o rascunho pendente desta sessao. Como posso ajudar agora?",
+                    acao_sugerida=None,
+                    dados_estruturados=None,
+                )
+            if draft_resolution == "ignore":
+                session_draft = None
+
             current_message = build_current_message(
                 payload,
                 parsed_file,
@@ -2790,6 +2804,51 @@ class ChatRuntimeService:
             "dados_parciais": list(pending.records or []),
         }
 
+    def _resolve_session_draft_resolution(
+        self,
+        *,
+        pending: Any | None,
+        message: str,
+    ) -> str:
+        if pending is None:
+            return "keep"
+
+        normalized = self._normalize_free_text(message)
+        if not normalized:
+            return "keep"
+
+        if self._message_cancels_pending_draft(normalized):
+            return "cancel"
+
+        pending_fields = list((pending.metadata or {}).get("pending_fields") or [])
+        draft_action = self._canonical_action(pending.action) or ""
+        draft_records = list(pending.records or [])
+
+        if draft_action == "gerar_fatura" and "cliente" in pending_fields:
+            if self._message_requests_client_creation(message):
+                return "continue"
+
+        extracted_updates = self._extract_pending_updates_from_message(
+            action=draft_action,
+            message=message,
+            pending_fields=pending_fields,
+            draft_records=draft_records,
+        )
+        if extracted_updates:
+            return "continue"
+
+        if self._message_mentions_pending_topics(
+            normalized_message=normalized,
+            pending_fields=pending_fields,
+            action=draft_action,
+        ):
+            return "continue"
+
+        if self._is_plain_greeting(message) or self._is_low_signal_message(normalized):
+            return "ignore"
+
+        return "ignore"
+
     def _merge_session_draft_into_action_plan(
         self,
         plan: ActionPlan,
@@ -2923,6 +2982,8 @@ class ChatRuntimeService:
             return []
 
         updates: dict[str, Any] = {}
+        base_records = [dict(record) for record in draft_records] if draft_records else [{}]
+        mutated_records = False
 
         if "data_vencimento" in pending_fields:
             if due_date := self._extract_date_from_text(text):
@@ -2961,11 +3022,42 @@ class ChatRuntimeService:
             if descricao := self._extract_named_value(text, labels=["descricao", "histórico", "historico"]):
                 updates["descricao"] = descricao
 
-        if not updates:
+        item_value_fields = sorted(
+            [
+                field
+                for field in pending_fields
+                if field.startswith("item_") and field.endswith(".valor_unitario")
+            ],
+            key=lambda field: self._to_int(field.split(".", 1)[0].replace("item_", "")) or 0,
+        )
+        currency_values = self._extract_currency_values_from_text(text) if item_value_fields else []
+        if item_value_fields and currency_values:
+            for record in base_records:
+                items = [dict(item) for item in self._extract_fatura_items(record)]
+                if not items:
+                    continue
+
+                for index, field in enumerate(item_value_fields):
+                    item_position = (self._to_int(field.split(".", 1)[0].replace("item_", "")) or 1) - 1
+                    if item_position >= len(items):
+                        continue
+
+                    value = currency_values[index] if index < len(currency_values) else currency_values[-1]
+                    items[item_position]["valor_unitario"] = value
+                    quantidade = self._parse_decimal(items[item_position].get("quantidade")) or 1.0
+                    items[item_position]["valor_total"] = round(quantidade * value, 2)
+
+                record["_itens_payload"] = items
+                mutated_records = True
+
+        if not updates and not mutated_records:
             return []
 
-        target_size = max(len(draft_records), 1)
-        return [dict(updates) for _ in range(target_size)]
+        if updates:
+            for record in base_records:
+                record.update(updates)
+
+        return base_records
 
     def _build_cliente_records_from_fatura_draft(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized_records: list[dict[str, Any]] = []
@@ -2995,6 +3087,106 @@ class ChatRuntimeService:
                 normalized_records.append(cliente_record)
 
         return normalized_records
+
+    def _message_cancels_pending_draft(self, normalized_message: str) -> bool:
+        cancel_terms = {
+            "cancelar",
+            "cancela",
+            "cancelar isso",
+            "cancelar rascunho",
+            "cancelar pendencia",
+            "cancelar pendência",
+            "esquecer",
+            "esquece",
+            "deixa pra la",
+            "deixa pra lá",
+            "parar",
+            "pare",
+            "novo assunto",
+            "mudar de assunto",
+        }
+
+        return any(term in normalized_message for term in cancel_terms)
+
+    def _is_low_signal_message(self, normalized_message: str) -> bool:
+        if not normalized_message:
+            return False
+
+        if len(normalized_message) <= 2 and not re.search(r"\d", normalized_message):
+            return True
+
+        low_signal_tokens = {"ok", "blz", "kk", "haha", "rs", "ff", "hm", "hmm"}
+        tokens = set(re.findall(r"[a-zA-ZÀ-ÿ0-9_-]+", normalized_message))
+        return bool(tokens) and tokens.issubset(low_signal_tokens)
+
+    def _message_mentions_pending_topics(
+        self,
+        *,
+        normalized_message: str,
+        pending_fields: list[str],
+        action: str,
+    ) -> bool:
+        if not normalized_message:
+            return False
+
+        terms: set[str] = set()
+
+        if action == "gerar_fatura":
+            terms.update(
+                {
+                    "fatura",
+                    "faturamento",
+                    "item",
+                    "itens",
+                    "exame",
+                    "exames",
+                    "valor",
+                    "valores",
+                    "vencimento",
+                    "periodo",
+                    "período",
+                    "competencia",
+                    "competência",
+                    "cliente",
+                    "cnpj",
+                }
+            )
+
+        for field in pending_fields:
+            if field == "data_vencimento":
+                if self._extract_date_from_text(normalized_message):
+                    return True
+                terms.update({"vencimento", "vence", "dia", "data"})
+            elif field == "nova_data_vencimento":
+                if self._extract_date_from_text(normalized_message):
+                    return True
+                terms.update({"novo", "nova", "vencimento", "vence", "dia", "data"})
+            elif field == "periodo_referencia":
+                if self._extract_period_from_text(normalized_message):
+                    return True
+                terms.update({"periodo", "período", "competencia", "competência", "mes", "mês"})
+            elif field == "cliente":
+                if self._extract_document_from_text(normalized_message, required_length=14):
+                    return True
+                terms.update({"cliente", "empresa", "cnpj", "id", "cadastre"})
+            elif field == "cnpj":
+                if self._extract_document_from_text(normalized_message, required_length=14):
+                    return True
+                terms.update({"cnpj", "empresa"})
+            elif field == "razao_social":
+                terms.update({"razao", "razão", "social", "empresa", "cliente"})
+            elif field == "valor_original":
+                if self._extract_currency_values_from_text(normalized_message):
+                    return True
+                terms.update({"valor", "preco", "preço", "r$"})
+            elif field == "descricao":
+                terms.update({"descricao", "descrição", "historico", "histórico"})
+            elif field.startswith("item_") and field.endswith(".valor_unitario"):
+                if self._extract_currency_values_from_text(normalized_message):
+                    return True
+                terms.update({"item", "itens", "valor", "valores", "exame", "exames", "r$"})
+
+        return any(term in normalized_message for term in terms)
 
     def _resolve_auto_cliente_record_for_fatura(
         self,
@@ -3171,6 +3363,9 @@ class ChatRuntimeService:
             r"(\d{2}/\d{2}/\d{4})",
             r"(\d{2}-\d{2}-\d{4})",
             r"(\d{4}-\d{2}-\d{2})",
+            r"(\d{1,2}\s+de\s+[a-zà-ÿ]+\s+de\s+\d{4})",
+            r"(\d{1,2}\s+de\s+[a-zà-ÿ]+\s+\d{4})",
+            r"(\d{1,2}\s+[a-zà-ÿ]+\s+\d{4})",
         ):
             match = re.search(pattern, normalized)
             if match:
@@ -3184,10 +3379,18 @@ class ChatRuntimeService:
             r"(\d{2}/\d{4})",
             r"(\d{2}-\d{4})",
             r"(\d{4}-\d{2})",
+            r"([a-zà-ÿ]+\s+de\s+\d{4})",
+            r"([a-zà-ÿ]+\s+\d{4})",
         ):
             match = re.search(pattern, normalized)
             if match:
                 return self._normalize_periodo_referencia(match.group(1))
+
+        if due_date := self._extract_date_from_text(message):
+            try:
+                return datetime.strptime(due_date, "%Y-%m-%d").strftime("%Y-%m")
+            except ValueError:
+                return None
 
         return None
 
@@ -3223,6 +3426,23 @@ class ChatRuntimeService:
             return float(raw)
         except ValueError:
             return None
+
+    def _extract_currency_values_from_text(self, message: str) -> list[float]:
+        matches = re.findall(
+            r"(?:r\$\s*)?(\d{1,3}(?:\.\d{3})*,\d{2}|\d+(?:,\d{2})?)",
+            message or "",
+            re.IGNORECASE,
+        )
+        values: list[float] = []
+
+        for raw in matches:
+            normalized = raw.replace(".", "").replace(",", ".")
+            try:
+                values.append(float(normalized))
+            except ValueError:
+                continue
+
+        return values
 
     def _extract_named_value(self, message: str, *, labels: list[str]) -> str | None:
         normalized = self._as_string(message)
@@ -3399,7 +3619,9 @@ class ChatRuntimeService:
         if text == "":
             return None
 
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        text = self._normalize_portuguese_date_text(text)
+
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
                 return datetime.strptime(text[:19], fmt).date().isoformat()
             except ValueError:
@@ -3411,7 +3633,7 @@ class ChatRuntimeService:
         if value in (None, ""):
             return None
 
-        text = str(value).strip()
+        text = self._normalize_portuguese_date_text(str(value).strip())
         if text == "":
             return None
 
@@ -3438,7 +3660,7 @@ class ChatRuntimeService:
         if value in (None, ""):
             return None
 
-        text = str(value).strip()
+        text = self._normalize_portuguese_date_text(str(value).strip())
         if text == "":
             return None
 
@@ -3462,3 +3684,31 @@ class ChatRuntimeService:
 
     def _today(self) -> str:
         return datetime.utcnow().date().isoformat()
+
+    def _normalize_portuguese_date_text(self, value: str) -> str:
+        text = self._normalize_free_text(value)
+        if not text:
+            return ""
+
+        months = {
+            "janeiro": "01",
+            "fevereiro": "02",
+            "marco": "03",
+            "março": "03",
+            "abril": "04",
+            "maio": "05",
+            "junho": "06",
+            "julho": "07",
+            "agosto": "08",
+            "setembro": "09",
+            "outubro": "10",
+            "novembro": "11",
+            "dezembro": "12",
+        }
+
+        for month_name, month_number in months.items():
+            text = re.sub(rf"\b{month_name}\b", month_number, text)
+
+        text = re.sub(r"\s+de\s+", "/", text)
+        text = re.sub(r"\s+", "/", text)
+        return text.strip("/")

@@ -49,6 +49,7 @@ return [
         'oauth_client_id' => env('GOOGLE_DRIVE_OAUTH_CLIENT_ID'),
         'oauth_client_secret' => env('GOOGLE_DRIVE_OAUTH_CLIENT_SECRET'),
         'oauth_refresh_token' => env('GOOGLE_DRIVE_OAUTH_REFRESH_TOKEN'),
+        'oauth_token_cache_prefix' => env('GOOGLE_DRIVE_OAUTH_TOKEN_CACHE_PREFIX', 'google_drive_oauth_access_token'),
         'service_account_json' => env('GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON'),
         'service_account_path' => env('GOOGLE_DRIVE_SERVICE_ACCOUNT_PATH'),
         'folder_id' => env('GOOGLE_DRIVE_FOLDER_ID'),
